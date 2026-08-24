@@ -29,16 +29,25 @@ def _ncpus() -> int:
     return os.cpu_count() or 1
 
 
+_PROBE_CACHE: dict[str, tuple] = {}
+
+
 def _probe_capabilities() -> tuple[list[str], list[str], str]:
+    """Probe once per process; cycle mode repeats collect() many times."""
+    cached = _PROBE_CACHE.get("caps")
+    if cached is not None:
+        return list(cached[0]), list(cached[1]), cached[2]
     ev_ok, _ev_bad = doctor.supported_events(doctor.CANDIDATE_EVENTS)
-    m_ok, _m_bad = doctor.supported_metrics()
+    m_ok, m_bad = doctor.supported_metrics()
     precise = None
     for ev in ("cycles:P", "cycles:pu", "cycles"):
         ok, _ = doctor.probe_record(ev)
         if ok:
             precise = ev
             break
-    return ev_ok, m_ok, precise or "cycles"
+    precise_ev = precise or "cycles"
+    _PROBE_CACHE["caps"] = (tuple(ev_ok), tuple(m_ok), precise_ev)
+    return ev_ok, m_ok, precise_ev
 
 
 def _write_meta(outdir: str, meta: dict) -> None:
@@ -56,6 +65,7 @@ def collect(
     use_stat: bool = True,
     use_record: bool = True,
     callgraph_mode: str = "dwarf",
+    quiet_stdout: bool = False,
 ) -> ProfileData:
     """Profile either a new process (`target_cmd`) or an existing one (`pid`)."""
     os.makedirs(outdir, exist_ok=True)
@@ -103,7 +113,8 @@ def collect(
                 + ("\n" + doctor.PERF_ACCESS_HINTS if "paranoid" in (r.stderr or "") or "Access" in (r.stderr or "") else "")
             )
         if target_cmd and r.stdout:
-            sys.stdout.write(r.stdout)  # forward target's own output
+            # forward target's own output; keep stdout clean in cycle mode
+            (sys.stderr if quiet_stdout else sys.stdout).write(r.stdout)
         known = set(ev_list) | set(metric_list)
         try:
             with open(stat_csv, encoding="utf-8", errors="replace") as f:
