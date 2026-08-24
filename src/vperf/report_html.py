@@ -6,6 +6,7 @@ import html
 from collections import defaultdict
 
 from .flamegraph import render_flame_svg
+from .memory import LATENCY_BANDS, MemoryProfile
 from .metrics import MetricsReport, all_hints
 from .stacks import StackProfile, TreeNode, top_threads
 from .timeline import render_threads_svg, render_util_svg, thread_series
@@ -168,7 +169,66 @@ def _tree_html(node: TreeNode, total: int, depth: int = 0) -> str:
             f"<span class='selfpct'>{pct:.1f}% · self {self_pct:.1f}%</span></summary>{inner}</details>")
 
 
-def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile) -> str:
+def _memory_tab(mem: MemoryProfile | None) -> str:
+    if mem is None or mem.total_samples == 0:
+        return ('<div class="page" id="mem"><div class="panel">'
+                '<h3>Memory access</h3><em>Not collected (AMD IBS '
+                'unavailable or disabled with --no-memory).</em></div></div>')
+    total = max(mem.classified_samples, 1)
+
+    def bars(items):
+        peak = max((v for _, v in items), default=1) or 1
+        rows = "".join(
+            f"<tr><td class='mono'>{esc(k)}</td>"
+            f"<td data-v='{v}'><span class='bar' style='width:{v/peak*120:.0f}px'></span> "
+            f"{v:,}</td><td data-v='{v/max(total,1):.4f}'>{v/max(total,1)*100:.1f}%</td></tr>"
+            for k, v in items if v)
+        return (f"<table><thead><tr><th></th><th>Accesses</th>"
+                f"<th>% of classified</th></tr></thead><tbody>{rows}</tbody></table>")
+
+    mix = [(lv, mem.level_samples.get(lv, 0)) for lv in ("DRAM", "L3", "L2", "L1", "other")]
+    bands = [(name, mem.bands.get(name, 0)) for name, _lo, _hi in LATENCY_BANDS]
+    tlb = sorted(mem.tlb_samples.items(), key=lambda kv: -kv[1])[:6]
+
+    stall_rows = ""
+    for sym in mem.top_symbols(20):
+        avg = sym.weight / sym.samples if sym.samples else 0
+        stall_rows += (
+            f"<tr><td class='mono'>{esc(sym.symbol)}</td>"
+            f"<td class='mono'>{esc(sym.dso)}</td>"
+            f"<td data-v='{sym.samples}'>{sym.samples:,}</td>"
+            f"<td data-v='{sym.weight}' class='mono'>{sym.weight:,}</td>"
+            f"<td data-v='{avg:.2f}' class='mono'>{avg:,.0f}</td>"
+            f"<td data-v='{sym.dram_samples}'>{sym.dram_samples:,}</td></tr>")
+    stall_table = (
+        "<table><thead><tr>"
+        "<th onclick='sortTable(this,0)'>Function</th>"
+        "<th onclick='sortTable(this,0)'>Module</th>"
+        "<th onclick='sortTable(this,1)'>Accesses</th>"
+        "<th onclick='sortTable(this,1)'>Stall cycles (Σ latency)</th>"
+        "<th onclick='sortTable(this,1)'>Avg latency</th>"
+        "<th onclick='sortTable(this,1)'>DRAM accesses</th>"
+        "</tr></thead><tbody>" + stall_rows + "</tbody></table>")
+
+    return f'''<div id="mem" class="page">
+<div class="panel"><h3>Memory access summary (IBS)</h3>
+<table><tbody>
+<tr><td>IBS samples collected</td><td>{mem.total_samples:,}</td>
+<td class="mono" style="color:var(--dim)">tagged micro-ops</td></tr>
+<tr><td>Classified data accesses</td><td>{mem.classified_samples:,}</td>
+<td class="mono" style="color:var(--dim)">with cache-level attribution</td></tr>
+<tr><td>Average access latency</td><td>{(mem.avg_latency or 0):,.0f} cycles</td>
+<td class="mono" style="color:var(--dim)">weighted by samples</td></tr>
+</tbody></table></div>
+<div class="panel"><h3>Where the data came from</h3>{bars(mix)}</div>
+<div class="panel"><h3>Latency distribution (VTune-style bands)</h3>{bars(bands)}</div>
+<div class="panel"><h3>dTLB outcomes</h3>{bars(tlb)}</div>
+<div class="panel"><h3>Top functions by memory-stall time</h3>{stall_table}</div>
+</div>'''
+
+
+def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
+               mem: MemoryProfile | None = None) -> str:
     ncpu = meta.get("ncpus", 1)
 
     # ---- flame graphs -------------------------------------------------------
@@ -222,6 +282,7 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile) 
 <div class="tabs">
 <div class="tab active" onclick="showTab(this,'overview')">Overview</div>
 <div class="tab" onclick="showTab(this,'hotspots')">Hotspots</div>
+<div class="tab" onclick="showTab(this,'mem')">Memory</div>
 <div class="tab" onclick="showTab(this,'flame')">Flame Graph</div>
 <div class="tab" onclick="showTab(this,'timeline')">Timeline</div>
 <div class="tab" onclick="showTab(this,'tree')">Call Tree</div>
@@ -261,6 +322,8 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile) 
 <div id="hotspots" class="page">
 <div class="panel"><h3>Top functions by self time</h3>{_hotspots_table(prof)}</div>
 </div>
+
+{_memory_tab(mem)}
 
 <div id="flame" class="page">
 <div class="panel"><h3>Flame graph</h3>{flame_sel}<div id="flamewrap">{''.join(flame_divs)}</div></div>
