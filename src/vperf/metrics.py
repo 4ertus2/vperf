@@ -6,6 +6,9 @@ from dataclasses import dataclass, field
 
 from .parsers import StatData
 
+# average branch-misprediction recovery penalty in cycles (Zen 3/4 ≈ 13)
+BAD_SPEC_PENALTY_CYCLES = 13.0
+
 
 @dataclass
 class MetricsReport:
@@ -36,6 +39,8 @@ class MetricsReport:
     # bound analysis (approximation of VTune TMA level-1)
     backend_bound_pct: float | None = None    # dispatch slots lost to backend stalls
     frontend_bound_pct: float | None = None
+    bad_speculation_pct: float | None = None  # est. cycles lost to wrong-path exec
+    retiring_pct: float | None = None         # remainder: useful execution share
     # OS noise
     context_switches: float | None = None
     migrations: float | None = None
@@ -56,6 +61,12 @@ def compute_metrics(
     ncpus: int,
     stat_interval_ms: int | None = None,
 ) -> MetricsReport:
+    """Derive VTune-style metrics.
+
+    BAD_SPEC_PENALTY_CYCLES approximates the average branch-misprediction
+    recovery cost on Zen 3/4 (13 cycles); exposed as a module constant so
+    callers can tune it per microarchitecture.
+    """
     m = MetricsReport(elapsed=elapsed, ncpus=ncpus)
     s = stat.effective_summary(_BASE_EVENTS)
     met = stat.metrics
@@ -156,6 +167,17 @@ def compute_metrics(
         m.frontend_bound_pct = f if f > 1.0 else f * 100.0
     elif cyc and s.get("stalled-cycles-frontend") is not None:
         m.frontend_bound_pct = s["stalled-cycles-frontend"] / cyc * 100.0
+
+    # ---- bad speculation (TMA quadrant) -------------------------------------
+    # No direct slots event on AMD: estimate wrong-path cycles as
+    # mispredicted branches x typical recovery penalty (Zen 4 ~13 cycles),
+    # expressed as % of total cycles. Retiring is the remainder of the
+    # pipeline budget not consumed by the three loss sources.
+    if cyc and bmiss is not None:
+        m.bad_speculation_pct = min(bmiss * BAD_SPEC_PENALTY_CYCLES / cyc * 100.0, 100.0)
+    parts = [m.backend_bound_pct, m.frontend_bound_pct, m.bad_speculation_pct]
+    if any(p is not None for p in parts):
+        m.retiring_pct = max(0.0, 100.0 - sum(p for p in parts if p is not None))
 
     # ---- OS noise -----------------------------------------------------------
     cs = s.get("context-switches")

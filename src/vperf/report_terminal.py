@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .metrics import MetricsReport, all_hints
+from .metrics import BAD_SPEC_PENALTY_CYCLES, MetricsReport, all_hints
 from .stacks import StackProfile, top_threads
 
 
@@ -86,6 +86,10 @@ def render_terminal(meta: dict, m: MetricsReport, prof: StackProfile | None) -> 
          "dispatch slots lost to memory/core stalls (TMA-like)"],
         ["Frontend Bound", _fmt(m.frontend_bound_pct, " %"),
          "slots lost to fetch/decode stalls"],
+        ["Bad Speculation", _fmt(m.bad_speculation_pct, " %"),
+         f"est. wrong-path share ({int(BAD_SPEC_PENALTY_CYCLES)} cyc/mispredict model)"],
+        ["Retiring (remainder)", _fmt(m.retiring_pct, " %"),
+         "pipeline budget not lost to the above"],
     ]
     out.append("")
     out.append("-- Pipeline Bound Analysis (approx.) " + "-" * 44)
