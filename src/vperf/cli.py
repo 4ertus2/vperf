@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 import time
 
@@ -141,6 +142,85 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cycle(args: argparse.Namespace) -> int:
+    import tempfile
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from vperf.cycle import (DEFAULT_METRICS, physical_core_cpus,
+                             render_summary, render_tsv)
+    from vperf.metrics import compute_metrics
+
+    _ensure_access()
+    metrics = ([m.strip() for m in args.metrics.split(",")]
+               if args.metrics else list(DEFAULT_METRICS))
+
+    ncpus = os.cpu_count() or 1
+    jobs = args.jobs if args.jobs else max(1, ncpus // 2)
+
+    # pin each run to its own physical core when possible: excludes SMT
+    # sibling contention from the measurements
+    pin_cpus: list[int] | None = None
+    cores = physical_core_cpus() or []
+    if not args.no_pin and shutil.which("taskset") and jobs <= len(cores):
+        pin_cpus = cores
+
+    base = tempfile.mkdtemp(prefix="vperf-cycle-")
+    total_runs = args.runs + (args.warmup or 0)
+    results: dict[int, tuple[object, int | None]] = {}
+
+    def run_one(idx: int, is_warmup: bool):
+        cpu = None
+        cmd_args = list(args.cmd)
+        if pin_cpus:
+            cpu = pin_cpus[(idx - 1) % len(pin_cpus)]
+            if shutil.which("taskset"):
+                cmd_args = ["taskset", "-c", str(cpu), *cmd_args]
+        outdir = os.path.join(base, f"run_{idx}")
+        t0 = time.monotonic()
+        pd = collect(target_cmd=cmd_args, pid=None, outdir=outdir,
+                     use_stat=True, use_record=False, quiet_stdout=True)
+        m = compute_metrics(pd.stat, pd.elapsed,
+                            pd.meta.get("ncpus", 1), pd.meta.get("interval_ms"))
+        ipc_s = f"{m.ipc:.3f}" if m.ipc is not None else "na"
+        tag = (f"[warmup {idx}/{args.warmup}]" if is_warmup
+               else f"[{idx - (args.warmup or 0)}/{args.runs}]")
+        print(f"{tag} ipc={ipc_s} elapsed={pd.elapsed:.3f}s "
+              f"({time.monotonic()-t0:.2f}s wall"
+              + (f", cpu={cpu}" if cpu is not None else "") + ")",
+              file=sys.stderr, flush=True)
+        return idx, is_warmup, m, cpu
+
+    try:
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            futs = {}
+            for i in range(1, total_runs + 1):
+                futs[ex.submit(run_one, i, i <= (args.warmup or 0))] = i
+                if args.sleep > 0:
+                    time.sleep(args.sleep)
+            for fut in as_completed(futs):
+                idx, is_warmup, m, cpu = fut.result()
+                if not is_warmup:
+                    results[idx] = (m, cpu)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        raise SystemExit(130)
+
+    ordered_idx = sorted(results)
+    reports = [results[i][0] for i in ordered_idx]
+    cpus = [results[i][1] for i in ordered_idx]
+
+    tsv = render_tsv(reports, metrics, {"cpu": cpus})
+    if args.tsv:
+        with open(args.tsv, "w", encoding="utf-8") as f:
+            f.write(tsv)
+        print(f"TSV written: {args.tsv}", file=sys.stderr)
+    else:
+        sys.stdout.write(tsv)
+    print(render_summary(reports, metrics), file=sys.stderr)
+    return 0
+
+
 def cmd_doctor(_args: argparse.Namespace) -> int:
     if not perf_available():
         print("FAIL: perf not found in PATH")
@@ -183,6 +263,21 @@ def build_parser() -> argparse.ArgumentParser:
     prep = sub.add_parser("report", help="regenerate reports from a profile directory")
     prep.add_argument("dir", help="profile directory containing meta.json/perf.data")
     prep.set_defaults(func=cmd_report)
+
+    pcyc = sub.add_parser("cycle", help="repeat profiling N times; TSV output for ministat")
+    pcyc.add_argument("-n", "--runs", type=int, default=30,
+                      help="measured runs; 30-100 gives solid ministat stats (default 30)")
+    pcyc.add_argument("--warmup", type=int, default=1, help="discarded warmup runs (default 1)")
+    pcyc.add_argument("--sleep", type=float, default=0.2, help="seconds between runs (default 0.2)")
+    pcyc.add_argument("--tsv", help="write TSV to file instead of stdout")
+    pcyc.add_argument("-j", "--jobs", type=int, default=None,
+                      help="parallel runs (default: half the logical CPUs "
+                           "to exclude hyper-threading effects)")
+    pcyc.add_argument("--no-pin", action="store_true",
+                      help="do not pin runs to distinct physical cores")
+    pcyc.add_argument("--metrics", help="comma-separated metric columns (default: headline set)")
+    pcyc.add_argument("cmd", nargs=argparse.REMAINDER, metavar="-- CMD", help="target command after --")
+    pcyc.set_defaults(func=cmd_cycle)
 
     pdoc = sub.add_parser("doctor", help="check environment readiness")
     pdoc.set_defaults(func=cmd_doctor)
