@@ -254,6 +254,11 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile) 
 <td class="mono" style="color:var(--dim)">CPU migrations/s {_fmt(m.migrations_per_sec)}</td></tr>
 <tr><td>Page faults/s</td><td>{_fmt(m.page_faults_per_sec)}</td>
 <td class="mono" style="color:var(--dim)">soft+hard</td></tr>
+<tr><td>FP ops retired</td><td data-v="{m.fp_ops_total or 0}">{_fmt_count(m.fp_ops_total)}</td>
+<td class="mono" style="color:var(--dim)">{_fmt_count(m.fp_ops_per_sec)}/s</td></tr>
+<tr><td>Vectorization ratio</td><td data-v="{m.vectorization_pct or 0}">{_fmt(m.vectorization_pct)}%</td>
+<td class="mono" style="color:var(--dim)">scalar {_fmt(m.fp_scalar_pct, "%")} ·
+128b {_fmt(m.fp_128_pct, "%")} · 256b {_fmt(m.fp_256_pct, "%")} · 512b {_fmt(m.fp_512_pct, "%")}</td></tr>
 </tbody></table></div>
 <div class="panel"><h3>Observations</h3>{hints_html}</div>
 </div>

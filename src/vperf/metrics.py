@@ -43,6 +43,14 @@ class MetricsReport:
     cs_per_sec: float | None = None
     migrations_per_sec: float | None = None
     page_faults_per_sec: float | None = None
+    # HPC / vectorization characterization (AMD fp events)
+    fp_ops_total: float | None = None        # retired FP ops (lane-weighted)
+    fp_ops_per_sec: float | None = None
+    fp_scalar_pct: float | None = None       # share of FP uops by width
+    fp_128_pct: float | None = None
+    fp_256_pct: float | None = None
+    fp_512_pct: float | None = None
+    vectorization_pct: float | None = None   # packed(128+256+512) / all FP uops
     # raw counters for the report table: name -> value
     raw_events: dict[str, float] = field(default_factory=dict)
     # timeline: (timestamp_s, avg cores busy)
@@ -157,6 +165,27 @@ def compute_metrics(
     elif cyc and s.get("stalled-cycles-frontend") is not None:
         m.frontend_bound_pct = s["stalled-cycles-frontend"] / cyc * 100.0
 
+    # ---- HPC / vectorization characterization -------------------------------
+    fp_all_uops = s.get("fp_ops_retired_by_width.all")
+    if fp_all_uops:
+        widths = {
+            "scalar": s.get("fp_ops_retired_by_width.scalar_uops_retired") or 0.0,
+            "128": s.get("fp_ops_retired_by_width.pack_128_uops_retired") or 0.0,
+            "256": s.get("fp_ops_retired_by_width.pack_256_uops_retired") or 0.0,
+            "512": s.get("fp_ops_retired_by_width.pack_512_uops_retired") or 0.0,
+        }
+        m.fp_scalar_pct = widths["scalar"] / fp_all_uops * 100.0
+        m.fp_128_pct = widths["128"] / fp_all_uops * 100.0
+        m.fp_256_pct = widths["256"] / fp_all_uops * 100.0
+        m.fp_512_pct = widths["512"] / fp_all_uops * 100.0
+        packed = widths["128"] + widths["256"] + widths["512"]
+        m.vectorization_pct = packed / fp_all_uops * 100.0
+    fp_ops = s.get("fp_ret_sse_avx_ops.all")
+    if fp_ops is not None:
+        m.fp_ops_total = fp_ops
+        if elapsed:
+            m.fp_ops_per_sec = fp_ops / elapsed
+
     # ---- OS noise -----------------------------------------------------------
     cs = s.get("context-switches")
     mg = s.get("cpu-migrations")
@@ -198,6 +227,13 @@ _BASE_EVENTS = [
     "ls_any_fills_from_sys.local_ccx",
     "ls_any_fills_from_sys.all_dram_io",
     "l2_cache_req_stat.ic_dc_miss_in_l2",
+    "fp_ret_sse_avx_ops.all",
+    "fp_ret_sse_avx_ops.mac_flops",
+    "fp_ops_retired_by_width.all",
+    "fp_ops_retired_by_width.scalar_uops_retired",
+    "fp_ops_retired_by_width.pack_128_uops_retired",
+    "fp_ops_retired_by_width.pack_256_uops_retired",
+    "fp_ops_retired_by_width.pack_512_uops_retired",
 ]
 
 
@@ -228,4 +264,12 @@ def all_hints(m: MetricsReport) -> list[str]:
     if m.branch_mispredict_pct is not None and m.branch_mispredict_pct > 5.0:
         out.append(f"Branch mispredict rate {m.branch_mispredict_pct:.1f}% is high; consider "
                    "lookup tables or branchless forms.")
+    if (m.fp_ops_total is not None and m.vectorization_pct is not None
+            and m.fp_ops_total > 1e9):
+        if m.vectorization_pct < 50.0:
+            out.append(f"FP-heavy workload poorly vectorized: only {m.vectorization_pct:.0f}% "
+                       "of FP uops use packed SIMD; enable autovectorization or add "
+                       "explicit vector intrinsics.")
+        elif m.vectorization_pct > 90.0:
+            out.append(f"Well vectorized: {m.vectorization_pct:.0f}% of FP uops packed SIMD.")
     return out
