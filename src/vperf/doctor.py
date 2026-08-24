@@ -47,6 +47,14 @@ CANDIDATE_EVENTS = [
     "ls_any_fills_from_sys.local_ccx",
     "ls_any_fills_from_sys.all_dram_io",
     "l2_cache_req_stat.ic_dc_miss_in_l2",
+    # AMD Zen FP/vectorization characterization (HPC view)
+    "fp_ret_sse_avx_ops.all",
+    "fp_ret_sse_avx_ops.mac_flops",
+    "fp_ops_retired_by_width.all",
+    "fp_ops_retired_by_width.scalar_uops_retired",
+    "fp_ops_retired_by_width.pack_128_uops_retired",
+    "fp_ops_retired_by_width.pack_256_uops_retired",
+    "fp_ops_retired_by_width.pack_512_uops_retired",
 ]
 
 

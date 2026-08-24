@@ -77,6 +77,17 @@ def render_terminal(meta: dict, m: MetricsReport, prof: StackProfile | None) -> 
         ["CPU Migrations/s", _fmt(m.migrations_per_sec)],
         ["Page Faults/s", _fmt(m.page_faults_per_sec)],
     ]
+    if m.vectorization_pct is not None:
+        hw_rows += [
+            ["FP Ops Retired", _fmt_count(m.fp_ops_total)],
+            ["FP Ops / s", _fmt_count(m.fp_ops_per_sec)],
+            ["Vectorization Ratio", _fmt(m.vectorization_pct, " %")],
+            ["FP Width Mix",
+             f"s{_fmt(m.fp_scalar_pct, '%')} / "
+             f"128b {_fmt(m.fp_128_pct, '%')} / "
+             f"256b {_fmt(m.fp_256_pct, '%')} / "
+             f"512b {_fmt(m.fp_512_pct, '%')}", ""],
+        ]
     out.append("")
     out.append("-- Hardware Metrics " + "-" * 59)
     out.append(_table(hw_rows, ["Metric", "Value"]))
