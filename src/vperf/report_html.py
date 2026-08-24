@@ -88,6 +88,33 @@ function sortTable(th,numeric){
 """
 
 
+_QUAD_COLORS = {"Retiring": "var(--good)", "Backend": "var(--bad)",
+                "Frontend": "var(--warn)", "Bad spec": "#c792ea"}
+
+
+def _quad_bar(m: MetricsReport) -> str:
+    parts = [
+        ("Retiring", m.retiring_pct),
+        ("Backend", m.backend_bound_pct),
+        ("Frontend", m.frontend_bound_pct),
+        ("Bad spec", m.bad_speculation_pct),
+    ]
+    known = [(n, v) for n, v in parts if v is not None]
+    if not known:
+        return "<em>n/a</em>"
+    total = sum(v for _, v in known) or 100.0
+    segs = "".join(
+        f'<div title="{esc(n)} {v:.1f}%" style="width:{v/total*100:.2f}%;'
+        f'background:{_QUAD_COLORS[n]}"></div>'
+        for n, v in known)
+    legend = " ".join(
+        f'<span style="color:{_QUAD_COLORS[n]}">■</span>{esc(n)} {_v:.0f}%'
+        for n, _v in known)
+    return (f'<div style="display:flex;height:22px;border-radius:5px;'
+            f'overflow:hidden;margin-bottom:8px">{segs}</div>'
+            f'<div style="font-size:12px;color:var(--dim)">{legend}</div>')
+
+
 def _cards(m: MetricsReport, ncpu: int, prof: StackProfile | None) -> str:
     util = m.effective_cpu_util
     cards = [
@@ -230,12 +257,17 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile) 
 
 <div id="overview" class="page active">
 {_cards(m, ncpu, prof)}
-<div class="panel"><h3>Pipeline bound analysis (approx.)</h3>
+<div class="panel"><h3>Pipeline budget (TMA-like quadrants)</h3>
+{_quad_bar(m)}
 <table><tbody>
+<tr><td>Retiring (remainder)</td><td data-v="{m.retiring_pct or 0}">{_fmt(m.retiring_pct)}%</td>
+<td class="mono" style="color:var(--dim)">budget not lost to stalls/wrong-path</td></tr>
 <tr><td>Backend bound</td><td data-v="{m.backend_bound_pct or 0}">{_fmt(m.backend_bound_pct)}%</td>
 <td class="mono" style="color:var(--dim)">dispatch slots lost to memory/core stalls</td></tr>
 <tr><td>Frontend bound</td><td data-v="{m.frontend_bound_pct or 0}">{_fmt(m.frontend_bound_pct)}%</td>
 <td class="mono" style="color:var(--dim)">slots lost to fetch/decode stalls</td></tr>
+<tr><td>Bad speculation</td><td data-v="{m.bad_speculation_pct or 0}">{_fmt(m.bad_speculation_pct)}%</td>
+<td class="mono" style="color:var(--dim)">est. wrong-path share (mispredict penalty model)</td></tr>
 <tr><td>IPC / CPI</td><td>{_fmt(m.ipc)} / {_fmt(m.cpi)}</td>
 <td class="mono" style="color:var(--dim)">instructions per cycle</td></tr>
 <tr><td>Branch mispredict rate</td><td>{_fmt(m.branch_mispredict_pct)}%</td>
