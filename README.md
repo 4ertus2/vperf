@@ -132,3 +132,39 @@ document real Zen 4 physics: instructions-per-pass halve with each widening,
 cycles shrink until AVX then flatten (double-pumped 512-bit ops), so
 AVX-512 IPC drops to ~half of AVX's — a reminder that IPC compares
 instructions, not work.
+
+Other workloads: `sleeper` (100 ms spin + 200 ms usleep — wait-analysis
+signature: ~2/3 of the window asleep) and `diskwriter`
+(append+fdatasync loop, used by block-IO tests).
+
+## Cycle mode: before/after comparisons with ministat
+
+Single runs are noisy. `vperf cycle` repeats a target N times and writes a
+TSV matrix (rows = runs, columns = metrics) for statistical comparison:
+
+```bash
+# baseline: current build
+vperf cycle -n 30 -- ./myapp > base.tsv
+
+# after your optimization
+vperf cycle -n 30 -- ./myapp-fixed > fixed.tsv
+
+# compare one metric column (IPC is column 4)
+awk -F'\t' 'NR>1{print $4}' base.tsv  > base_ipc.txt
+awk -F'\t' 'NR>1{print $4}' fixed.tsv > fix_ipc.txt
+ministat base_ipc.txt fix_ipc.txt
+```
+
+ministat prints N/min/max/median/avg/stddev per dataset plus a
+"Difference at 95.0% confidence" verdict when the delta is real.
+
+Options: `-n` measured runs (default 30), `--warmup` discarded runs
+(default 1), `-j` parallel runs (default = half your logical CPUs, pinned
+round-robin to distinct physical cores to exclude SMT sibling contention,
+`--no-pin` disables), `--metrics ipc,llc_miss_pct,...` selects columns,
+`--tsv FILE` instead of stdout. Progress and per-metric summary go to
+stderr, so `> file.tsv` stays clean.
+
+The cycle integration test does exactly this across SIMD tiers:
+30-run scalar vs AVX-512 datasets must differ significantly in both
+elapsed time (AVX-512 faster) and IPC (lower — double-pump).
