@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .metrics import BAD_SPEC_PENALTY_CYCLES, MetricsReport, all_hints
+from .memory import LATENCY_BANDS, MemoryProfile
 from .stacks import StackProfile, top_threads
 
 
@@ -32,7 +33,45 @@ def _table(rows: list[list[str]], headers: list[str]) -> str:
     return f"{head}\n{sep}\n{body}"
 
 
-def render_terminal(meta: dict, m: MetricsReport, prof: StackProfile | None) -> str:
+def _memory_section(mp: MemoryProfile) -> list[str]:
+    out = ["", "-- Memory Access (IBS) " + "-" * 54]
+    if mp.total_samples == 0:
+        return out + [" (no samples)"]
+    rows = [
+        ["IBS Samples Collected", f"{mp.total_samples:,}"],
+        ["Classified Data Accesses", f"{mp.classified_samples:,}"],
+        ["Average Access Latency", _fmt(mp.avg_latency, " cyc")],
+    ]
+    out.append(_table(rows, ["Metric", "Value"]))
+
+    mix = []
+    for level in ("DRAM", "L3", "L2", "L1", "other"):
+        pct = mp.level_pct(level)
+        if pct is not None and mp.level_samples.get(level):
+            mix.append([level, f"{mp.level_samples[level]:,}", f"{pct:.1f}%"])
+    if mix:
+        out.append("")
+        out.append(_table(mix, ["Access Level", "Samples", "%"]))
+
+    band_rows = [[name, f"{mp.bands.get(name, 0):,}"]
+                 for name, _lo, _hi in LATENCY_BANDS]
+    out.append("")
+    out.append(_table(band_rows, ["Latency Band (cycles)", "Accesses"]))
+
+    top = mp.top_symbols(10)
+    if top:
+        trows = []
+        for s in top:
+            avg = s.weight / s.samples if s.samples else 0
+            trows.append([s.symbol[:40], s.dso[:18], f"{s.samples:,}",
+                          f"{s.weight:,}", _fmt(avg, " cyc")])
+        out.append("")
+        out.append(_table(trows, ["Function", "Module", "Accesses", "Stall cycles", "Avg lat"]))
+    return out
+
+
+def render_terminal(meta: dict, m: MetricsReport, prof: StackProfile | None,
+                    mem: MemoryProfile | None = None) -> str:
     out: list[str] = []
     tgt = meta["target"]
     what = ("PID " + str(tgt["pid"])) if tgt.get("pid") else " ".join(tgt.get("cmd") or [])
@@ -132,10 +171,18 @@ def render_terminal(meta: dict, m: MetricsReport, prof: StackProfile | None) -> 
         out.append(_table(th_rows, ["Thread", "PID", "Cycles", "%"]))
 
     hs = all_hints(m)
+    if mem is not None and mem.classified_samples:
+        ram = mem.level_pct("DRAM")
+        if ram is not None and ram > 40.0 and (mem.avg_latency or 0) > 200:
+            hs.append(f"Memory-latency bound: {ram:.0f}% of sampled data accesses "
+                      f"miss to DRAM (avg {mem.avg_latency:.0f} cycles). "
+                      "Improve locality, blocking, or prefetching.")
     if hs:
         out.append("")
         out.append("-- Observations " + "-" * 62)
         for h in hs:
             out.append(f" * {h}")
+    if mem is not None:
+        out += _memory_section(mem)
     out.append("")
     return "\n".join(out)

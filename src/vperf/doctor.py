@@ -176,6 +176,12 @@ def run_doctor() -> DoctorReport:
     a_ok, a_err = probe_attach()
     rep.add("attach (-p)", "OK" if a_ok else "WARN",
             a_err or "can attach to existing processes")
+
+    if probe_ibs():
+        rep.add("memory analysis (IBS)", "OK", "ibs_op sampling available")
+    else:
+        rep.add("memory analysis (IBS)", "WARN",
+                "unavailable (Intel CPU or IBS blocked); --no-memory implied")
     return rep
 
 
@@ -183,6 +189,22 @@ def probe_record(event: str) -> tuple[bool, str]:
     r = run_perf(["record", "-o", "/tmp/vperf-probe.data", "-e", event, "--", "true"], timeout=30)
     try:
         os.unlink("/tmp/vperf-probe.data")
+    except OSError:
+        pass
+    return r.returncode == 0, ""
+
+
+def probe_ibs() -> bool:
+    """Check whether AMD IBS op sampling (memory-access analysis) works."""
+    if not perf_available():
+        return False
+    r = run_perf(
+        ["record", "-q", "-d", "-W", "-o", "/tmp/vperf-ibs-probe.data",
+         "-e", "ibs_op//p", "-c", "500003", "--", "true"],
+        timeout=30,
+    )
+    try:
+        os.unlink("/tmp/vperf-ibs-probe.data")
     except OSError:
         pass
     return r.returncode == 0, ""

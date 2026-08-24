@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass
 
 from . import doctor
+from .doctor import probe_ibs
 from .parsers import StatData, parse_stat_csv
 from .perf import PerfError, perf_version, run_perf
 
@@ -22,6 +23,7 @@ class ProfileData:
     stat: StatData
     elapsed: float | None
     script_path: str | None
+    mem_report_path: str | None
     warnings: list[str]
 
 
@@ -64,6 +66,8 @@ def collect(
     duration: float | None = None,
     use_stat: bool = True,
     use_record: bool = True,
+    use_memory: bool = True,
+    mem_period: int = 100003,
     callgraph_mode: str = "dwarf",
     quiet_stdout: bool = False,
 ) -> ProfileData:
@@ -156,6 +160,40 @@ def collect(
                             + (sr.stderr or "").strip().splitlines()[-1][:200]
                             if (sr.stderr or "").strip() else "unknown")
 
+    # ---- pass 3: IBS memory access (AMD) -------------------------------------
+    mem_report_path = None
+    memory_enabled = False
+    if use_memory:
+        ibs_ok = probe_ibs()
+        if ibs_ok:
+            args = ["record", "-q", "-d", "-W",
+                    "-o", os.path.join(outdir, "perf_ibs.data"),
+                    "-e", "ibs_op//p", "-c", str(mem_period)]
+            cg = ["--call-graph", f"{callgraph_mode},16384"] if callgraph_mode != "none" else []
+            args += cg
+            if pid is not None:
+                args += ["-p", str(pid)]
+                placeholder = ["sleep", f"{duration}" if duration else "5"]
+            else:
+                placeholder = list(target_cmd or [])
+            r = run_perf(args + ["--", *placeholder],
+                         timeout=(duration or 0) + 3600)
+            if r.ok:
+                mr = run_perf(["mem", "report", "-i", os.path.join(outdir, "perf_ibs.data")],
+                              timeout=900,
+                              stdout_file=os.path.join(outdir, "mem_report.txt"))
+                if mr.ok and os.path.getsize(os.path.join(outdir, "mem_report.txt")) > 0:
+                    mem_report_path = os.path.join(outdir, "mem_report.txt")
+                    memory_enabled = True
+                else:
+                    warnings.append("IBS samples recorded but mem report failed.")
+            else:
+                warnings.append("IBS memory pass failed: "
+                                + (r.stderr or "").strip().splitlines()[-1][:160]
+                                if (r.stderr or "").strip() else "IBS memory pass failed")
+        else:
+            warnings.append("Memory analysis unavailable (needs AMD IBS); skipped.")
+
     meta = {
         "version": 1,
         "mode": "attach" if pid is not None else "run",
@@ -170,6 +208,7 @@ def collect(
         "metrics": metric_list,
         "precise_event": precise_ev,
         "callgraph": callgraph_mode,
+        "memory": {"enabled": memory_enabled, "period": mem_period if memory_enabled else None},
         "perf_version": perf_version(),
         "elapsed_wall": elapsed,
     }
@@ -181,12 +220,14 @@ def collect(
         stat=stat_data,
         elapsed=elapsed,
         script_path=script_path,
+        mem_report_path=mem_report_path,
         warnings=warnings,
     )
 
 
-def load_profile(outdir: str) -> tuple[dict, StatData, str | None]:
-    """Reload previously collected artifacts (for `report`)."""
+def load_profile(outdir: str) -> tuple[dict, StatData, str | None, str | None]:
+    """Reload previously collected artifacts (for `report`).
+    Returns (meta, stat_data, script_path, mem_report_path)."""
     with open(os.path.join(outdir, "meta.json"), encoding="utf-8") as f:
         meta = json.load(f)
     stat = StatData()
@@ -197,4 +238,7 @@ def load_profile(outdir: str) -> tuple[dict, StatData, str | None]:
     script_path = os.path.join(outdir, "script.txt")
     if not os.path.exists(script_path):
         script_path = None
-    return meta, stat, script_path
+    mem_report_path = os.path.join(outdir, "mem_report.txt")
+    if not os.path.exists(mem_report_path):
+        mem_report_path = None
+    return meta, stat, script_path, mem_report_path

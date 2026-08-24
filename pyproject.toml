@@ -26,3 +26,4 @@ select = ["E", "F", "W"]
 [tool.ruff.lint.per-file-ignores]
 # fixtures replicate real `perf script` output byte-for-byte (tabs matter)
 "tests/test_parsers.py" = ["E101", "W29", "E501"]
+"tests/test_memory_ibs.py" = ["E501"]
