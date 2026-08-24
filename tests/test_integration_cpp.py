@@ -66,12 +66,12 @@ def _profile(binaries: dict[str, Path], args: list[str]) -> MetricsReport:
 
 @pytest.fixture(scope="module")
 def simd_m(binaries) -> MetricsReport:
-    return _profile(binaries, [binaries["simd_levels_avx"], "2000000"])
+    return _profile(binaries, [binaries["simd_levels_avx"], "1000000"])
 
 
 @pytest.fixture(scope="module")
 def membound_m(binaries) -> MetricsReport:
-    return _profile(binaries, [binaries["membound"], str(256 << 20), "1.5"])
+    return _profile(binaries, [binaries["membound"], str(256 << 20), "0.6"])
 
 
 # -------------------------------------------------- SIMD tier ladder

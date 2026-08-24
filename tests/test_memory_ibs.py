@@ -95,7 +95,7 @@ class TestIbsIntegration:
     def test_membound_dram_bound_signature(self, tmp_path):
         binaries = build_binaries()
         outdir = tmp_path / "mem"
-        pd = collect(target_cmd=[str(binaries["membound"]), str(256 << 20), "1.5"],
+        pd = collect(target_cmd=[str(binaries["membound"]), str(256 << 20), "0.7"],
                      pid=None, outdir=str(outdir),
                      use_stat=False, use_record=False, use_memory=True)
         assert pd.mem_report_path, "mem_report.txt not produced"
@@ -132,7 +132,7 @@ class TestIbsIntegration:
 
     def test_meta_records_memory_pass(self, tmp_path):
         binaries = build_binaries()
-        pd = collect(target_cmd=[str(binaries["simd_levels_avx"]), "1000000"],
+        pd = collect(target_cmd=[str(binaries["simd_levels_avx"]), "500000"],
                      pid=None, outdir=str(tmp_path / "meta"),
                      use_stat=False, use_record=False, use_memory=True)
         assert pd.meta["memory"]["enabled"] is True

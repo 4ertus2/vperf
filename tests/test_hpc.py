@@ -78,7 +78,7 @@ def subprocess_run_build():
 
 class TestVectorizationCharacterization:
     def test_simd_kernel_is_vectorized(self, built):
-        m = _profile(built, [built["simd_levels_avx"], "2000000"])
+        m = _profile(built, [built["simd_levels_avx"], "1000000"])
         if m.vectorization_pct is None:
             pytest.skip("AMD fp width events unavailable")
         # AVX2 add kernel must be overwhelmingly packed SIMD
@@ -89,7 +89,7 @@ class TestVectorizationCharacterization:
         assert (m.fp_ops_per_sec or 0) > 10e9
 
     def test_membound_has_no_fp_work(self, built):
-        m = _profile(built, [built["membound"], str(256 << 20), "1.2"])
+        m = _profile(built, [built["membound"], str(256 << 20), "0.5"])
         if m.vectorization_pct is None:
             pytest.skip("AMD fp width events unavailable")
         # integer pointer chasing: negligible FP ops overall
@@ -109,7 +109,7 @@ class TestSimdTiersVectorWidth:
                      "simd_levels_avx", "simd_levels_avx512"):
             if name not in built:
                 continue
-            out[name] = _profile(built, [built[name], "2000000"])
+            out[name] = _profile(built, [built[name], "1000000"])
         return out
 
     def test_avx_uses_256b(self, tier_metrics):

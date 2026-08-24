@@ -109,6 +109,10 @@ Notes & caveats:
 uv venv && uv pip install -e . pytest ruff
 .venv/bin/python -m pytest tests/ -q   # unit + integration (needs perf access)
 ruff check src/
+
+Note: run the suite WITHOUT pytest-xdist/-n. The integration tests assert
+exact PMU counter relationships; concurrent profiling sessions multiplex
+the hardware counters and break those assertions.
 ```
 
 Examples in `examples/` are C++ workloads with opposite, well-understood

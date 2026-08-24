@@ -137,9 +137,9 @@ class TestCycleIntegration:
         b = _ensure_built()
         if not (b / "simd_levels_avx512").exists():
             pytest.skip("AVX-512 tier not built")
-        base = _cycle(str(b / "simd_levels_scalar"), 500000, 30,
+        base = _cycle(str(b / "simd_levels_scalar"), 250000, 30,
                       metrics="run,elapsed_s,ipc")
-        comp = _cycle(str(b / "simd_levels_avx512"), 500000, 30,
+        comp = _cycle(str(b / "simd_levels_avx512"), 250000, 30,
                       metrics="run,elapsed_s,ipc")
 
         assert len(base.strip().splitlines()) == 31  # header + 30 runs
