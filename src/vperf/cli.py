@@ -141,6 +141,15 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_diff(args: argparse.Namespace) -> int:
+    from vperf.diff import _analyze_dir, render_diff
+
+    base_m, base_p, base_meta = _analyze_dir(args.base)
+    comp_m, comp_p, comp_meta = _analyze_dir(args.compared)
+    print(render_diff(base_m, base_p, comp_m, comp_p, base_meta, comp_meta))
+    return 0
+
+
 def cmd_doctor(_args: argparse.Namespace) -> int:
     if not perf_available():
         print("FAIL: perf not found in PATH")
@@ -183,6 +192,11 @@ def build_parser() -> argparse.ArgumentParser:
     prep = sub.add_parser("report", help="regenerate reports from a profile directory")
     prep.add_argument("dir", help="profile directory containing meta.json/perf.data")
     prep.set_defaults(func=cmd_report)
+
+    pdif = sub.add_parser("diff", help="compare two profile directories")
+    pdif.add_argument("base", help="baseline profile directory")
+    pdif.add_argument("compared", help="comparison profile directory")
+    pdif.set_defaults(func=cmd_diff)
 
     pdoc = sub.add_parser("doctor", help="check environment readiness")
     pdoc.set_defaults(func=cmd_doctor)
