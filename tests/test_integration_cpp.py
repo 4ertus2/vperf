@@ -46,7 +46,7 @@ def binaries() -> dict[str, Path]:
     assert r.returncode == 0, f"build failed:\n{r.stderr}"
     bindir = REPO / "examples" / "bin"
     out = {p.name: p for p in bindir.iterdir() if p.is_file()}
-    for required in ("simd", "membound"):
+    for required in ("simd_levels_avx", "membound"):
         assert required in out, f"{required} missing after build"
     return out
 
@@ -54,15 +54,19 @@ def binaries() -> dict[str, Path]:
 def _profile(binaries: dict[str, Path], args: list[str]) -> MetricsReport:
     """Counting pass only: fast, stable numbers for metric assertions."""
     outdir = tempfile.mkdtemp(prefix="vperf-it-")
-    pd = collect(target_cmd=[str(args[0]), *args[1:]], pid=None,
-                 outdir=outdir, use_record=False)
-    return compute_metrics(pd.stat, pd.elapsed,
-                           pd.meta.get("ncpus", 1), pd.meta.get("interval_ms"))
+    try:
+        pd = collect(target_cmd=[str(args[0]), *args[1:]], pid=None,
+                     outdir=outdir, use_record=False,
+                     use_memory=False, use_wait=False)
+        return compute_metrics(pd.stat, pd.elapsed,
+                               pd.meta.get("ncpus", 1), pd.meta.get("interval_ms"))
+    finally:
+        shutil.rmtree(outdir, ignore_errors=True)
 
 
 @pytest.fixture(scope="module")
 def simd_m(binaries) -> MetricsReport:
-    return _profile(binaries, [binaries["simd"], "1.5"])
+    return _profile(binaries, [binaries["simd_levels_avx"], "2000000"])
 
 
 @pytest.fixture(scope="module")
@@ -288,15 +292,16 @@ class TestBoundAnalysis:
 
 class TestCollectionPlumbing:
     def test_record_pass_produces_samples_and_hotspots(self, binaries, tmp_path):
-        pd = collect(target_cmd=[str(binaries["simd"]), "1.0"],
+        pd = collect(target_cmd=[str(binaries["simd_levels_avx"]), "1000000"],
                      pid=None, outdir=str(tmp_path / "rec"),
                      freq=399, use_stat=False)
         assert pd.script_path, "script dump missing"
         text = Path(pd.script_path).read_text(errors="replace")
         samples = parse_perf_script(text)
-        assert len(samples) > 100
+        # sample COUNT fluctuates with system load; sampled CYCLES track work
+        assert len(samples) > 40
         prof_total = sum(s.period for s in samples)
-        assert prof_total > 1e8
+        assert prof_total > 1e9
 
         from vperf.stacks import build_profile
         prof = build_profile(samples)

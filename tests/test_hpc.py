@@ -78,7 +78,7 @@ def subprocess_run_build():
 
 class TestVectorizationCharacterization:
     def test_simd_kernel_is_vectorized(self, built):
-        m = _profile(built, [built["simd"], "1.5"])
+        m = _profile(built, [built["simd_levels_avx"], "2000000"])
         if m.vectorization_pct is None:
             pytest.skip("AMD fp width events unavailable")
         # AVX2 add kernel must be overwhelmingly packed SIMD

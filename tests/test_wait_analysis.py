@@ -141,10 +141,14 @@ class TestWaitIntegration:
         assert r.returncode == 0, r.stderr
 
     def run_wait_pass(self, binary, args):
+        import shutil
         outdir = tempfile.mkdtemp(prefix="vperf-wait-")
-        return collect(target_cmd=[str(binary), *args], pid=None,
-                       outdir=outdir, use_stat=False, use_record=False,
-                       use_memory=False, use_wait=True)
+        try:
+            return collect(target_cmd=[str(binary), *args], pid=None,
+                           outdir=outdir, use_stat=False, use_record=False,
+                           use_memory=False, use_wait=True)
+        finally:
+            shutil.rmtree(outdir, ignore_errors=True)
 
     def test_sleeper_signature(self, tmp_path):
         self.build()

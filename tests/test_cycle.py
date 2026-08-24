@@ -105,7 +105,7 @@ def _cycle_par(bin_path: str, passes: int, jobs: int, runs: int) -> str:
 class TestCycleIntegration:
     def test_produces_parseable_tsv(self):
         b = _ensure_built()
-        out = _cycle(str(b / "simd"), "0.3", 3)   # simd arg = seconds
+        out = _cycle(str(b / "simd_levels_avx"), 300000, 3)
         lines = out.strip().split("\n")
         assert len(lines) == 4  # header + 3 runs
         assert lines[0].split("\t")[0] == "run"

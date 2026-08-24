@@ -112,8 +112,9 @@ hardware signatures (used by the integration tests):
 
 ```bash
 examples/build.sh                       # g++ -O3 -march=x86-64-v3 -> examples/bin/
-vperf run -- examples/bin/simd 1.5      # AVX2 reduction, L1-resident array
-                                        #   -> IPC ~2.8, ~zero cache/TLB misses
+vperf run -- examples/bin/simd_levels_avx 2000000
+                                        # AVX2 dot product, L1-resident arrays
+                                        #   -> IPC ~2.9, ~zero cache/TLB misses
 vperf run -- examples/bin/membound 268435456 1.5
                                         # dependent-load pointer chase, 256 MiB
                                         #   -> IPC ~0.14, huge L1/L2/LLC misses,

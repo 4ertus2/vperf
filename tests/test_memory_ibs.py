@@ -110,14 +110,20 @@ class TestIbsIntegration:
     def test_simd_low_latency_contrast(self, tmp_path):
         binaries = build_binaries()
         def prof_of(binname, args):
-            pd = collect(target_cmd=[str(binaries[binname]), *args],
-                         pid=None, outdir=str(tmp_path / binname),
-                         use_stat=False, use_record=False, use_memory=True)
-            assert pd.mem_report_path
-            return parse_mem_report(Path(pd.mem_report_path).read_text(errors="replace"))
+            import shutil
+            outdir = str(tmp_path / binname)
+            try:
+                pd = collect(target_cmd=[str(binaries[binname]), *args],
+                             pid=None, outdir=outdir,
+                             use_stat=False, use_record=False, use_memory=True)
+                assert pd.mem_report_path
+                return parse_mem_report(
+                    Path(pd.mem_report_path).read_text(errors="replace"))
+            finally:
+                shutil.rmtree(outdir, ignore_errors=True)
 
         mb = prof_of("membound", [str(256 << 20), "1.5"])
-        sd = prof_of("simd", ["1.5"])
+        sd = prof_of("simd_levels_avx", ["2000000"])
         if sd.classified_samples < 50:
             pytest.skip("too few classified samples for contrast")
         mb_ram = mb.level_pct("DRAM") or 0
@@ -126,7 +132,7 @@ class TestIbsIntegration:
 
     def test_meta_records_memory_pass(self, tmp_path):
         binaries = build_binaries()
-        pd = collect(target_cmd=[str(binaries["simd"]), "1.0"],
+        pd = collect(target_cmd=[str(binaries["simd_levels_avx"]), "1000000"],
                      pid=None, outdir=str(tmp_path / "meta"),
                      use_stat=False, use_record=False, use_memory=True)
         assert pd.meta["memory"]["enabled"] is True

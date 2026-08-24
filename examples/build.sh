@@ -6,7 +6,6 @@ mkdir -p bin
 
 CXXFLAGS="-O3 -march=x86-64-v3 -std=c++17 -Wall"
 
-g++ $CXXFLAGS -o bin/simd simd.cpp
 g++ $CXXFLAGS -o bin/membound membound.cpp
 g++ $CXXFLAGS -o bin/sleeper sleeper.cpp
 

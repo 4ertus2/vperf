@@ -217,7 +217,8 @@ def cmd_cycle(args: argparse.Namespace) -> int:
         outdir = os.path.join(base, f"run_{idx}")
         t0 = time.monotonic()
         pd = collect(target_cmd=cmd_args, pid=None, outdir=outdir,
-                     use_stat=True, use_record=False, quiet_stdout=True)
+                     use_stat=True, use_record=False,
+                     use_memory=False, use_wait=False, quiet_stdout=True)
         m = compute_metrics(pd.stat, pd.elapsed,
                             pd.meta.get("ncpus", 1), pd.meta.get("interval_ms"))
         ipc_s = f"{m.ipc:.3f}" if m.ipc is not None else "na"
