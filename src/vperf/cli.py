@@ -244,6 +244,8 @@ def cmd_cycle(args: argparse.Namespace) -> int:
         print("\ninterrupted", file=sys.stderr)
         raise SystemExit(130)
 
+    shutil.rmtree(base, ignore_errors=True)   # per-run artifacts not needed
+
     ordered_idx = sorted(results)
     reports = [results[i][0] for i in ordered_idx]
     cpus = [results[i][1] for i in ordered_idx]
