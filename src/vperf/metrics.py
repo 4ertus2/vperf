@@ -201,7 +201,8 @@ def compute_metrics(
         m.fp_256_pct = widths["256"] / fp_all_uops * 100.0
         m.fp_512_pct = widths["512"] / fp_all_uops * 100.0
         packed = widths["128"] + widths["256"] + widths["512"]
-        m.vectorization_pct = packed / fp_all_uops * 100.0
+        # multiplexed groups scale independently; the ratio can exceed 100%
+        m.vectorization_pct = min(packed / fp_all_uops * 100.0, 100.0)
     fp_ops = s.get("fp_ret_sse_avx_ops.all")
     if fp_ops is not None:
         m.fp_ops_total = fp_ops

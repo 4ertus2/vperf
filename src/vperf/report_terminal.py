@@ -24,8 +24,9 @@ def _fmt_count(v: float | None) -> str:
 
 def _table(rows: list[list[str]], headers: list[str]) -> str:
     widths = [len(h) for h in headers]
+    ncols = len(widths)
     for row in rows:
-        for i, cell in enumerate(row):
+        for i, cell in enumerate(row[:ncols]):
             widths[i] = max(widths[i], len(cell))
     sep = "-+-".join("-" * w for w in widths)
     head = " | ".join(h.ljust(w) for h, w in zip(headers, widths))
@@ -120,12 +121,11 @@ def render_terminal(meta: dict, m: MetricsReport, prof: StackProfile | None,
         hw_rows += [
             ["FP Ops Retired", _fmt_count(m.fp_ops_total)],
             ["FP Ops / s", _fmt_count(m.fp_ops_per_sec)],
-            ["Vectorization Ratio", _fmt(m.vectorization_pct, " %")],
-            ["FP Width Mix",
-             f"s{_fmt(m.fp_scalar_pct, '%')} / "
-             f"128b {_fmt(m.fp_128_pct, '%')} / "
-             f"256b {_fmt(m.fp_256_pct, '%')} / "
-             f"512b {_fmt(m.fp_512_pct, '%')}", ""],
+            ["Vectorization Ratio", _fmt(m.vectorization_pct, " %")
+             + f"  (s{_fmt(m.fp_scalar_pct, '%')} / "
+               f"128b {_fmt(m.fp_128_pct, '%')} / "
+               f"256b {_fmt(m.fp_256_pct, '%')} / "
+               f"512b {_fmt(m.fp_512_pct, '%')})"],
         ]
     out.append("")
     out.append("-- Hardware Metrics " + "-" * 59)
