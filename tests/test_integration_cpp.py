@@ -292,7 +292,7 @@ class TestBoundAnalysis:
 
 class TestCollectionPlumbing:
     def test_record_pass_produces_samples_and_hotspots(self, binaries, tmp_path):
-        pd = collect(target_cmd=[str(binaries["simd_levels_avx"]), "1000000"],
+        pd = collect(target_cmd=[str(binaries["simd_levels_avx"]), "6000000"],
                      pid=None, outdir=str(tmp_path / "rec"),
                      freq=399, use_stat=False)
         assert pd.script_path, "script dump missing"
