@@ -1,0 +1,189 @@
+"""Collection passes: wrap the target under perf stat + perf record."""
+
+from __future__ import annotations
+
+import json
+import os
+import platform
+import socket
+import sys
+import time
+from dataclasses import dataclass
+
+from . import doctor
+from .parsers import StatData, parse_stat_csv
+from .perf import PerfError, perf_version, run_perf
+
+
+@dataclass
+class ProfileData:
+    outdir: str
+    meta: dict
+    stat: StatData
+    elapsed: float | None
+    script_path: str | None
+    warnings: list[str]
+
+
+def _ncpus() -> int:
+    return os.cpu_count() or 1
+
+
+def _probe_capabilities() -> tuple[list[str], list[str], str]:
+    ev_ok, _ev_bad = doctor.supported_events(doctor.CANDIDATE_EVENTS)
+    m_ok, _m_bad = doctor.supported_metrics()
+    precise = None
+    for ev in ("cycles:P", "cycles:pu", "cycles"):
+        ok, _ = doctor.probe_record(ev)
+        if ok:
+            precise = ev
+            break
+    return ev_ok, m_ok, precise or "cycles"
+
+
+def _write_meta(outdir: str, meta: dict) -> None:
+    with open(os.path.join(outdir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+
+def collect(
+    target_cmd: list[str] | None,
+    pid: int | None,
+    outdir: str,
+    freq: int = 199,
+    interval_ms: int | None = None,
+    duration: float | None = None,
+    use_stat: bool = True,
+    use_record: bool = True,
+    callgraph_mode: str = "dwarf",
+) -> ProfileData:
+    """Profile either a new process (`target_cmd`) or an existing one (`pid`)."""
+    os.makedirs(outdir, exist_ok=True)
+    warnings: list[str] = []
+
+    ev_list, metric_list, precise_ev = _probe_capabilities()
+    if not metric_list:
+        warnings.append("No named metrics supported; deriving metrics from base counters.")
+
+    # ---- pass 1: perf stat --------------------------------------------------
+    stat_data = StatData()
+    elapsed: float | None = None
+    stat_csv = os.path.abspath(os.path.join(outdir, "stat.csv"))
+    if use_stat:
+        args = ["stat", "-x,", "-o", stat_csv,
+                "-e", ",".join(ev_list) if ev_list else "task-clock"]
+        if metric_list:
+            args += ["-M", ",".join(metric_list)]
+        if interval_ms:
+            args += ["-I", str(interval_ms)]
+        if pid is not None:
+            args += ["-p", str(pid)]
+            placeholder = ["sleep", f"{duration}"] if duration else ["sleep", "5"]
+            float(placeholder[1])
+        else:
+            placeholder = list(target_cmd or [])
+
+        t0 = time.monotonic()
+        r = run_perf(args + ["--", *placeholder])
+        elapsed = time.monotonic() - t0
+        if not r.ok:
+            (r.stderr or "").strip()
+            if interval_ms:
+                # retry once without intervals
+                args2 = [a for i, a in enumerate(args) if not (a == "-I" or (i and args[i - 1] == "-I"))]
+                t0 = time.monotonic()
+                r = run_perf(args2 + ["--", *placeholder])
+                elapsed = time.monotonic() - t0
+                if r.ok:
+                    warnings.append("Interval collection unavailable; timeline falls back to samples.")
+                    interval_ms = None
+        if not r.ok:
+            raise PerfError(
+                "perf stat failed:\n" + (r.stderr or "").strip()[:2000]
+                + ("\n" + doctor.PERF_ACCESS_HINTS if "paranoid" in (r.stderr or "") or "Access" in (r.stderr or "") else "")
+            )
+        if target_cmd and r.stdout:
+            sys.stdout.write(r.stdout)  # forward target's own output
+        known = set(ev_list) | set(metric_list)
+        try:
+            with open(stat_csv, encoding="utf-8", errors="replace") as f:
+                stat_data.merge(parse_stat_csv(f.read(), known))
+        except OSError:
+            warnings.append("perf produced no stat output.")
+
+    # ---- pass 2: perf record -------------------------------------------------
+    script_path = None
+    if use_record:
+        cg = ["--call-graph", f"{callgraph_mode},16384"] if callgraph_mode != "none" else []
+        args = ["record", "-F", str(freq), "-e", precise_ev, *cg, "-o",
+                os.path.join(outdir, "perf.data")]
+        if pid is not None:
+            args += ["-p", str(pid)]
+            placeholder = ["sleep", f"{duration}" if duration else "5"]
+        else:
+            placeholder = list(target_cmd or [])
+        r = run_perf(args + ["--", *placeholder], timeout=(duration or 0) + 3600)
+        if not r.ok and callgraph_mode == "dwarf":
+            warnings.append("DWARF call graphs failed; retrying with frame pointers.")
+            args = [a for i, a in enumerate(args) if not (a == "--call-graph" or (i and args[i - 1] == "--call-graph"))]
+            args = ["record", "-g", "-F", str(freq), "-e", precise_ev,
+                    "-o", os.path.join(outdir, "perf.data")]
+            if pid is not None:
+                args += ["-p", str(pid)]
+            r = run_perf(args + ["--", *(placeholder)], timeout=(duration or 0) + 3600)
+        if not r.ok:
+            raise PerfError("perf record failed:\n" + (r.stderr or "").strip()[:2000])
+
+        # default format: explicit -F field lists suppress callchain frames
+        sr = run_perf(["script", "-i", os.path.join(outdir, "perf.data")],
+                      timeout=600,
+                      stdout_file=os.path.join(outdir, "script.txt"))
+        if sr.ok:
+            script_path = os.path.join(outdir, "script.txt")
+        else:
+            warnings.append("Could not dump samples via perf script: "
+                            + (sr.stderr or "").strip().splitlines()[-1][:200]
+                            if (sr.stderr or "").strip() else "unknown")
+
+    meta = {
+        "version": 1,
+        "mode": "attach" if pid is not None else "run",
+        "target": {"cmd": target_cmd, "pid": pid, "duration": duration},
+        "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "host": socket.gethostname(),
+        "kernel": platform.release(),
+        "ncpus": _ncpus(),
+        "freq": freq,
+        "interval_ms": interval_ms,
+        "events": ev_list,
+        "metrics": metric_list,
+        "precise_event": precise_ev,
+        "callgraph": callgraph_mode,
+        "perf_version": perf_version(),
+        "elapsed_wall": elapsed,
+    }
+    _write_meta(outdir, meta)
+
+    return ProfileData(
+        outdir=outdir,
+        meta=meta,
+        stat=stat_data,
+        elapsed=elapsed,
+        script_path=script_path,
+        warnings=warnings,
+    )
+
+
+def load_profile(outdir: str) -> tuple[dict, StatData, str | None]:
+    """Reload previously collected artifacts (for `report`)."""
+    with open(os.path.join(outdir, "meta.json"), encoding="utf-8") as f:
+        meta = json.load(f)
+    stat = StatData()
+    stat_csv = os.path.join(outdir, "stat.csv")
+    if os.path.exists(stat_csv):
+        with open(stat_csv, encoding="utf-8", errors="replace") as f:
+            stat.merge(parse_stat_csv(f.read(), set(meta.get("events", [])) | set(meta.get("metrics", []))))
+    script_path = os.path.join(outdir, "script.txt")
+    if not os.path.exists(script_path):
+        script_path = None
+    return meta, stat, script_path

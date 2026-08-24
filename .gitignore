@@ -1,0 +1,7 @@
+.venv/
+.vperf/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+examples/bin/
+.ruff_cache/
