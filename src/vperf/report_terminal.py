@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .metrics import BAD_SPEC_PENALTY_CYCLES, MetricsReport, all_hints
+from .wait import WAIT_BANDS_MS, WaitProfile
 from .memory import LATENCY_BANDS, MemoryProfile
 from .stacks import StackProfile, top_threads
 
@@ -71,8 +72,39 @@ def _memory_section(mp: MemoryProfile) -> list[str]:
     return out
 
 
+def _wait_section(wp) -> list[str]:
+    out = ["", "-- Wait / Off-CPU (sched tracepoints) " + "-" * 40]
+    if wp is None or wp.window_s is None or not wp.threads:
+        return out + [" (no data)"]
+    w = wp.window_s
+    rows = [
+        ["Observation Window", f"{w:.3f} s"],
+        ["On-CPU (avg cores)", _fmt(wp.util_cores)],
+        ["Sleep (voluntary)", f"{_fmt(wp.sleep_s, ' s')}  ({_fmt(wp.sleep_share_pct, ' %')})"],
+        ["Blocked / IOwait", f"{_fmt(wp.blocked_s + wp.iowait_s, ' s')}  "
+                             f"({_fmt(wp.blocked_share_pct, ' %')})"],
+        ["Preempted Switches", f"{wp.preempted_total:,}"],
+    ]
+    out.append(_table(rows, ["Metric", "Value"]))
+
+    band_rows = [[name, f"{wp.bands.get(name, 0):,}"]
+                 for name, _lo, _hi in WAIT_BANDS_MS]
+    out.append("")
+    out.append(_table(band_rows, ["Delay Band", "Events"]))
+
+    trows = []
+    for t in wp.top_threads(10):
+        trows.append([f"{t.comm} ({t.tid})", _fmt(t.runtime_s, " s"),
+                      _fmt(t.sleep_s, " s"), _fmt(t.blocked_s + t.iowait_s, " s"),
+                      f"{t.preempted:,}"])
+    out.append("")
+    out.append(_table(trows, ["Thread", "On-CPU", "Sleep", "Blocked/IO", "Preempted"]))
+    return out
+
+
 def render_terminal(meta: dict, m: MetricsReport, prof: StackProfile | None,
-                    mem: MemoryProfile | None = None) -> str:
+                    mem: MemoryProfile | None = None,
+                    wp: WaitProfile | None = None) -> str:
     out: list[str] = []
     tgt = meta["target"]
     what = ("PID " + str(tgt["pid"])) if tgt.get("pid") else " ".join(tgt.get("cmd") or [])
@@ -184,5 +216,7 @@ def render_terminal(meta: dict, m: MetricsReport, prof: StackProfile | None,
             out.append(f" * {h}")
     if mem is not None:
         out += _memory_section(mem)
+    if wp is not None:
+        out += _wait_section(wp)
     out.append("")
     return "\n".join(out)

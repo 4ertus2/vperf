@@ -182,6 +182,14 @@ def run_doctor() -> DoctorReport:
     else:
         rep.add("memory analysis (IBS)", "WARN",
                 "unavailable (Intel CPU or IBS blocked); --no-memory implied")
+
+    if probe_wait():
+        rep.add("wait analysis (sched tracepoints)", "OK",
+                "scheduler tracepoints accessible")
+    else:
+        rep.add("wait analysis (sched tracepoints)", "WARN",
+                "tracepoints denied at this paranoid level; --no-wait implied "
+                "(CAP_PERFMON or paranoid<=0 unlocks)")
     return rep
 
 
@@ -192,6 +200,13 @@ def probe_record(event: str) -> tuple[bool, str]:
     except OSError:
         pass
     return r.returncode == 0, ""
+
+
+def probe_wait() -> bool:
+    """Check whether scheduler tracepoints are accessible (needs CAP_PERFMON
+    or paranoid <= 0 on stock kernels)."""
+    r = run_perf(["stat", "-e", "sched:sched_switch", "--", "true"], timeout=30)
+    return r.returncode == 0
 
 
 def probe_ibs() -> bool:

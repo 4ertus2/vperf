@@ -7,6 +7,7 @@ from collections import defaultdict
 
 from .flamegraph import render_flame_svg
 from .memory import LATENCY_BANDS, MemoryProfile
+from .wait import WAIT_BANDS_MS, WaitProfile
 from .metrics import MetricsReport, all_hints
 from .stacks import StackProfile, TreeNode, top_threads
 from .timeline import render_threads_svg, render_util_svg, thread_series
@@ -254,8 +255,64 @@ def _memory_tab(mem: MemoryProfile | None) -> str:
 </div>'''
 
 
+def _wait_tab(wp: WaitProfile | None) -> str:
+    if wp is None or wp.window_s is None or not wp.threads:
+        return ('<div class="page" id="wait"><div class="panel">'
+                '<h3>Wait / Off-CPU</h3><em>Not collected (scheduler '
+                'tracepoints unavailable; needs CAP_PERFMON).</em></div></div>')
+    w = max(wp.window_s, 1e-9)
+    parts = [
+        ("On-CPU", wp.runtime_s / w * 100, "#59d499"),
+        ("Sleep", wp.sleep_s / w * 100, "#c792ea"),
+        ("Blocked/IO", (wp.blocked_s + wp.iowait_s) / w * 100, "#ff6f7d"),
+    ]
+    segs = "".join(
+        f'<div title="{esc(n)} {v:.1f}%" style="width:{min(v,100):.2f}%;'
+        f'background:{color}"></div>' for n, v, color in parts if v > 0)
+    legend = " ".join(f'<span style="color:{c}">■</span>{esc(n)} {v:.0f}%'
+                      for n, v, c in parts if v > 0)
+
+    def bars(items):
+        peak = max((v for _, v in items), default=1) or 1
+        rows = "".join(
+            f"<tr><td class='mono'>{esc(k)}</td>"
+            f"<td data-v='{v}'><span class='bar' style='width:{v/peak*120:.0f}px'></span> "
+            f"{v:,}</td></tr>"
+            for k, v in items if v)
+        return (f"<table><thead><tr><th></th><th>Count</th></tr></thead>"
+                f"<tbody>{rows}</tbody></table>")
+
+    bands = [(nm, wp.bands.get(nm, 0)) for nm, _lo, _hi in WAIT_BANDS_MS]
+    trows = ""
+    for t in wp.top_threads(20):
+        off = t.sleep_s + t.blocked_s + t.iowait_s
+        share = off / w * 100 if w else 0
+        trows += (f"<tr><td class='mono'>{esc(t.comm)} ({t.tid})</td>"
+                  f"<td data-v='{t.runtime_s:.6f}' class='mono'>{t.runtime_s:,.3f} s</td>"
+                  f"<td data-v='{off:.6f}' class='mono'>{off:,.3f} s</td>"
+                  f"<td data-v='{share:.3f}'>{share:.1f}%</td>"
+                  f"<td data-v='{t.preempted}'>{t.preempted:,}</td></tr>")
+    thread_table = (
+        "<table><thead><tr>"
+        "<th onclick='sortTable(this,0)'>Thread</th>"
+        "<th onclick='sortTable(this,1)'>On-CPU</th>"
+        "<th onclick='sortTable(this,1)'>Off-CPU (sleep+blocked)</th>"
+        "<th onclick='sortTable(this,1)'>Off-CPU % of window</th>"
+        "<th onclick='sortTable(this,1)'>Preempted</th>"
+        "</tr></thead><tbody>" + trows + "</tbody></table>")
+
+    return f'''<div id="wait" class="page">
+<div class="panel"><h3>Where the time went (window {wp.window_s:.2f}s)</h3>
+<div style="display:flex;height:22px;border-radius:5px;overflow:hidden;margin-bottom:8px">{segs}</div>
+<div style="font-size:12px;color:var(--dim)">{legend}</div></div>
+<div class="panel"><h3>Sleep/block delay distribution</h3>{bars(bands)}</div>
+<div class="panel"><h3>Threads by wait time</h3>{thread_table}</div>
+</div>'''
+
+
 def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
-               mem: MemoryProfile | None = None) -> str:
+               mem: MemoryProfile | None = None,
+               wp: WaitProfile | None = None) -> str:
     ncpu = meta.get("ncpus", 1)
 
     # ---- flame graphs -------------------------------------------------------
@@ -310,6 +367,7 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 <div class="tab active" onclick="showTab(this,'overview')">Overview</div>
 <div class="tab" onclick="showTab(this,'hotspots')">Hotspots</div>
 <div class="tab" onclick="showTab(this,'mem')">Memory</div>
+<div class="tab" onclick="showTab(this,'wait')">Wait</div>
 <div class="tab" onclick="showTab(this,'flame')">Flame Graph</div>
 <div class="tab" onclick="showTab(this,'timeline')">Timeline</div>
 <div class="tab" onclick="showTab(this,'tree')">Call Tree</div>
@@ -361,6 +419,8 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 </div>
 
 {_memory_tab(mem)}
+
+{_wait_tab(wp)}
 
 <div id="flame" class="page">
 <div class="panel"><h3>Flame graph</h3>{flame_sel}<div id="flamewrap">{''.join(flame_divs)}</div></div>
