@@ -55,6 +55,10 @@ vperf run -- ./yourapp --arg1 val
 vperf run -f 999 -o myprofile -- ./yourapp     # 999 Hz, custom output dir
 vperf run --callgraph fp -- ./yourapp          # frame-pointer unwinding
 vperf run --no-record -- ./yourapp             # counters only (fast)
+vperf run --no-memory --no-wait -- ./yourapp   # skip optional passes
+
+# compare two profiles (baseline vs after your change)
+vperf diff .vperf/base .vperf/after
 
 # attach to a running process (needs CAP_PERFMON/CAP_SYS_PTRACE, see doctor)
 vperf attach -p 1234 --duration 10
