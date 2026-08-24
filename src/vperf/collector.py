@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 
 from . import doctor
-from .doctor import probe_ibs
+from .doctor import probe_ibs, probe_wait
 from .parsers import StatData, parse_stat_csv
 from .perf import PerfError, perf_version, run_perf
 
@@ -24,6 +24,7 @@ class ProfileData:
     elapsed: float | None
     script_path: str | None
     mem_report_path: str | None
+    wait_path: str | None
     warnings: list[str]
 
 
@@ -68,6 +69,7 @@ def collect(
     use_record: bool = True,
     use_memory: bool = True,
     mem_period: int = 100003,
+    use_wait: bool = True,
     callgraph_mode: str = "dwarf",
     quiet_stdout: bool = False,
 ) -> ProfileData:
@@ -160,7 +162,40 @@ def collect(
                             + (sr.stderr or "").strip().splitlines()[-1][:200]
                             if (sr.stderr or "").strip() else "unknown")
 
-    # ---- pass 3: IBS memory access (AMD) -------------------------------------
+    # ---- pass 3: wait/off-CPU via scheduler tracepoints ----------------------
+    from .wait import TRACEPOINT_EVENTS
+    wait_path = None
+    wait_enabled = False
+    if use_wait:
+        w_ok = probe_wait()
+        if w_ok:
+            args = ["record", "-q", "-o", os.path.join(outdir, "perf_wait.data"),
+                    "-e", ",".join(TRACEPOINT_EVENTS)]
+            if pid is not None:
+                args += ["-p", str(pid)]
+                placeholder = ["sleep", f"{duration}" if duration else "5"]
+            else:
+                placeholder = list(target_cmd or [])
+            r = run_perf(args + ["--", *placeholder],
+                         timeout=(duration or 0) + 3600)
+            if r.ok:
+                wr = run_perf(["script", "-i", os.path.join(outdir, "perf_wait.data")],
+                              timeout=900,
+                              stdout_file=os.path.join(outdir, "wait.txt"))
+                if wr.ok and os.path.getsize(os.path.join(outdir, "wait.txt")) > 0:
+                    wait_path = os.path.join(outdir, "wait.txt")
+                    wait_enabled = True
+                else:
+                    warnings.append("Wait events recorded but script dump failed.")
+            else:
+                warnings.append("Wait pass failed: "
+                                + (r.stderr or "").strip().splitlines()[-1][:160]
+                                if (r.stderr or "").strip() else "wait pass failed")
+        else:
+            warnings.append("Wait analysis skipped: scheduler tracepoints need "
+                            "CAP_PERFMON or kernel.perf_event_paranoid<=0.")
+
+    # ---- pass 4: IBS memory access (AMD) -------------------------------------
     mem_report_path = None
     memory_enabled = False
     if use_memory:
@@ -209,6 +244,7 @@ def collect(
         "precise_event": precise_ev,
         "callgraph": callgraph_mode,
         "memory": {"enabled": memory_enabled, "period": mem_period if memory_enabled else None},
+        "wait": {"enabled": wait_enabled},
         "perf_version": perf_version(),
         "elapsed_wall": elapsed,
     }
@@ -221,6 +257,7 @@ def collect(
         elapsed=elapsed,
         script_path=script_path,
         mem_report_path=mem_report_path,
+        wait_path=wait_path,
         warnings=warnings,
     )
 
@@ -241,4 +278,7 @@ def load_profile(outdir: str) -> tuple[dict, StatData, str | None, str | None]:
     mem_report_path = os.path.join(outdir, "mem_report.txt")
     if not os.path.exists(mem_report_path):
         mem_report_path = None
-    return meta, stat, script_path, mem_report_path
+    wait_path = os.path.join(outdir, "wait.txt")
+    if not os.path.exists(wait_path):
+        wait_path = None
+    return meta, stat, script_path, mem_report_path, wait_path

@@ -59,14 +59,16 @@ def _analyze(stat_data: StatData, elapsed: float | None, script_path: str | None
 
 def _finish(outdir: str, meta: dict, warnings: list[str], stat_data: StatData,
             elapsed: float | None, script_path: str | None,
-            mem_report_path: str | None = None) -> None:
+            mem_report_path: str | None = None,
+            wait_path: str | None = None) -> None:
     samples, prof, m = _analyze(
         stat_data, elapsed, script_path,
         meta.get("ncpus", 1), meta.get("interval_ms"),
     )
     mem = _load_mem_profile(mem_report_path)
+    wp = _load_wait_profile(wait_path)
 
-    print(render_terminal(meta, m, prof, mem))
+    print(render_terminal(meta, m, prof, mem, wp))
     if warnings:
         print("Warnings:")
         for w in warnings:
@@ -78,6 +80,17 @@ def _finish(outdir: str, meta: dict, warnings: list[str], stat_data: StatData,
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(build_html(meta, samples, m, prof, mem))
     print(f"HTML report: {report_path}")
+
+
+def _load_wait_profile(wait_path: str | None):
+    if not wait_path:
+        return None
+    from vperf.wait import parse_wait_script
+    try:
+        with open(wait_path, encoding="utf-8", errors="replace") as f:
+            return parse_wait_script(f.read())
+    except OSError:
+        return None
 
 
 def _load_mem_profile(mem_report_path: str | None):
@@ -107,9 +120,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         use_record=not args.no_record,
         callgraph_mode=args.callgraph,
         use_memory=not args.no_memory,
+        use_wait=not args.no_wait,
     )
     _finish(outdir, pd.meta, pd.warnings, pd.stat, pd.elapsed, pd.script_path,
-            pd.mem_report_path)
+            pd.mem_report_path, pd.wait_path)
     return 0
 
 
@@ -138,24 +152,30 @@ def cmd_attach(args: argparse.Namespace) -> int:
         use_record=not args.no_record,
         callgraph_mode=args.callgraph,
         use_memory=not args.no_memory,
+        use_wait=not args.no_wait,
     )
     _finish(outdir, pd.meta, pd.warnings, pd.stat, pd.elapsed or args.duration,
-            pd.script_path, pd.mem_report_path)
+            pd.script_path, pd.mem_report_path, pd.wait_path)
     return 0
 
 
 def cmd_report(args: argparse.Namespace) -> int:
-    meta, stat_data, script_path, mem_report_path = load_profile(args.dir)
+    loaded = load_profile(args.dir)
+    meta, stat_data = loaded[0], loaded[1]
+    script_path = loaded[2] if len(loaded) > 2 else None
+    mem_report_path = loaded[3] if len(loaded) > 3 else None
+    wait_path = loaded[4] if len(loaded) > 4 else None
     samples, prof, m = _analyze(
         stat_data, meta.get("elapsed_wall"), script_path,
         meta.get("ncpus", 1), meta.get("interval_ms"),
     )
     mem = _load_mem_profile(mem_report_path)
+    wp = _load_wait_profile(wait_path)
     meta["_outdir"] = os.path.abspath(args.dir)
-    print(render_terminal(meta, m, prof, mem))
+    print(render_terminal(meta, m, prof, mem, wp))
     report_path = os.path.join(args.dir, "report.html")
     with open(report_path, "w", encoding="utf-8") as f:
-        f.write(build_html(meta, samples, m, prof, mem))
+        f.write(build_html(meta, samples, m, prof, mem, wp))
     print(f"HTML report: {report_path}")
     return 0
 
@@ -276,6 +296,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="call graph unwinding method")
         sp.add_argument("--no-memory", action="store_true",
                         help="skip the IBS memory-access pass (AMD only)")
+        sp.add_argument("--no-wait", action="store_true",
+                        help="skip the wait/off-CPU pass (scheduler tracepoints)")
 
     prun = sub.add_parser("run", help="profile a new process")
     common(prun)
