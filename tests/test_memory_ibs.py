@@ -1,6 +1,6 @@
-"""IBS Memory Access analysis tests (AMD).
+"""Memory Access analysis tests (AMD IBS + Intel PEBS).
 
-Unit tests run anywhere; integration tests require working ibs_op sampling.
+Unit tests run anywhere; integration tests require working IBS or PEBS.
 """
 
 import shutil
@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from vperf.collector import collect
-from vperf.doctor import probe_ibs, probe_stat
+from vperf.doctor import probe_ibs, probe_intel_mem, probe_stat
 from vperf.memory import MemoryProfile, parse_mem_report
 REPO = Path(__file__).resolve().parents[1]
 
@@ -74,6 +74,10 @@ def test_classify_levels():
     assert _classify_access("L2 hit") == "L2"
     assert _classify_access("N/A") == "unclassified"
     assert _classify_access("") == "unclassified"
+    # Intel-specific access levels
+    assert _classify_access("L1 miss") == "L1"
+    assert _classify_access("LFB hit") == "L1"
+    assert _classify_access("Local RAM hit") == "DRAM"
 
 
 def test_empty_report():
@@ -137,6 +141,48 @@ class TestIbsIntegration:
                      use_stat=False, use_record=False, use_memory=True)
         assert pd.meta["memory"]["enabled"] is True
         assert pd.meta["memory"]["period"] > 0
+
+
+# --------------------------------------------------- integration (Intel PEBS)
+
+
+@pytest.mark.skipif(not probe_intel_mem(), reason="Intel PEBS memory sampling unavailable")
+class TestIntelPebsIntegration:
+    def test_membound_has_dram_accesses(self, tmp_path):
+        binaries = build_binaries()
+        outdir = tmp_path / "pebs"
+        pd = collect(target_cmd=[str(binaries["membound"]), str(256 << 20), "0.7"],
+                     pid=None, outdir=str(outdir),
+                     use_stat=False, use_record=False, use_memory=True)
+        assert pd.mem_report_path, "mem_report.txt not produced"
+        mp = parse_mem_report(Path(pd.mem_report_path).read_text(errors="replace"))
+        assert mp.classified_samples > 100
+        # pointer chase should show DRAM accesses
+        ram = mp.level_pct("DRAM")
+        assert ram is not None and ram > 10.0, f"expected DRAM accesses, got {ram:.1f}%"
+        assert mp.top_symbols(3)[0].symbol == "main"
+
+    def test_simd_has_low_latency(self, tmp_path):
+        binaries = build_binaries()
+        outdir = tmp_path / "pebs-simd"
+        pd = collect(target_cmd=[str(binaries["simd_levels_avx"]), "2000000"],
+                     pid=None, outdir=str(outdir),
+                     use_stat=False, use_record=False, use_memory=True)
+        assert pd.mem_report_path, "mem_report.txt not produced"
+        mp = parse_mem_report(Path(pd.mem_report_path).read_text(errors="replace"))
+        if mp.classified_samples < 50:
+            pytest.skip("too few classified samples")
+        # SIMD array fits in cache -> lower DRAM fraction than membound
+        ram = mp.level_pct("DRAM") or 0
+        assert ram < 50.0, f"SIMD should have low DRAM share, got {ram:.1f}%"
+
+    def test_meta_records_pebs_backend(self, tmp_path):
+        binaries = build_binaries()
+        pd = collect(target_cmd=[str(binaries["simd_levels_avx"]), "500000"],
+                     pid=None, outdir=str(tmp_path / "meta"),
+                     use_stat=False, use_record=False, use_memory=True)
+        assert pd.meta["memory"]["enabled"] is True
+        assert pd.meta["memory"]["backend"] == "pebs"
 
 
 # ------------------------------------------------------------- helpers

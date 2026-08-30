@@ -200,7 +200,7 @@ def _tree_html(node: TreeNode, total: int, depth: int = 0) -> str:
 def _memory_tab(mem: MemoryProfile | None) -> str:
     if mem is None or mem.total_samples == 0:
         return ('<div class="page" id="mem"><div class="panel">'
-                '<h3>Memory access</h3><em>Not collected (AMD IBS '
+                '<h3>Memory access</h3><em>Not collected (AMD IBS / Intel PEBS '
                 'unavailable or disabled with --no-memory).</em></div></div>')
     total = max(mem.classified_samples, 1)
 

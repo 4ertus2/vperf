@@ -210,9 +210,12 @@ def run_doctor() -> DoctorReport:
 
     if probe_ibs():
         rep.add("memory analysis (IBS)", "OK", "ibs_op sampling available")
+    elif probe_intel_mem():
+        rep.add("memory analysis (PEBS)", "OK",
+                "Intel PEBS mem-loads/stores available (--ldlat 30)")
     else:
-        rep.add("memory analysis (IBS)", "WARN",
-                "unavailable (Intel CPU or IBS blocked); --no-memory implied")
+        rep.add("memory analysis", "WARN",
+                "neither AMD IBS nor Intel PEBS memory sampling available; --no-memory implied")
 
     if probe_wait():
         rep.add("wait analysis (sched tracepoints)", "OK",
@@ -251,6 +254,27 @@ def probe_ibs() -> bool:
     )
     try:
         os.unlink("/tmp/vperf-ibs-probe.data")
+    except OSError:
+        pass
+    return r.returncode == 0
+
+
+def probe_intel_mem() -> bool:
+    """Check whether Intel PEBS memory-access sampling works.
+
+    Uses ``perf mem record --ldlat 30`` which employs Precise Event-Based
+    Sampling (PEBS) with a load-latency threshold of 30 cycles.  This is
+    the Intel analog of AMD IBS for per-instruction memory profiling.
+    """
+    if not perf_available():
+        return False
+    r = run_perf(
+        ["mem", "record", "--ldlat", "30", "-o", "/tmp/vperf-intel-mem-probe.data",
+         "--", "true"],
+        timeout=30,
+    )
+    try:
+        os.unlink("/tmp/vperf-intel-mem-probe.data")
     except OSError:
         pass
     return r.returncode == 0
@@ -305,6 +329,7 @@ __all__ = [
     "branch_mispredict_penalty",
     "cpu_vendor",
     "paranoid_level",
+    "probe_intel_mem",
     "probe_record",
     "probe_stat",
     "run_doctor",
