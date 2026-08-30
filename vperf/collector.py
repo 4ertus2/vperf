@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 
 from . import doctor
-from .doctor import probe_ibs, probe_wait
+from .doctor import probe_ibs, probe_intel_mem, probe_wait
 from .parsers import StatData, parse_stat_csv
 from .perf import PerfError, perf_version, run_perf
 
@@ -200,12 +200,14 @@ def collect(
             warnings.append("Wait analysis skipped: scheduler tracepoints need "
                             "CAP_PERFMON or kernel.perf_event_paranoid<=0.")
 
-    # ---- pass 4: IBS memory access (AMD) -------------------------------------
+    # ---- pass 4: memory access (AMD IBS or Intel PEBS) ----------------------
     mem_report_path = None
     memory_enabled = False
+    mem_backend = None  # "ibs" or "pebs"
     if use_memory:
         ibs_ok = probe_ibs()
         if ibs_ok:
+            mem_backend = "ibs"
             args = ["record", "-q", "-d", "-W",
                     "-o", os.path.join(outdir, "perf_ibs.data"),
                     "-e", "ibs_op//p", "-c", str(mem_period)]
@@ -231,8 +233,35 @@ def collect(
                 warnings.append("IBS memory pass failed: "
                                 + (r.stderr or "").strip().splitlines()[-1][:160]
                                 if (r.stderr or "").strip() else "IBS memory pass failed")
+        elif probe_intel_mem():
+            # Intel PEBS: perf mem record with load-latency threshold
+            mem_backend = "pebs"
+            args = ["mem", "record", "--ldlat", "30",
+                    "-o", os.path.join(outdir, "perf_mem.data")]
+            cg = ["--call-graph", f"{callgraph_mode},16384"] if callgraph_mode != "none" else []
+            args += cg
+            if pid is not None:
+                args += ["-p", str(pid)]
+                placeholder = ["sleep", f"{duration}" if duration else "5"]
+            else:
+                placeholder = list(target_cmd or [])
+            r = run_perf(args + ["--", *placeholder],
+                         timeout=(duration or 0) + 3600)
+            if r.ok:
+                mr = run_perf(["mem", "report", "-i", os.path.join(outdir, "perf_mem.data")],
+                              timeout=900,
+                              stdout_file=os.path.join(outdir, "mem_report.txt"))
+                if mr.ok and os.path.getsize(os.path.join(outdir, "mem_report.txt")) > 0:
+                    mem_report_path = os.path.join(outdir, "mem_report.txt")
+                    memory_enabled = True
+                else:
+                    warnings.append("Intel PEBS samples recorded but mem report failed.")
+            else:
+                warnings.append("Intel PEBS memory pass failed: "
+                                + (r.stderr or "").strip().splitlines()[-1][:160]
+                                if (r.stderr or "").strip() else "PEBS memory pass failed")
         else:
-            warnings.append("Memory analysis unavailable (needs AMD IBS); skipped.")
+            warnings.append("Memory analysis unavailable (needs AMD IBS or Intel PEBS); skipped.")
 
     meta = {
         "version": 1,
@@ -248,7 +277,8 @@ def collect(
         "metrics": metric_list,
         "precise_event": precise_ev,
         "callgraph": callgraph_mode,
-        "memory": {"enabled": memory_enabled, "period": mem_period if memory_enabled else None},
+        "memory": {"enabled": memory_enabled, "backend": mem_backend,
+                    "period": mem_period if memory_enabled else None},
         "wait": {"enabled": wait_enabled},
         "perf_version": perf_version(),
         "elapsed_wall": elapsed,

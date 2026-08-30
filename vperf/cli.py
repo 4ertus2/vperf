@@ -298,7 +298,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--callgraph", choices=["dwarf", "fp", "none"], default="dwarf",
                         help="call graph unwinding method")
         sp.add_argument("--no-memory", action="store_true",
-                        help="skip the IBS memory-access pass (AMD only)")
+                        help="skip the memory-access pass (AMD IBS or Intel PEBS)")
         sp.add_argument("--no-wait", action="store_true",
                         help="skip the wait/off-CPU pass (scheduler tracepoints)")
 

@@ -1,12 +1,18 @@
-"""IBS memory-access analysis (AMD Instruction-Based Sampling).
+"""Memory-access analysis via AMD IBS or Intel PEBS.
 
-The collection pass records tagged micro-ops with data-address sampling:
+Collection uses one of two backends depending on hardware:
 
+AMD IBS (Instruction-Based Sampling):
     perf record -d -W -e ibs_op//p -c <period> -- <target>
 
-and post-processes them into VTune's Memory Access view via
-`perf mem report`, which classifies every sampled load/store by where its
-data came from (L1/L2/L3/RAM) together with the access latency in cycles.
+Intel PEBS (Precise Event-Based Sampling):
+    perf mem record --ldlat 30 -- <target>
+
+Both produce ``perf mem report`` output with per-sample cache-level
+classification and latency data, parsed identically by this module.
+
+The parser classifies every sampled load/store by where its data came
+from (L1/L2/L3/RAM) together with the access latency in cycles.
 """
 
 from __future__ import annotations
@@ -48,7 +54,7 @@ def _classify_access(access: str) -> str:
     a = access.strip().lower()
     if not a or a == "n/a":
         return "unclassified"
-    if "l1" in a:
+    if "l1" in a or "lfb" in a:
         return "L1"
     if "l2" in a:
         return "L2"
