@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .doctor import AMD_ONLY_EVENTS, GENERIC_EVENTS, branch_mispredict_penalty
 from .parsers import StatData
 
-# average branch-misprediction recovery penalty in cycles (Zen 3/4 ≈ 13)
-BAD_SPEC_PENALTY_CYCLES = 13.0
+# Vendor-aware branch-misprediction recovery penalty in cycles.
+BAD_SPEC_PENALTY_CYCLES = branch_mispredict_penalty()
 
 
 @dataclass
@@ -239,25 +240,7 @@ def compute_metrics(
     return m
 
 
-_BASE_EVENTS = [
-    "task-clock", "cycles", "instructions", "branches", "branch-misses",
-    "cache-references", "cache-misses", "context-switches", "cpu-migrations",
-    "page-faults", "L1-dcache-load-misses", "L1-dcache-loads",
-    "dTLB-load-misses", "dTLB-loads",
-    "stalled-cycles-frontend", "stalled-cycles-backend",
-    "LLC-loads", "LLC-load-misses",
-    "ls_any_fills_from_sys.all",
-    "ls_any_fills_from_sys.local_ccx",
-    "ls_any_fills_from_sys.all_dram_io",
-    "l2_cache_req_stat.ic_dc_miss_in_l2",
-    "fp_ret_sse_avx_ops.all",
-    "fp_ret_sse_avx_ops.mac_flops",
-    "fp_ops_retired_by_width.all",
-    "fp_ops_retired_by_width.scalar_uops_retired",
-    "fp_ops_retired_by_width.pack_128_uops_retired",
-    "fp_ops_retired_by_width.pack_256_uops_retired",
-    "fp_ops_retired_by_width.pack_512_uops_retired",
-]
+_BASE_EVENTS = GENERIC_EVENTS + AMD_ONLY_EVENTS
 
 
 def all_hints(m: MetricsReport) -> list[str]:

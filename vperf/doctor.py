@@ -22,7 +22,8 @@ CANDIDATE_METRICS = [
     "CPUs_utilized",
 ]
 
-CANDIDATE_EVENTS = [
+# Generic events available on both AMD and Intel.
+GENERIC_EVENTS = [
     "task-clock",
     "cycles",
     "instructions",
@@ -39,15 +40,16 @@ CANDIDATE_EVENTS = [
     "dTLB-loads",
     "LLC-loads",
     "LLC-load-misses",
-    # AMD Zen cache-hierarchy data-source events (core PMU, no extra caps):
-    #   all        = all data-cache fills (i.e. L1 misses serviced)
-    #   local_ccx  = fills from the local L3            -> LLC hits
-    #   all_dram_io= fills from DRAM/MMIO               -> LLC misses
+    "stalled-cycles-frontend",
+    "stalled-cycles-backend",
+]
+
+# AMD Zen-only events: data-source fill events, L2 misses, FP width characterization.
+AMD_ONLY_EVENTS = [
     "ls_any_fills_from_sys.all",
     "ls_any_fills_from_sys.local_ccx",
     "ls_any_fills_from_sys.all_dram_io",
     "l2_cache_req_stat.ic_dc_miss_in_l2",
-    # AMD Zen FP/vectorization characterization (HPC view)
     "fp_ret_sse_avx_ops.all",
     "fp_ret_sse_avx_ops.mac_flops",
     "fp_ops_retired_by_width.all",
@@ -56,6 +58,35 @@ CANDIDATE_EVENTS = [
     "fp_ops_retired_by_width.pack_256_uops_retired",
     "fp_ops_retired_by_width.pack_512_uops_retired",
 ]
+
+# Keep a flat list for backward compatibility.
+CANDIDATE_EVENTS = GENERIC_EVENTS + AMD_ONLY_EVENTS
+
+
+def cpu_vendor() -> str:
+    """Return CPU vendor string ('GenuineIntel', 'AuthenticAMD', or 'unknown')."""
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("vendor_id"):
+                    return line.split(":", 1)[1].strip()
+    except (OSError, ValueError):
+        pass
+    return "unknown"
+
+
+# Average branch-misprediction recovery penalty in cycles per vendor.
+# Intel: 15-20 cycles (varies by microarchitecture; 15 is a safe lower bound).
+# AMD Zen 3/4: ~13 cycles.
+_BRANCH_PENALTY: dict[str, float] = {
+    "GenuineIntel": 15.0,
+    "AuthenticAMD": 13.0,
+}
+
+
+def branch_mispredict_penalty() -> float:
+    """Return the branch-misprediction penalty in cycles for the current CPU."""
+    return _BRANCH_PENALTY.get(cpu_vendor(), 15.0)
 
 
 @dataclass
@@ -222,7 +253,7 @@ def probe_ibs() -> bool:
         os.unlink("/tmp/vperf-ibs-probe.data")
     except OSError:
         pass
-    return r.returncode == 0, ""
+    return r.returncode == 0
 
 
 def probe_attach() -> tuple[bool, str]:
@@ -265,10 +296,14 @@ def probe_attach() -> tuple[bool, str]:
 
 
 __all__ = [
+    "AMD_ONLY_EVENTS",
     "CANDIDATE_EVENTS",
     "CANDIDATE_METRICS",
+    "GENERIC_EVENTS",
     "PERF_ACCESS_HINTS",
     "DoctorReport",
+    "branch_mispredict_penalty",
+    "cpu_vendor",
     "paranoid_level",
     "probe_record",
     "probe_stat",

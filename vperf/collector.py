@@ -40,7 +40,12 @@ def _probe_capabilities() -> tuple[list[str], list[str], str]:
     cached = _PROBE_CACHE.get("caps")
     if cached is not None:
         return list(cached[0]), list(cached[1]), cached[2]
-    ev_ok, _ev_bad = doctor.supported_events(doctor.CANDIDATE_EVENTS)
+    # On AMD, probe all events (generic + AMD-only).  On Intel, skip AMD-only
+    # events so perf stat does not emit noisy <not counted> lines.
+    candidates = (doctor.GENERIC_EVENTS + doctor.AMD_ONLY_EVENTS
+                  if doctor.cpu_vendor() == "AuthenticAMD"
+                  else doctor.GENERIC_EVENTS)
+    ev_ok, _ev_bad = doctor.supported_events(candidates)
     m_ok, m_bad = doctor.supported_metrics()
     precise = None
     for ev in ("cycles:P", "cycles:pu", "cycles"):
