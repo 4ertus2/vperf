@@ -125,7 +125,9 @@ def _cards(m: MetricsReport, ncpu: int, prof: StackProfile | None) -> str:
         ("Effective CPU Utilization",
          (_fmt(util) if util is not None else "n/a") +
          (f" <small>of {ncpu} cores</small>" if util is not None else ""), ""),
-        ("IPC", _fmt(m.ipc), f"<small>CPI {_fmt(m.cpi)}</small>" if m.cpi else ""),
+        ("IPC / CPI",
+         f"<b>{_fmt(m.ipc)}</b> / <b>{_fmt(m.cpi)}</b>" if m.cpi else _fmt(m.ipc),
+         ""),
         ("Branch Mispredict", _fmt(m.branch_mispredict_pct), "%"),
         ("LLC Miss Rate", _fmt(m.llc_miss_pct), "%"),
         ("Backend Bound", _fmt(m.backend_bound_pct), "%"),
