@@ -1,5 +1,5 @@
 CXX      ?= g++
-CXXFLAGS ?= -O3 -march=x86-64-v3 -std=c++17 -Wall
+CXXFLAGS ?= -O3 -march=x86-64-v3 -std=c++17 -Wall -g
 
 BINDIR   := bin
 SRCDIR   := .
