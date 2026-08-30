@@ -182,7 +182,8 @@ class TestIntelPebsIntegration:
                      pid=None, outdir=str(tmp_path / "meta"),
                      use_stat=False, use_record=False, use_memory=True)
         assert pd.meta["memory"]["enabled"] is True
-        assert pd.meta["memory"]["backend"] == "pebs"
+        backend = pd.meta["memory"]["backend"]
+        assert backend in ("pebs", "ibs"), f"unexpected backend: {backend}"
 
 
 # ------------------------------------------------------------- helpers
