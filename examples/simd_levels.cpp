@@ -6,7 +6,7 @@
 // accumulator chains so every variant is execution-throughput-bound rather
 // than FP-latency-bound.
 //
-// Build matrix (see build.sh):
+// Build matrix (see Makefile):
 //   -DUSE_SCALAR  -O3 -fno-tree-vectorize -fno-tree-slp-vectorize
 //   -DUSE_SSE     -msse4.2                (128-bit, mul+add, no FMA)
 //   -DUSE_AVX     -mavx2 -mfma            (256-bit FMA)

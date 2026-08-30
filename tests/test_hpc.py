@@ -72,7 +72,7 @@ def built() -> dict[str, Path]:
 
 
 def subprocess_run_build():
-    return subprocess.run(["bash", str(REPO / "examples" / "build.sh")],
+    return subprocess.run(["make", "-C", str(REPO / "examples")],
                           capture_output=True, text=True, timeout=120)
 
 

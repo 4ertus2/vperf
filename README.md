@@ -119,7 +119,7 @@ Examples in `examples/` are C++ workloads with opposite, well-understood
 hardware signatures (used by the integration tests):
 
 ```bash
-examples/build.sh                       # g++ -O3 -march=x86-64-v3 -> examples/bin/
+make -C examples                      # g++ -O3 -march=x86-64-v3 -> examples/bin/
 vperf run -- examples/bin/simd_levels_avx 2000000
                                         # AVX2 dot product, L1-resident arrays
                                         #   -> IPC ~2.9, ~zero cache/TLB misses

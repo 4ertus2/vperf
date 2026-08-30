@@ -66,7 +66,7 @@ def test_summary_math():
 def _ensure_built() -> Path:
     bindir = REPO / "examples" / "bin"
     if not (bindir / "simd_levels_scalar").exists():
-        r = subprocess.run(["bash", str(REPO / "examples" / "build.sh")],
+        r = subprocess.run(["make", "-C", str(REPO / "examples")],
                            capture_output=True, text=True, timeout=120)
         assert r.returncode == 0, r.stderr
     return bindir

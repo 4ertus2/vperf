@@ -174,5 +174,5 @@ class TestWaitIntegration:
 
 def subprocess_run_build():
     import subprocess
-    return subprocess.run(["bash", str(REPO / "examples" / "build.sh")],
+    return subprocess.run(["make", "-C", str(REPO / "examples")],
                           capture_output=True, text=True, timeout=120)

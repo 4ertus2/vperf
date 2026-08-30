@@ -40,7 +40,7 @@ def binaries() -> dict[str, Path]:
     if not shutil.which("g++"):
         pytest.skip("g++ not available")
     r = subprocess.run(
-        ["bash", str(REPO / "examples" / "build.sh")],
+        ["make", "-C", str(REPO / "examples")],
         capture_output=True, text=True, timeout=120,
     )
     assert r.returncode == 0, f"build failed:\n{r.stderr}"
