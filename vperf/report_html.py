@@ -197,7 +197,8 @@ def _tree_html(node: TreeNode, total: int, depth: int = 0) -> str:
             f"<span class='selfpct'>{pct:.1f}% · self {self_pct:.1f}%</span></summary>{inner}</details>")
 
 
-def _memory_tab(mem: MemoryProfile | None) -> str:
+def _memory_tab(mem: MemoryProfile | None, backend: str = "ibs") -> str:
+    label = "IBS" if backend == "ibs" else "PEBS"
     if mem is None or mem.total_samples == 0:
         return ('<div class="page" id="mem"><div class="panel">'
                 '<h3>Memory access</h3><em>Not collected (AMD IBS / Intel PEBS '
@@ -239,9 +240,9 @@ def _memory_tab(mem: MemoryProfile | None) -> str:
         "</tr></thead><tbody>" + stall_rows + "</tbody></table>")
 
     return f'''<div id="mem" class="page">
-<div class="panel"><h3>Memory access summary (IBS)</h3>
+<div class="panel"><h3>Memory access summary ({label})</h3>
 <table><tbody>
-<tr><td>IBS samples collected</td><td>{mem.total_samples:,}</td>
+<tr><td>{label} samples collected</td><td>{mem.total_samples:,}</td>
 <td class="mono" style="color:var(--dim)">tagged micro-ops</td></tr>
 <tr><td>Classified data accesses</td><td>{mem.classified_samples:,}</td>
 <td class="mono" style="color:var(--dim)">with cache-level attribution</td></tr>
@@ -418,7 +419,7 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 <div class="panel"><h3>Top functions by self time</h3>{_hotspots_table(prof)}</div>
 </div>
 
-{_memory_tab(mem)}
+{_memory_tab(mem, meta.get("memory", {}).get("backend", "ibs"))}
 
 {_wait_tab(wp)}
 

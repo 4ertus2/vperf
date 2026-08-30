@@ -35,12 +35,13 @@ def _table(rows: list[list[str]], headers: list[str]) -> str:
     return f"{head}\n{sep}\n{body}"
 
 
-def _memory_section(mp: MemoryProfile) -> list[str]:
-    out = ["", "-- Memory Access (IBS) " + "-" * 54]
+def _memory_section(mp: MemoryProfile, backend: str = "ibs") -> list[str]:
+    label = "IBS" if backend == "ibs" else "PEBS"
+    out = ["", f"-- Memory Access ({label}) " + "-" * (56 - len(label))]
     if mp.total_samples == 0:
         return out + [" (no samples)"]
     rows = [
-        ["IBS Samples Collected", f"{mp.total_samples:,}"],
+        [f"{label} Samples Collected", f"{mp.total_samples:,}"],
         ["Classified Data Accesses", f"{mp.classified_samples:,}"],
         ["Average Access Latency", _fmt(mp.avg_latency, " cyc")],
     ]
@@ -215,7 +216,7 @@ def render_terminal(meta: dict, m: MetricsReport, prof: StackProfile | None,
         for h in hs:
             out.append(f" * {h}")
     if mem is not None:
-        out += _memory_section(mem)
+        out += _memory_section(mem, meta.get("memory", {}).get("backend", "ibs"))
     if wp is not None:
         out += _wait_section(wp)
     out.append("")
