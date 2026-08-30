@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import math
+import statistics
 
 
 def _esc(s: str) -> str:
@@ -190,3 +191,99 @@ def render_threads_svg(
             ly += 14
     out.append("</svg>")
     return "".join(out), colors
+
+
+def render_freq_svg(
+    freq_samples: list[tuple[float, dict[int, int]]],
+    width: int = 1160,
+    height: int = 180,
+) -> str:
+    """Area chart of CPU frequency over time (min/avg/max envelope)."""
+    if not freq_samples:
+        return ""
+    t0 = freq_samples[0][0]
+    t1 = freq_samples[-1][0]
+    tspan = max(t1 - t0, 1e-6)
+
+    # compute min/p25/median/p75/max per sample
+    envelope: list[tuple[float, float, float, float, float, float]] = []
+    for t, freqs in freq_samples:
+        vals = sorted(v / 1e6 for v in freqs.values())  # kHz -> GHz, sorted
+        if not vals:
+            continue
+        n = len(vals)
+        def _pct(p: float) -> float:
+            k = p * (n - 1)
+            lo = int(k)
+            hi = min(lo + 1, n - 1)
+            return vals[lo] + (vals[hi] - vals[lo]) * (k - lo)
+        envelope.append((t, vals[0], _pct(0.25), statistics.median(vals), _pct(0.75), vals[-1]))
+
+    if not envelope:
+        return ""
+
+    ymax = max(e[5] for e in envelope) * 1.05
+    if ymax <= 0:
+        ymax = 5.0
+
+    pad_l, pad_b, pad_t = 56, 24, 8
+    plot_w = width - pad_l - 10
+    plot_h = height - pad_b - pad_t
+
+    def X(t: float) -> float:
+        return pad_l + (t - t0) / tspan * plot_w
+
+    def Y(v: float) -> float:
+        return pad_t + plot_h - min(v / ymax, 1.0) * plot_h
+
+    out = [(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+            f'font-family="Verdana,sans-serif" font-size="11">')]
+
+    # grid + y labels
+    step = _nice_axes(ymax)
+    g = 0.0
+    while g <= ymax + 1e-9:
+        out.append(f'<line x1="{pad_l}" y1="{Y(g):.1f}" x2="{width-10}" y2="{Y(g):.1f}" stroke="#333" stroke-width="1"/>')
+        out.append(f'<text x="{pad_l-6}" y="{Y(g)+4:.1f}" text-anchor="end" fill="#999">{g:.1f}</text>')
+        g += step
+
+    # max envelope (filled area)
+    pts_max = " ".join(f"{X(t):.1f},{Y(mx):.1f}" for t, _, _, _, _, mx in envelope)
+    pts_min_rev = " ".join(f"{X(t):.1f},{Y(mn):.1f}" for t, mn, _, _, _, _ in reversed(envelope))
+    out.append(
+        f'<polygon points="{X(t0):.1f},{pad_t+plot_h} {pts_max} {pts_min_rev} {X(t0):.1f},{pad_t+plot_h}" '
+        f'fill="rgba(64,156,255,0.20)" stroke="none"/>'
+    )
+
+    # p75 line (dashed)
+    pts_p75 = " ".join(f"{X(t):.1f},{Y(p):.1f}" for t, _, _, _, p, _ in envelope)
+    out.append(f'<polyline points="{pts_p75}" fill="none" stroke="#409cff" stroke-width="1" stroke-dasharray="6,3" opacity="0.6"/>')
+
+    # median line (solid)
+    pts_med = " ".join(f"{X(t):.1f},{Y(md):.1f}" for t, _, _, md, _, _ in envelope)
+    out.append(f'<polyline points="{pts_med}" fill="none" stroke="#409cff" stroke-width="1.5"/>')
+
+    # p25 line (dashed)
+    pts_p25 = " ".join(f"{X(t):.1f},{Y(p):.1f}" for t, _, p, _, _, _ in envelope)
+    out.append(f'<polyline points="{pts_p25}" fill="none" stroke="#409cff" stroke-width="1" stroke-dasharray="6,3" opacity="0.6"/>')
+
+    # min line (dotted)
+    pts_min_line = " ".join(f"{X(t):.1f},{Y(mn):.1f}" for t, mn, _, _, _, _ in envelope)
+    out.append(f'<polyline points="{pts_min_line}" fill="none" stroke="#409cff" stroke-width="1" stroke-dasharray="2,3" opacity="0.4"/>')
+
+    # x labels
+    for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+        t = t0 + frac * tspan
+        out.append(f'<text x="{X(t):.1f}" y="{height-6}" text-anchor="middle" fill="#999">{frac*tspan:.2f}s</text>')
+
+    # legend
+    lx = pad_l + 4
+    ly = pad_t + 12
+    for label, dash, opa in [("max", "6,3", "0.6"), ("p75", "6,3", "0.6"), ("median", "none", "1"), ("p25", "6,3", "0.6"), ("min", "2,3", "0.4")]:
+        out.append(f'<line x1="{lx}" y1="{ly-4}" x2="{lx+12}" y2="{ly-4}" stroke="#409cff" stroke-width="2" stroke-dasharray="{dash}" opacity="{opa}"/>')
+        out.append(f'<text x="{lx+16}" y="{ly}" fill="#ddd">{label}</text>')
+        lx += 56
+
+    out.append(f'<text x="{pad_l-44}" y="{pad_t+10}" fill="#bbb">GHz</text>')
+    out.append("</svg>")
+    return "".join(out)

@@ -10,7 +10,7 @@ from .memory import LATENCY_BANDS, MemoryProfile
 from .wait import WAIT_BANDS_MS, WaitProfile
 from .metrics import MetricsReport, all_hints
 from .stacks import StackProfile, TreeNode, top_threads
-from .timeline import render_threads_svg, render_util_svg, thread_series
+from .timeline import render_freq_svg, render_threads_svg, render_util_svg, thread_series
 
 
 def esc(s) -> str:
@@ -315,7 +315,8 @@ def _wait_tab(wp: WaitProfile | None) -> str:
 
 def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
                mem: MemoryProfile | None = None,
-               wp: WaitProfile | None = None) -> str:
+               wp: WaitProfile | None = None,
+               freq_timeline: list | None = None) -> str:
     ncpu = meta.get("ncpus", 1)
 
     # ---- flame graphs -------------------------------------------------------
@@ -338,6 +339,7 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
     # ---- timelines ----------------------------------------------------------
     t0, t1 = prof.time_range if prof.time_range else (0.0, 1.0)
     util_svg = render_util_svg(m.timeline, ncpu)
+    freq_svg = render_freq_svg(freq_timeline or [])
 
     pts_by_tid: dict[int, list[tuple[float, float]]] = defaultdict(list)
     for s in samples:
@@ -432,6 +434,7 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 <div id="timeline" class="page">
 <div class="panel"><h3>Average busy CPU cores over time</h3>{util_svg}</div>
 <div class="panel"><h3>Per-thread CPU activity (cycles-weighted)</h3>{threads_svg}</div>
+<div class="panel"><h3>CPU frequency over time</h3>{freq_svg}</div>
 </div>
 
 <div id="tree" class="page">

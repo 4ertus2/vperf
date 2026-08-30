@@ -60,7 +60,8 @@ def _analyze(stat_data: StatData, elapsed: float | None, script_path: str | None
 def _finish(outdir: str, meta: dict, warnings: list[str], stat_data: StatData,
             elapsed: float | None, script_path: str | None,
             mem_report_path: str | None = None,
-            wait_path: str | None = None) -> None:
+            wait_path: str | None = None,
+            freq_timeline: list | None = None) -> None:
     samples, prof, m = _analyze(
         stat_data, elapsed, script_path,
         meta.get("ncpus", 1), meta.get("interval_ms"),
@@ -78,7 +79,7 @@ def _finish(outdir: str, meta: dict, warnings: list[str], stat_data: StatData,
     report_path = os.path.join(outdir, "report.html")
     meta["_outdir"] = os.path.abspath(outdir)
     with open(report_path, "w", encoding="utf-8") as f:
-        f.write(build_html(meta, samples, m, prof, mem))
+        f.write(build_html(meta, samples, m, prof, mem, wp, freq_timeline=freq_timeline))
     print(f"HTML report: {report_path}")
 
 
@@ -123,7 +124,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         use_wait=not args.no_wait,
     )
     _finish(outdir, pd.meta, pd.warnings, pd.stat, pd.elapsed, pd.script_path,
-            pd.mem_report_path, pd.wait_path)
+            pd.mem_report_path, pd.wait_path, pd.freq_timeline)
     return 0
 
 
@@ -155,7 +156,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
         use_wait=not args.no_wait,
     )
     _finish(outdir, pd.meta, pd.warnings, pd.stat, pd.elapsed or args.duration,
-            pd.script_path, pd.mem_report_path, pd.wait_path)
+            pd.script_path, pd.mem_report_path, pd.wait_path, pd.freq_timeline)
     return 0
 
 
@@ -165,6 +166,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     script_path = loaded[2] if len(loaded) > 2 else None
     mem_report_path = loaded[3] if len(loaded) > 3 else None
     wait_path = loaded[4] if len(loaded) > 4 else None
+    freq_timeline = loaded[5] if len(loaded) > 5 else []
     samples, prof, m = _analyze(
         stat_data, meta.get("elapsed_wall"), script_path,
         meta.get("ncpus", 1), meta.get("interval_ms"),
@@ -175,7 +177,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     print(render_terminal(meta, m, prof, mem, wp))
     report_path = os.path.join(args.dir, "report.html")
     with open(report_path, "w", encoding="utf-8") as f:
-        f.write(build_html(meta, samples, m, prof, mem, wp))
+        f.write(build_html(meta, samples, m, prof, mem, wp, freq_timeline=freq_timeline))
     print(f"HTML report: {report_path}")
     return 0
 
