@@ -27,11 +27,7 @@ class DiffRow:
 
 def _analyze_dir(dirpath: str) -> tuple[MetricsReport, StackProfile, dict]:
     loaded = load_profile(dirpath)
-    # tolerate both pre/post-IBS signatures of load_profile
-    if len(loaded) == 4:
-        meta, stat_data, script_path, _mem_report = loaded
-    else:
-        meta, stat_data, script_path = loaded
+    meta, stat_data, script_path = loaded[0], loaded[1], loaded[2]
     samples = []
     if script_path:
         with open(script_path, encoding="utf-8", errors="replace") as f:

@@ -262,7 +262,7 @@ def collect(
     )
 
 
-def load_profile(outdir: str) -> tuple[dict, StatData, str | None, str | None]:
+def load_profile(outdir: str) -> tuple[dict, StatData, str | None, str | None, str | None]:
     """Reload previously collected artifacts (for `report`).
     Returns (meta, stat_data, script_path, mem_report_path)."""
     with open(os.path.join(outdir, "meta.json"), encoding="utf-8") as f:
