@@ -1,7 +1,7 @@
 # vperf — VTune-style CPU profiling on Linux
 
 `vperf` wraps the Linux `perf` tool to reproduce Intel VTune's most valuable
-CPU analyses on any machine (AMD and Intel), with zero Python dependencies:
+CPU analyses on amd64 machine (AMD and Intel), with zero Python dependencies:
 
 - **Hotspots** — self/inclusive time per function with call stacks (DWARF),
   per-thread breakdown, flame graphs
@@ -10,14 +10,14 @@ CPU analyses on any machine (AMD and Intel), with zero Python dependencies:
   context switches & migrations/s
 - **Pipeline bound analysis** — Backend Bound / Frontend Bound
   (VTune's Top-down Microarchitecture Analysis approximated; uses perf's
-  TMA-style metrics where available, e.g. AMD Zen `de_no_dispatch_per_slot`)
+  TMA-style metrics where available)
 - **Cache-hierarchy classification** — on AMD Zen, data-source fill events
   (`ls_any_fills_from_sys.*`, `l2_cache_req_stat.*`) attribute every L1 miss
   to its source: L2 hit, local L3 hit, or DRAM/MMIO (= true LLC misses)
 - **Effective CPU utilization** — average busy cores + utilization timeline
-- **Reports** — rich terminal summary + a single-file interactive
-  `report.html` (metric cards, sortable hotspots table, flame graph,
-  timelines, call tree)
+- **Reports** — terminal summary + a single-file interactive `report.html`
+  (metric overview, hotspots table, memery access summary, flame graph,
+  timelines, call tree, threads)
 
 Artifacts (`stat.csv`, `perf.data`, `script.txt`, `meta.json`) are kept in the
 profile directory so reports can be regenerated any time with `vperf report`.
@@ -36,8 +36,7 @@ echo 'kernel.perf_event_paranoid=1' | sudo tee /etc/sysctl.d/99-perf.conf
 ### Install with uv (recommended)
 
 ```bash
-# Create a virtual environment (required on Ubuntu/Debian — system Python
-# rejects pip install outside a venv since Python 3.11+; see PEP 668).
+# Create a virtual environment (required on Ubuntu/Debian).
 uv venv
 
 # Install vperf in editable mode inside the venv
@@ -64,22 +63,25 @@ vperf doctor
 ## Usage
 
 ```bash
-# profile a command (two passes: counting + sampling)
-vperf run -- ./yourapp --arg1 val
+vperf run <vperf-args> -- ./yourapp <yourapp-args>
+```
 
-# useful flags
-vperf run -f 999 -o myprofile -- ./yourapp     # 999 Hz, custom output dir
-vperf run --callgraph fp -- ./yourapp          # frame-pointer unwinding
-vperf run --no-record -- ./yourapp             # counters only (fast)
-vperf run --no-memory --no-wait -- ./yourapp   # skip optional passes
+```bash
+# run with differet options
+vperf run -- ./yourapp                            # profile with defaults
+vperf run -o baseline -- ./yourapp input.bin      # save to a named directory
+vperf run -f 999 -- ./yourapp input.bin           # higher sampling frequency
+vperf run --no-record -- ./yourapp input.bin      # counters only (faster, no call stacks)
+vperf run --no-memory --no-wait -- ./yourapp      # skip optional passes
+vperf run --callgraph fp -- ./yourapp             # frame-pointer unwinding (no debug info needed)
 
-# compare two profiles (baseline vs after your change)
-vperf diff .vperf/base .vperf/after
+# compare two runs
+vperf diff .vperf/baseline .vperf/optimized
 
-# attach to a running process (needs CAP_PERFMON/CAP_SYS_PTRACE, see doctor)
+# attach to a running process (needs CAP_PERFMON, see doctor)
 vperf attach -p 1234 --duration 10
 
-# regenerate terminal summary + report.html from artifacts
+# regenerate summary + report.html from saved artifacts
 vperf report .vperf/run_20260824_021912
 ```
 
@@ -184,8 +186,7 @@ AVX-512 IPC drops to ~half of AVX's — a reminder that IPC compares
 instructions, not work.
 
 Other workloads: `sleeper` (100 ms spin + 200 ms usleep — wait-analysis
-signature: ~2/3 of the window asleep) and `diskwriter`
-(append+fdatasync loop, used by block-IO tests).
+signature: ~2/3 of the window asleep).
 
 ## Cycle mode: before/after comparisons with ministat
 
