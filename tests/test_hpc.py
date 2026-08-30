@@ -109,7 +109,10 @@ class TestSimdTiersVectorWidth:
                      "simd_levels_avx", "simd_levels_avx512"):
             if name not in built:
                 continue
-            out[name] = _profile(built, [built[name], "1000000"])
+            try:
+                out[name] = _profile(built, [built[name], "1000000"])
+            except Exception:
+                pass  # binary may crash (e.g. AVX-512 on CPU without it)
         return out
 
     def test_avx_uses_256b(self, tier_metrics):

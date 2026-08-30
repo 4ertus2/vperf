@@ -7,12 +7,18 @@ from pathlib import Path
 
 import pytest
 
-from vperf.doctor import probe_stat
+from vperf.doctor import cpu_vendor, probe_stat
 from vperf.cycle import DEFAULT_METRICS, render_summary, render_tsv
 from vperf.metrics import MetricsReport
 
 REPO = Path(__file__).resolve().parents[1]
 VPERF = REPO / ".venv" / "bin" / "vperf"
+# Fallback: use the installed vperf if .venv does not exist
+if not VPERF.exists():
+    import shutil as _shutil
+    _vperf_path = _shutil.which("vperf")
+    if _vperf_path:
+        VPERF = Path(_vperf_path)
 
 pytestmark = pytest.mark.skipif(
     not shutil.which("perf") or not probe_stat(["-e", "task-clock"])[0],
@@ -114,6 +120,15 @@ class TestCycleIntegration:
 
     def test_parallel_runs_share_tsv_and_pin_cores(self):
         b = _ensure_built()
+        if not (b / "simd_levels_avx512").exists():
+            pytest.skip("AVX-512 tier not built")
+        if cpu_vendor() != "AuthenticAMD":
+            # AVX-512 binary may crash on Intel CPUs without AVX-512 support
+            import subprocess as _sp
+            r = _sp.run([str(b / "simd_levels_avx512"), "100"],
+                        capture_output=True, timeout=5)
+            if r.returncode != 0:
+                pytest.skip("AVX-512 binary not runnable on this CPU")
         out = _cycle_par(str(b / "simd_levels_avx512"), 500000, jobs=4, runs=8)
         lines = out.strip().split("\n")
         assert len(lines) == 9  # header + 8 runs
@@ -137,6 +152,12 @@ class TestCycleIntegration:
         b = _ensure_built()
         if not (b / "simd_levels_avx512").exists():
             pytest.skip("AVX-512 tier not built")
+        if cpu_vendor() != "AuthenticAMD":
+            import subprocess as _sp
+            r = _sp.run([str(b / "simd_levels_avx512"), "100"],
+                        capture_output=True, timeout=5)
+            if r.returncode != 0:
+                pytest.skip("AVX-512 binary not runnable on this CPU")
         base = _cycle(str(b / "simd_levels_scalar"), 250000, 30,
                       metrics="run,elapsed_s,ipc")
         comp = _cycle(str(b / "simd_levels_avx512"), 250000, 30,
