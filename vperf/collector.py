@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import platform
 import socket
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import doctor
 from .doctor import probe_ibs, probe_intel_mem, probe_wait
@@ -26,6 +28,7 @@ class ProfileData:
     mem_report_path: str | None
     wait_path: str | None
     warnings: list[str]
+    freq_timeline: list[tuple[float, dict[int, int]]] = field(default_factory=list)
 
 
 def _ncpus() -> int:
@@ -61,6 +64,53 @@ def _probe_capabilities() -> tuple[list[str], list[str], str]:
 def _write_meta(outdir: str, meta: dict) -> None:
     with open(os.path.join(outdir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
+
+
+_CPU_FREQ_GLOB = "/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"
+
+
+def _read_freqs() -> dict[int, int]:
+    """Read current frequency (kHz) for each online CPU from sysfs."""
+    freqs: dict[int, int] = {}
+    for path in glob.glob(_CPU_FREQ_GLOB):
+        try:
+            # path: /sys/devices/system/cpu/cpu3/cpufreq/scaling_cur_freq
+            base = os.path.basename(os.path.dirname(os.path.dirname(path)))
+            cpu = int(base.removeprefix("cpu"))
+            with open(path, encoding="utf-8") as f:
+                freqs[cpu] = int(f.read().strip())
+        except (OSError, ValueError):
+            continue
+    return freqs
+
+
+class _FreqSampler:
+    """Background thread that samples CPU frequencies from sysfs."""
+
+    def __init__(self, interval: float = 0.01):
+        self.interval = interval
+        self.samples: list[tuple[float, dict[int, int]]] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> list[tuple[float, dict[int, int]]]:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        return self.samples
+
+    def _run(self) -> None:
+        t0 = time.monotonic()
+        while not self._stop.is_set():
+            freqs = _read_freqs()
+            if freqs:
+                self.samples.append((time.monotonic() - t0, freqs))
+            self._stop.wait(self.interval)
 
 
 def collect(
@@ -135,6 +185,7 @@ def collect(
 
     # ---- pass 2: perf record -------------------------------------------------
     script_path = None
+    freq_timeline: list[tuple[float, dict[int, int]]] = []
     if use_record:
         cg = ["--call-graph", f"{callgraph_mode},16384"] if callgraph_mode != "none" else []
         args = ["record", "-F", str(freq), "-e", precise_ev, *cg, "-o",
@@ -144,7 +195,10 @@ def collect(
             placeholder = ["sleep", f"{duration}" if duration else "5"]
         else:
             placeholder = list(target_cmd or [])
+        freq_sampler = _FreqSampler(interval=0.01)
+        freq_sampler.start()
         r = run_perf(args + ["--", *placeholder], timeout=(duration or 0) + 3600)
+        freq_timeline = freq_sampler.stop()
         if not r.ok and callgraph_mode == "dwarf":
             warnings.append("DWARF call graphs failed; retrying with frame pointers.")
             args = [a for i, a in enumerate(args) if not (a == "--call-graph" or (i and args[i - 1] == "--call-graph"))]
@@ -285,6 +339,11 @@ def collect(
     }
     _write_meta(outdir, meta)
 
+    if freq_timeline:
+        freq_path = os.path.join(outdir, "freq.json")
+        with open(freq_path, "w", encoding="utf-8") as f:
+            json.dump(freq_timeline, f)
+
     return ProfileData(
         outdir=outdir,
         meta=meta,
@@ -294,12 +353,13 @@ def collect(
         mem_report_path=mem_report_path,
         wait_path=wait_path,
         warnings=warnings,
+        freq_timeline=freq_timeline,
     )
 
 
-def load_profile(outdir: str) -> tuple[dict, StatData, str | None, str | None, str | None]:
+def load_profile(outdir: str) -> tuple[dict, StatData, str | None, str | None, str | None, list]:
     """Reload previously collected artifacts (for `report`).
-    Returns (meta, stat_data, script_path, mem_report_path)."""
+    Returns (meta, stat_data, script_path, mem_report_path, wait_path, freq_timeline)."""
     with open(os.path.join(outdir, "meta.json"), encoding="utf-8") as f:
         meta = json.load(f)
     stat = StatData()
@@ -316,4 +376,9 @@ def load_profile(outdir: str) -> tuple[dict, StatData, str | None, str | None, s
     wait_path = os.path.join(outdir, "wait.txt")
     if not os.path.exists(wait_path):
         wait_path = None
-    return meta, stat, script_path, mem_report_path, wait_path
+    freq_path = os.path.join(outdir, "freq.json")
+    freq_timeline: list[tuple[float, dict[int, int]]] = []
+    if os.path.exists(freq_path):
+        with open(freq_path, encoding="utf-8") as f:
+            freq_timeline = json.load(f)
+    return meta, stat, script_path, mem_report_path, wait_path, freq_timeline
