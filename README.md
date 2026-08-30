@@ -33,16 +33,32 @@ sudo sysctl kernel.perf_event_paranoid=1      # -1 also enables full kernel samp
 echo 'kernel.perf_event_paranoid=1' | sudo tee /etc/sysctl.d/99-perf.conf
 ```
 
-Check readiness (probes access, precise sampling, supported metrics, attach):
+### Install with uv (recommended)
 
 ```bash
+# Create a virtual environment (required on Ubuntu/Debian — system Python
+# rejects pip install outside a venv since Python 3.11+; see PEP 668).
+uv venv
+
+# Install vperf in editable mode inside the venv
+uv pip install -e .
+
+# Activate the venv so `vperf` is on your PATH
+source .venv/bin/activate
+
+# Verify everything is ready (probes access, metrics, attach capability)
 vperf doctor
 ```
 
-Install:
+After `source .venv/bin/activate`, `vperf` works like any system command.
+To leave the venv: `deactivate`. To re-enter later: `source .venv/bin/activate`.
+
+### Install with pip (if you manage your own venv)
 
 ```bash
-pip install .            # or: uv pip install .
+python3 -m venv .venv && source .venv/bin/activate
+pip install .
+vperf doctor
 ```
 
 ## Usage
@@ -107,12 +123,14 @@ Notes & caveats:
 
 ```bash
 uv venv && uv pip install -e . pytest ruff
-.venv/bin/python -m pytest tests/ -q   # unit + integration (needs perf access)
-ruff check src/
+source .venv/bin/activate
+vperf doctor                           # verify setup
+pytest tests/ -q                       # unit + integration (needs perf access)
+ruff check vperf/ tests/
 
-Note: run the suite WITHOUT pytest-xdist/-n. The integration tests assert
-exact PMU counter relationships; concurrent profiling sessions multiplex
-the hardware counters and break those assertions.
+# Note: run the suite WITHOUT pytest-xdist/-n. The integration tests assert
+# exact PMU counter relationships; concurrent profiling sessions multiplex
+# the hardware counters and break those assertions.
 ```
 
 Examples in `examples/` are C++ workloads with opposite, well-understood
