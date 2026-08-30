@@ -89,13 +89,37 @@ Open `report.html` in any browser — fully offline, no CDN.
 
 | Signal | Interpretation |
 |---|---|
+| **Headline** | |
 | Effective CPU Utilization ≪ cores | serial or I/O-bound; threading opportunity |
+| CPU Time ≈ Elapsed × cores | compute-bound; latency-dominated |
+| **Pipeline** | |
 | IPC ≥ 2 | compute-bound, executing efficiently |
 | IPC < 0.5 | stalled; look at bound analysis below |
 | Backend Bound high | memory hierarchy limited → check LLC/L1D/dTLB miss rates |
 | Frontend Bound high | fetch/decode limited (i-cache, big code footprint) |
+| Bad Speculation > 5% | branch mispredicts or machine clears wasting cycles |
+| Retiring < 30% | most pipeline slots lost; deep stall or contention |
+| **Branches** | |
 | Branch Mispredict % > 5 | unpredictable branches dominate |
+| **Memory hierarchy** | |
+| LLC Miss % > 30% | working set exceeds cache; DRAM-bound |
+| L1D Miss Rate > 5% | data-cache thrashing; blocking/tiling opportunity |
+| dTLB Miss Rate > 1% | page-table walks hurting latency |
+| **HPC / vectorization** | |
+| Vectorization Ratio < 50% | scalar or mixed-width code; widen with intrinsics or compiler hints |
+| FP Ops/s ≈ theoretical peak | compute-saturated; check memory won't help |
+| Backend Bound + high FP Ops/s | memory-bound despite vectorization (common with large arrays) |
+| **OS noise** | |
+| Context Switches/s > 100 | scheduling pressure; pin threads or increase work per task |
+| Page Faults/s high | first-touch allocation or huge-page opportunity |
+| **Memory access (IBS, AMD)** | |
+| DRAM access % high | true LLC misses; optimize data layout |
+| L1 access % ≈ 100% | working set fits in cache |
+| Avg latency > 200 cyc | deep memory stalls; prefetching or data restructuring needed |
+| **Hotspots** | |
 | Hotspots `[kernel]` heavy | syscalls/page faults; consider off-CPU analysis |
+| One function > 50% self | clear #1 target; optimize or vectorize that function |
+| Inlined functions dominate | compiler flattened the call tree; inspect unrolled loops |
 
 ## How it works
 
