@@ -18,6 +18,49 @@ from .parsers import StatData, parse_stat_csv
 from .perf import PerfError, perf_version, run_perf
 
 
+class _FreqSampler:
+    """Daemon thread that reads CPU frequency from sysfs periodically."""
+
+    def __init__(self, interval_ms: int = 500):
+        self.interval_s = interval_ms / 1000.0
+        self._samples: list[list] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _read_freqs(self) -> dict[int, float]:
+        freqs = {}
+        for p in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"):
+            try:
+                base = os.path.basename(os.path.dirname(os.path.dirname(p)))
+                cpu = int(base.replace("cpu", ""))
+                with open(p) as f:
+                    freqs[cpu] = float(f.read().strip()) / 1e3  # kHz -> MHz
+            except (OSError, ValueError):
+                continue
+        return freqs
+
+    def _loop(self) -> None:
+        t0 = time.monotonic()
+        while not self._stop.is_set():
+            freqs = self._read_freqs()
+            if freqs:
+                self._samples.append([time.monotonic() - t0, freqs])
+            self._stop.wait(self.interval_s)
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    @property
+    def samples(self) -> list[list]:
+        return self._samples
+
+
 @dataclass
 class ProfileData:
     outdir: str
@@ -28,7 +71,7 @@ class ProfileData:
     mem_report_path: str | None
     wait_path: str | None
     warnings: list[str]
-    freq_timeline: list[tuple[float, dict[int, int]]] = field(default_factory=list)
+    freq_timeline: list | None = None
 
 
 def _ncpus() -> int:
@@ -125,6 +168,7 @@ def collect(
     use_memory: bool = True,
     mem_period: int = 100003,
     use_wait: bool = True,
+    use_freq: bool = True,
     callgraph_mode: str = "dwarf",
     quiet_stdout: bool = False,
 ) -> ProfileData:
@@ -135,6 +179,15 @@ def collect(
     ev_list, metric_list, precise_ev = _probe_capabilities()
     if not metric_list:
         warnings.append("No named metrics supported; deriving metrics from base counters.")
+
+    # ---- freq sampler (background thread) -----------------------------------
+    freq_sampler: _FreqSampler | None = None
+    if use_freq:
+        try:
+            freq_sampler = _FreqSampler(interval_ms=500)
+            freq_sampler.start()
+        except Exception:
+            freq_sampler = None
 
     # ---- pass 1: perf stat --------------------------------------------------
     stat_data = StatData()
@@ -317,6 +370,16 @@ def collect(
         else:
             warnings.append("Memory analysis unavailable (needs AMD IBS or Intel PEBS); skipped.")
 
+    # ---- stop freq sampler and save -----------------------------------------
+    freq_timeline: list | None = None
+    if freq_sampler is not None:
+        freq_sampler.stop()
+        freq_timeline = freq_sampler.samples
+        if freq_timeline:
+            freq_path = os.path.join(outdir, "freq.json")
+            with open(freq_path, "w", encoding="utf-8") as f:
+                json.dump(freq_timeline, f)
+
     meta = {
         "version": 1,
         "mode": "attach" if pid is not None else "run",
@@ -357,7 +420,7 @@ def collect(
     )
 
 
-def load_profile(outdir: str) -> tuple[dict, StatData, str | None, str | None, str | None, list]:
+def load_profile(outdir: str) -> tuple[dict, StatData, str | None, str | None, str | None, list | None]:
     """Reload previously collected artifacts (for `report`).
     Returns (meta, stat_data, script_path, mem_report_path, wait_path, freq_timeline)."""
     with open(os.path.join(outdir, "meta.json"), encoding="utf-8") as f:
@@ -377,7 +440,7 @@ def load_profile(outdir: str) -> tuple[dict, StatData, str | None, str | None, s
     if not os.path.exists(wait_path):
         wait_path = None
     freq_path = os.path.join(outdir, "freq.json")
-    freq_timeline: list[tuple[float, dict[int, int]]] = []
+    freq_timeline: list | None = None
     if os.path.exists(freq_path):
         with open(freq_path, encoding="utf-8") as f:
             freq_timeline = json.load(f)
