@@ -87,8 +87,7 @@ def build_profile(samples: list[ScriptSample]) -> StackProfile:
         if ti is None:
             ti = ThreadInfo(tid=s.tid, pid=s.pid, comm=s.comm)
             prof.by_thread[s.tid] = ti
-        elif ti.comm != s.comm and _is_transient(ti.comm):
-            # perf-exec -> real process name once exec() completes
+        elif ti.comm != s.comm and not _is_transient(s.comm):
             ti.comm = s.comm
         ti.cycles += w
 
@@ -122,7 +121,7 @@ def build_profile(samples: list[ScriptSample]) -> StackProfile:
     real_comm = {}
     for s in samples:
         if not _is_transient(s.comm):
-            real_comm.setdefault(s.tid, s.comm)
+            real_comm[s.tid] = s.comm
     renames: dict[str, str] = {}
     for tid, ti in prof.by_thread.items():
         real = real_comm.get(tid, ti.comm)
@@ -133,8 +132,16 @@ def build_profile(samples: list[ScriptSample]) -> StackProfile:
         def fix(key: str) -> str:
             head, *tailr = key.split(";")
             return ";".join([renames.get(head, head), *tailr])
-        prof.folded = {fix(k): v for k, v in prof.folded.items()}
-        chains = {fix(k): v for k, v in chains.items()}
+        new_folded: dict[str, int] = {}
+        for k, v in prof.folded.items():
+            nk = fix(k)
+            new_folded[nk] = new_folded.get(nk, 0) + v
+        prof.folded = new_folded
+        new_chains: dict[tuple, int] = {}
+        for k, v in chains.items():
+            nk = fix(k)
+            new_chains[nk] = new_chains.get(nk, 0) + v
+        chains = new_chains
 
     rows: dict[str, Hotspot] = {}
     for fname, sc in self_by_func.items():
