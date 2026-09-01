@@ -166,7 +166,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     script_path = loaded[2] if len(loaded) > 2 else None
     mem_report_path = loaded[3] if len(loaded) > 3 else None
     wait_path = loaded[4] if len(loaded) > 4 else None
-    freq_timeline = loaded[5] if len(loaded) > 5 else []
+    freq_timeline = loaded[5] if len(loaded) > 5 else None
     samples, prof, m = _analyze(
         stat_data, meta.get("elapsed_wall"), script_path,
         meta.get("ncpus", 1), meta.get("interval_ms"),

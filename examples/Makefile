@@ -17,7 +17,7 @@ ifeq ($(AVX512_OK),yes)
 TARGETS_SIMD += simd_levels_avx512
 endif
 
-TARGETS := $(TARGETS_SIMPLE) $(TARGETS_SIMD)
+TARGETS := $(TARGETS_SIMPLE) $(TARGETS_SIMD) simd_levels_all
 
 .PHONY: all clean
 
@@ -45,6 +45,9 @@ $(BINDIR)/simd_levels_avx: $(SRCDIR)/simd_levels.cpp | $(BINDIR)
 
 $(BINDIR)/simd_levels_avx512: $(SRCDIR)/simd_levels.cpp | $(BINDIR)
 	$(CXX) $(CXXFLAGS) -mavx512f -mavx512dq -DUSE_AVX512 -o $@ $<
+
+$(BINDIR)/simd_levels_all: $(SRCDIR)/simd_levels_all.cpp | $(BINDIR)
+	$(CXX) $(CXXFLAGS) -mavx512f -mavx512dq -pthread -o $@ $<
 
 clean:
 	rm -rf $(BINDIR)
