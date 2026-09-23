@@ -12,6 +12,7 @@ from . import __version__
 from .collector import collect, load_profile
 from .doctor import PERF_ACCESS_HINTS, probe_attach, probe_stat, run_doctor
 from .metrics import MetricsReport, compute_metrics
+from .memory import event_matches
 from .parsers import StatData, parse_perf_script
 from .perf import perf_available
 from .report_html import build_html
@@ -36,11 +37,14 @@ def _ensure_access() -> None:
 
 
 def _analyze(stat_data: StatData, elapsed: float | None, script_path: str | None,
-             ncpus: int, interval_ms: int | None) -> tuple[list, StackProfile, MetricsReport]:
+             ncpus: int, interval_ms: int | None,
+             memory_events: set[str] | None = None) -> tuple[list, StackProfile, MetricsReport]:
     samples = []
     if script_path:
         with open(script_path, encoding="utf-8", errors="replace") as f:
             samples = parse_perf_script(f.read())
+    if memory_events:
+        samples = [s for s in samples if not event_matches(s.event, memory_events)]
 
     prof = build_profile(samples)
     cpu_ms = stat_data.summary.get("task-clock")
@@ -62,11 +66,12 @@ def _finish(outdir: str, meta: dict, warnings: list[str], stat_data: StatData,
             mem_report_path: str | None = None,
             wait_path: str | None = None,
             freq_timeline: list | None = None) -> None:
+    memory_events = set(meta.get("memory", {}).get("events", []))
     samples, prof, m = _analyze(
         stat_data, elapsed, script_path,
-        meta.get("ncpus", 1), meta.get("interval_ms"),
+        meta.get("ncpus", 1), meta.get("interval_ms"), memory_events,
     )
-    mem = _load_mem_profile(mem_report_path)
+    mem = _load_mem_profile(mem_report_path, memory_events)
     wp = _load_wait_profile(wait_path)
 
     print(render_terminal(meta, m, prof, mem, wp))
@@ -94,13 +99,14 @@ def _load_wait_profile(wait_path: str | None):
         return None
 
 
-def _load_mem_profile(mem_report_path: str | None):
+def _load_mem_profile(mem_report_path: str | None, memory_events: set[str] | None = None):
     if not mem_report_path:
         return None
     from vperf.memory import parse_mem_report
     try:
         with open(mem_report_path, encoding="utf-8", errors="replace") as f:
-            return parse_mem_report(f.read())
+            return parse_mem_report(
+                f.read(), memory_events, "\t", None if memory_events else False)
     except OSError:
         return None
 
@@ -167,11 +173,12 @@ def cmd_report(args: argparse.Namespace) -> int:
     mem_report_path = loaded[3] if len(loaded) > 3 else None
     wait_path = loaded[4] if len(loaded) > 4 else None
     freq_timeline = loaded[5] if len(loaded) > 5 else None
+    memory_events = set(meta.get("memory", {}).get("events", []))
     samples, prof, m = _analyze(
         stat_data, meta.get("elapsed_wall"), script_path,
-        meta.get("ncpus", 1), meta.get("interval_ms"),
+        meta.get("ncpus", 1), meta.get("interval_ms"), memory_events,
     )
-    mem = _load_mem_profile(mem_report_path)
+    mem = _load_mem_profile(mem_report_path, memory_events)
     wp = _load_wait_profile(wait_path)
     meta["_outdir"] = os.path.abspath(args.dir)
     print(render_terminal(meta, m, prof, mem, wp))

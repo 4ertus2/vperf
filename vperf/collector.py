@@ -10,10 +10,11 @@ import socket
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from . import doctor
 from .doctor import probe_ibs, probe_intel_mem, probe_wait
+from .memory import parse_mem_report
 from .parsers import StatData, parse_stat_csv
 from .perf import PerfError, perf_version, run_perf
 
@@ -72,6 +73,120 @@ class ProfileData:
     wait_path: str | None
     warnings: list[str]
     freq_timeline: list | None = None
+
+
+@dataclass
+class _MemoryPlan:
+    backend: str
+    events: list[str]
+    data_file: str
+
+
+_MEMORY_SORT = "tgid,pid,comm,local_weight,mem,sym,dso,tlb"
+_MEMORY_SORT_FALLBACK = "pid,comm,local_weight,mem,sym,dso,tlb"
+
+
+def _intel_memory_events(ldlat: int = 30) -> list[str]:
+    result = run_perf(["mem", "record", "-v", "-e", "list"], timeout=30)
+    lines = (result.stdout + "\n" + result.stderr).splitlines()
+    if not result.ok:
+        result = run_perf(["list", "--details"], timeout=30)
+        lines = (result.stdout + "\n" + result.stderr).splitlines()
+    groups: dict[str, dict[str, str]] = {}
+    for raw in lines:
+        for token in raw.replace(":", " ").split():
+            selector = token.strip(".,")
+            if "/" not in selector or selector.startswith("..."):
+                continue
+            if "mem-loads-aux" in selector:
+                continue
+            if "mem-loads" not in selector and "mem-stores" not in selector:
+                continue
+            prefix, event = selector.split("/", 1)
+            if "mem-loads" in event:
+                if "ldlat=" not in event:
+                    if event.endswith("/P"):
+                        event = event[:-2] + f",ldlat={ldlat}/P"
+                    elif event.endswith("/"):
+                        event = event[:-1] + f",ldlat={ldlat}/P"
+                    else:
+                        event += f",ldlat={ldlat}/P"
+                kind = "load"
+            else:
+                kind = "store"
+            if event.endswith("/"):
+                event += "P"
+            groups.setdefault(prefix, {})[kind] = f"{prefix}/{event}"
+    if not groups:
+        return []
+    candidates = list(groups.values())
+    candidates.sort(key=lambda group: 0 if "load" in group and "store" in group else 1)
+    events = []
+    for selected in candidates:
+        for kind in ("load", "store"):
+            event = selected.get(kind)
+            if event and event not in events:
+                events.append(event)
+    return events
+
+
+def _memory_plan(mem_period: int) -> _MemoryPlan | None:
+    if probe_ibs():
+        return _MemoryPlan("ibs", [f"ibs_op/period={mem_period}/p"], "perf_ibs.data")
+    if not probe_intel_mem():
+        return None
+    events = _intel_memory_events()
+    return _MemoryPlan("pebs", events, "perf_mem.data") if events else None
+
+
+def _frequency_event(precise_event: str, freq: int) -> str:
+    event, separator, modifier = precise_event.partition(":")
+    suffix = modifier if separator else ""
+    return f"{event}/freq={freq}/" + suffix
+
+
+def _cpu_record_args(data_path: str, precise_event: str, freq: int, callgraph_mode: str) -> list[str]:
+    cg = ["--call-graph", f"{callgraph_mode},16384"] if callgraph_mode != "none" else []
+    return ["record", "-F", str(freq), "-e", precise_event, *cg, "-o", data_path]
+
+
+def _memory_report(data_path: str, outdir: str, events: list[str],
+                   backend: str, warnings: list[str]) -> str | None:
+    report_path = os.path.join(outdir, "mem_report.txt")
+    sorts = [_MEMORY_SORT, _MEMORY_SORT_FALLBACK, ""]
+    saw_report = False
+    last_error = ""
+    last_report_text = None
+    for sort_name in sorts:
+        args = ["mem", "report", "-i", data_path, "--stdio", "--field-separator=\t",
+                "--show-total-period"]
+        if sort_name:
+            args += ["--sort", sort_name]
+        result = run_perf(args, timeout=900, stdout_file=report_path)
+        if not result.ok:
+            error_lines = (result.stderr or "").strip().splitlines()
+            last_error = error_lines[-1][:160] if error_lines else "unknown error"
+            continue
+        try:
+            with open(report_path, encoding="utf-8", errors="replace") as f:
+                report_text = f.read()
+        except OSError:
+            continue
+        profile = parse_mem_report(report_text, set(events), "\t", None)
+        if profile.total_samples > 0:
+            if profile.by_tid:
+                return report_path
+            last_report_text = report_text
+        saw_report = True
+    if last_report_text is not None:
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(last_report_text)
+        return report_path
+    if saw_report:
+        warnings.append(f"{backend.upper()} memory report contained no samples.")
+    elif last_error:
+        warnings.append(f"{backend.upper()} memory report failed: {last_error}")
+    return None
 
 
 def _ncpus() -> int:
@@ -180,6 +295,13 @@ def collect(
     if not metric_list:
         warnings.append("No named metrics supported; deriving metrics from base counters.")
 
+    requested_memory_plan = _memory_plan(mem_period) if use_memory else None
+    memory_plan = requested_memory_plan
+    fallback_memory_plan: _MemoryPlan | None = None
+    memory_cojoined = False
+    if use_memory and requested_memory_plan is None:
+        warnings.append("Memory analysis unavailable (needs AMD IBS or Intel PEBS); skipped.")
+
     # ---- freq sampler (background thread) -----------------------------------
     freq_sampler: _FreqSampler | None = None
     if use_freq:
@@ -239,40 +361,71 @@ def collect(
     # ---- pass 2: perf record -------------------------------------------------
     script_path = None
     freq_timeline: list[tuple[float, dict[int, int]]] = []
+    mem_report_path = None
+    memory_enabled = False
+    mem_backend = requested_memory_plan.backend if requested_memory_plan else None
+    memory_events = requested_memory_plan.events if requested_memory_plan else []
+    memory_data_path = None
     if use_record:
-        cg = ["--call-graph", f"{callgraph_mode},16384"] if callgraph_mode != "none" else []
-        args = ["record", "-F", str(freq), "-e", precise_ev, *cg, "-o",
-                os.path.join(outdir, "perf.data")]
+        data_path = os.path.join(outdir, "perf.data")
+        if memory_plan:
+            args = ["record", "-q", "-d", "-W", "-o", data_path]
+            cg = ["--call-graph", f"{callgraph_mode},16384"] if callgraph_mode != "none" else []
+            args += cg
+            args += ["-e", _frequency_event(precise_ev, freq)]
+            for event in memory_plan.events:
+                args += ["-e", event]
+        else:
+            args = _cpu_record_args(data_path, precise_ev, freq, callgraph_mode)
         if pid is not None:
             args += ["-p", str(pid)]
             placeholder = ["sleep", f"{duration}" if duration else "5"]
         else:
             placeholder = list(target_cmd or [])
+        if freq_sampler is not None:
+            freq_sampler.stop()
         freq_sampler = _FreqSampler(interval=0.01)
         freq_sampler.start()
         r = run_perf(args + ["--", *placeholder], timeout=(duration or 0) + 3600)
         freq_timeline = freq_sampler.stop()
+        if not r.ok and memory_plan and callgraph_mode == "dwarf":
+            warnings.append("DWARF call graphs failed; retrying with frame pointers.")
+            args = [a for a in args if a not in ("--call-graph", f"{callgraph_mode},16384")]
+            args.insert(1, "-g")
+            r = run_perf(args + ["--", *placeholder], timeout=(duration or 0) + 3600)
+        if not r.ok and memory_plan:
+            warnings.append(
+                f"Co-joined {mem_backend.upper()} memory sampling failed; retrying CPU-only."
+            )
+            fallback_memory_plan = memory_plan
+            memory_plan = None
+            args = _cpu_record_args(data_path, precise_ev, freq, callgraph_mode)
+            r = run_perf(args + ["--", *placeholder], timeout=(duration or 0) + 3600)
         if not r.ok and callgraph_mode == "dwarf":
             warnings.append("DWARF call graphs failed; retrying with frame pointers.")
-            args = [a for i, a in enumerate(args) if not (a == "--call-graph" or (i and args[i - 1] == "--call-graph"))]
-            args = ["record", "-g", "-F", str(freq), "-e", precise_ev,
-                    "-o", os.path.join(outdir, "perf.data")]
-            if pid is not None:
-                args += ["-p", str(pid)]
-            r = run_perf(args + ["--", *(placeholder)], timeout=(duration or 0) + 3600)
+            args = [a for a in args if a not in ("--call-graph", f"{callgraph_mode},16384")]
+            args.insert(1, "-g")
+            r = run_perf(args + ["--", *placeholder], timeout=(duration or 0) + 3600)
         if not r.ok:
             raise PerfError("perf record failed:\n" + (r.stderr or "").strip()[:2000])
 
         # default format: explicit -F field lists suppress callchain frames
-        sr = run_perf(["script", "-i", os.path.join(outdir, "perf.data")],
+        sr = run_perf(["script", "-i", data_path],
                       timeout=600,
                       stdout_file=os.path.join(outdir, "script.txt"))
         if sr.ok:
             script_path = os.path.join(outdir, "script.txt")
         else:
+            script_error = (sr.stderr or "").strip().splitlines()
             warnings.append("Could not dump samples via perf script: "
-                            + (sr.stderr or "").strip().splitlines()[-1][:200]
-                            if (sr.stderr or "").strip() else "unknown")
+                            + (script_error[-1][:200] if script_error else "unknown"))
+
+        if memory_plan:
+            memory_data_path = data_path
+            mem_report_path = _memory_report(
+                data_path, outdir, memory_events, mem_backend or "memory", warnings)
+            memory_enabled = mem_report_path is not None
+            memory_cojoined = memory_enabled
 
     # ---- pass 3: wait/off-CPU via scheduler tracepoints ----------------------
     from .wait import TRACEPOINT_EVENTS
@@ -300,75 +453,37 @@ def collect(
                 else:
                     warnings.append("Wait events recorded but script dump failed.")
             else:
+                wait_error = (r.stderr or "").strip().splitlines()
                 warnings.append("Wait pass failed: "
-                                + (r.stderr or "").strip().splitlines()[-1][:160]
-                                if (r.stderr or "").strip() else "wait pass failed")
+                                + (wait_error[-1][:160] if wait_error else "wait pass failed"))
         else:
             warnings.append("Wait analysis skipped: scheduler tracepoints need "
                             "CAP_PERFMON or kernel.perf_event_paranoid<=0.")
 
-    # ---- pass 4: memory access (AMD IBS or Intel PEBS) ----------------------
-    mem_report_path = None
-    memory_enabled = False
-    mem_backend = None  # "ibs" or "pebs"
-    if use_memory:
-        ibs_ok = probe_ibs()
-        if ibs_ok:
-            mem_backend = "ibs"
-            args = ["record", "-q", "-d", "-W",
-                    "-o", os.path.join(outdir, "perf_ibs.data"),
+    memory_pass_plan = fallback_memory_plan or (requested_memory_plan if not use_record else None)
+    if use_memory and memory_pass_plan:
+        memory_data_path = os.path.join(outdir, memory_pass_plan.data_file)
+        if memory_pass_plan.backend == "ibs":
+            args = ["record", "-q", "-d", "-W", "-o", memory_data_path,
                     "-e", "ibs_op//p", "-c", str(mem_period)]
-            cg = ["--call-graph", f"{callgraph_mode},16384"] if callgraph_mode != "none" else []
-            args += cg
-            if pid is not None:
-                args += ["-p", str(pid)]
-                placeholder = ["sleep", f"{duration}" if duration else "5"]
-            else:
-                placeholder = list(target_cmd or [])
-            r = run_perf(args + ["--", *placeholder],
-                         timeout=(duration or 0) + 3600)
-            if r.ok:
-                mr = run_perf(["mem", "report", "-i", os.path.join(outdir, "perf_ibs.data")],
-                              timeout=900,
-                              stdout_file=os.path.join(outdir, "mem_report.txt"))
-                if mr.ok and os.path.getsize(os.path.join(outdir, "mem_report.txt")) > 0:
-                    mem_report_path = os.path.join(outdir, "mem_report.txt")
-                    memory_enabled = True
-                else:
-                    warnings.append("IBS samples recorded but mem report failed.")
-            else:
-                warnings.append("IBS memory pass failed: "
-                                + (r.stderr or "").strip().splitlines()[-1][:160]
-                                if (r.stderr or "").strip() else "IBS memory pass failed")
-        elif probe_intel_mem():
-            # Intel PEBS: perf mem record with load-latency threshold
-            mem_backend = "pebs"
-            args = ["mem", "record", "--ldlat", "30",
-                    "-o", os.path.join(outdir, "perf_mem.data")]
-            cg = ["--call-graph", f"{callgraph_mode},16384"] if callgraph_mode != "none" else []
-            args += cg
-            if pid is not None:
-                args += ["-p", str(pid)]
-                placeholder = ["sleep", f"{duration}" if duration else "5"]
-            else:
-                placeholder = list(target_cmd or [])
-            r = run_perf(args + ["--", *placeholder],
-                         timeout=(duration or 0) + 3600)
-            if r.ok:
-                mr = run_perf(["mem", "report", "-i", os.path.join(outdir, "perf_mem.data")],
-                              timeout=900,
-                              stdout_file=os.path.join(outdir, "mem_report.txt"))
-                if mr.ok and os.path.getsize(os.path.join(outdir, "mem_report.txt")) > 0:
-                    mem_report_path = os.path.join(outdir, "mem_report.txt")
-                    memory_enabled = True
-                else:
-                    warnings.append("Intel PEBS samples recorded but mem report failed.")
-            else:
-                warnings.append("Intel PEBS memory pass failed: "
-                                + (r.stderr or "").strip().splitlines()[-1][:160]
-                                if (r.stderr or "").strip() else "PEBS memory pass failed")
         else:
-            warnings.append("Memory analysis unavailable (needs AMD IBS or Intel PEBS); skipped.")
+            args = ["mem", "record", "--ldlat", "30", "-o", memory_data_path]
+        cg = ["--call-graph", f"{callgraph_mode},16384"] if callgraph_mode != "none" else []
+        args += cg
+        if pid is not None:
+            args += ["-p", str(pid)]
+            placeholder = ["sleep", f"{duration}" if duration else "5"]
+        else:
+            placeholder = list(target_cmd or [])
+        r = run_perf(args + ["--", *placeholder], timeout=(duration or 0) + 3600)
+        if r.ok:
+            mem_report_path = _memory_report(
+                memory_data_path, outdir, memory_events, mem_backend or "memory", warnings)
+            memory_enabled = mem_report_path is not None
+        else:
+            memory_error = (r.stderr or "").strip().splitlines()
+            warnings.append(f"{mem_backend.upper()} memory pass failed: "
+                            + (memory_error[-1][:160] if memory_error else "memory pass failed"))
 
     # ---- stop freq sampler and save -----------------------------------------
     freq_timeline: list | None = None
@@ -394,8 +509,14 @@ def collect(
         "metrics": metric_list,
         "precise_event": precise_ev,
         "callgraph": callgraph_mode,
-        "memory": {"enabled": memory_enabled, "backend": mem_backend,
-                    "period": mem_period if memory_enabled else None},
+        "memory": {
+            "enabled": memory_enabled,
+            "backend": mem_backend,
+            "period": mem_period if memory_enabled else None,
+            "events": memory_events,
+            "data_file": os.path.basename(memory_data_path) if memory_data_path else None,
+            "cojoined": memory_cojoined,
+        },
         "wait": {"enabled": wait_enabled},
         "perf_version": perf_version(),
         "elapsed_wall": elapsed,

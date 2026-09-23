@@ -20,9 +20,11 @@ from pathlib import Path
 import pytest
 
 from vperf.collector import collect
-from vperf.doctor import cpu_vendor, probe_stat
+from vperf.doctor import cpu_vendor, probe_ibs, probe_intel_mem, probe_stat
+from vperf.memory import event_matches, parse_mem_report
 from vperf.metrics import MetricsReport, compute_metrics
 from vperf.parsers import parse_perf_script
+from vperf.stacks import build_profile
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -312,7 +314,7 @@ class TestCollectionPlumbing:
     def test_record_pass_produces_samples_and_hotspots(self, binaries, tmp_path):
         pd = collect(target_cmd=[str(binaries["simd_levels_avx"]), "6000000"],
                      pid=None, outdir=str(tmp_path / "rec"),
-                     freq=399, use_stat=False)
+                     freq=399, use_stat=False, use_memory=False, use_wait=False)
         assert pd.script_path, "script dump missing"
         text = Path(pd.script_path).read_text(errors="replace")
         samples = parse_perf_script(text)
@@ -321,12 +323,31 @@ class TestCollectionPlumbing:
         prof_total = sum(s.period for s in samples)
         assert prof_total > 1e9
 
-        from vperf.stacks import build_profile
         prof = build_profile(samples)
         funcs = [h.name for h in prof.hotspots[:30]]
         # attribution to the process's own code or at least resolved symbols
         assert any(not f.startswith("[k") for f in funcs), funcs
         assert prof.by_thread, "thread aggregation empty"
+
+    def test_cojoined_memory_tids_match_cpu_samples(self, binaries, tmp_path):
+        if not (probe_ibs() or probe_intel_mem()):
+            pytest.skip("AMD IBS or Intel PEBS unavailable")
+        if "simd_levels_all" not in binaries:
+            pytest.skip("multi-thread example unavailable")
+        pd = collect(target_cmd=[str(binaries["simd_levels_all"]), "1000000"],
+                     pid=None, outdir=str(tmp_path / "cojoin"),
+                     use_stat=False, use_record=True, use_memory=True,
+                     use_wait=False, use_freq=False)
+        if not pd.meta["memory"].get("cojoined") or not pd.mem_report_path:
+            pytest.skip("co-joined memory sampling unavailable")
+        assert pd.script_path
+        memory_events = set(pd.meta["memory"].get("events", []))
+        samples = parse_perf_script(Path(pd.script_path).read_text(errors="replace"))
+        cpu_samples = [s for s in samples if not event_matches(s.event, memory_events)]
+        memory = parse_mem_report(
+            Path(pd.mem_report_path).read_text(errors="replace"), memory_events, "\t")
+        cpu = build_profile(cpu_samples)
+        assert set(memory.by_tid) & set(cpu.by_thread)
 
     def test_attach_refused_or_works(self, tmp_path):
         from vperf.cli import main

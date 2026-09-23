@@ -279,8 +279,19 @@ def render_freq_svg(
     # legend
     lx = pad_l + 4
     ly = pad_t + 12
-    for label, dash, opa in [("max", "6,3", "0.6"), ("p75", "6,3", "0.6"), ("median", "none", "1"), ("p25", "6,3", "0.6"), ("min", "2,3", "0.4")]:
-        out.append(f'<line x1="{lx}" y1="{ly-4}" x2="{lx+12}" y2="{ly-4}" stroke="#409cff" stroke-width="2" stroke-dasharray="{dash}" opacity="{opa}"/>')
+    for label, dash, opa in [
+        ("max", "6,3", "0.6"),
+        ("p75", "6,3", "0.6"),
+        ("median", "none", "1"),
+        ("p25", "6,3", "0.6"),
+        ("min", "2,3", "0.4"),
+    ]:
+        out.append(
+            f'<line x1="{lx}" y1="{ly-4}" x2="{lx+12}" y2="{ly-4}" '
+            f'stroke="#409cff" stroke-width="2" stroke-dasharray="{dash}" '
+            f'opacity="{opa}"/>'
+        )
+
         out.append(f'<text x="{lx+16}" y="{ly}" fill="#ddd">{label}</text>')
         lx += 56
 
