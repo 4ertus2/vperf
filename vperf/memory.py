@@ -32,6 +32,7 @@ LATENCY_BANDS = [
 ]
 
 _ROW_SPLIT = re.compile(r"\s{2,}")
+_EVENT_SAMPLES = re.compile(r"#\s*Samples:.*event ['\"]([^'\"]+)")
 
 _SKIP_PREFIXES = (
     "#", "Warning:", "Kernel address", "Check ", "As no ",
@@ -42,11 +43,15 @@ _HEADER_HINTS = {
     "overhead": None,
     "samples": None,
     "local weight": None,
+    "period": None,
     "memory access": None,
     "symbol": None,
     "shared object": None,
     "data object": None,
     "tlb access": None,
+    "tgid:command": None,
+    "pid:command": None,
+    "command": None,
 }
 
 
@@ -75,6 +80,45 @@ def _clean_symbol(sym: str) -> str:
     return s or "[unknown]"
 
 
+def _int_value(value: str, default: int = 0) -> int:
+    try:
+        return int(float(value.replace(",", "")))
+    except (AttributeError, ValueError):
+        return default
+
+
+def _identity_value(value: str) -> tuple[int | None, str]:
+    if not value:
+        return None, ""
+    head, separator, comm = value.partition(":")
+    try:
+        number = int(head.strip())
+    except ValueError:
+        return None, ""
+    return number, comm.strip() if separator else ""
+
+
+def _split_cells(line: str, field_separator: str | None) -> list[str]:
+    separator = field_separator or ("\t" if "\t" in line else None)
+    if separator and separator in line:
+        return [cell.strip() for cell in line.split(separator)]
+    return [cell.strip() for cell in _ROW_SPLIT.split(line)]
+
+
+def event_matches(event: str, expected: set[str]) -> bool:
+    def key(value: str) -> str:
+        value = value.replace(" ", "").lower()
+        value = value.split(",", 1)[0]
+        parts = value.split("/")
+        if len(parts) >= 2:
+            name = parts[1].split("=", 1)[0]
+            return parts[0] if name in ("", "period", "freq") else parts[0] + "/" + name
+        return parts[0]
+
+    value = key(event)
+    return any(value == key(item) or value.startswith(key(item) + ":") for item in expected)
+
+
 @dataclass
 class MemSymbol:
     symbol: str
@@ -93,6 +137,10 @@ class MemoryProfile:
     tlb_samples: dict[str, int] = field(default_factory=dict)
     bands: dict[str, int] = field(default_factory=dict)   # band -> samples
     by_symbol: dict[str, MemSymbol] = field(default_factory=dict)
+    tid: int | None = None
+    tgid: int | None = None
+    comm: str = ""
+    by_tid: dict[int, "MemoryProfile"] = field(default_factory=dict, repr=False)
 
     @property
     def avg_latency(self) -> float | None:
@@ -114,10 +162,43 @@ class MemoryProfile:
         return sum(self.level_weight.values())
 
 
-def parse_mem_report(text: str) -> MemoryProfile:
-    prof = MemoryProfile()
+def _add_row(prof: MemoryProfile, samples: int, weight: int, level: str,
+             symbol: str, dso: str, tlb: str, weight_is_average: bool = False) -> None:
+    prof.total_samples += samples
+    if level != "unclassified":
+        total_weight = weight * samples if weight_is_average else weight
+        prof.classified_samples += samples
+        prof.level_samples[level] = prof.level_samples.get(level, 0) + samples
+        prof.level_weight[level] = prof.level_weight.get(level, 0) + total_weight
 
+        avg = weight if weight_is_average else weight / samples if samples else 0
+        for name, lo, hi in LATENCY_BANDS:
+            if lo <= avg < hi or (hi == float("inf") and avg >= lo):
+                prof.bands[name] = prof.bands.get(name, 0) + samples
+                break
+
+    tl = tlb if tlb and tlb != "N/A" else "n/a"
+    prof.tlb_samples[tl] = prof.tlb_samples.get(tl, 0) + samples
+
+    ms = prof.by_symbol.get(symbol)
+    if ms is None:
+        ms = prof.by_symbol[symbol] = MemSymbol(symbol=symbol, dso=dso)
+    ms.samples += samples
+    if level != "unclassified":
+        ms.weight += weight * samples if weight_is_average else weight
+    if level == "DRAM":
+        ms.dram_samples += samples
+
+
+def parse_mem_report(text: str, memory_events: set[str] | None = None,
+                     field_separator: str | None = None,
+                     weight_is_average: bool | None = False) -> MemoryProfile:
+    prof = MemoryProfile()
+    expected_events = {str(event) for event in (memory_events or set())}
     col: dict[str, int] = {}
+    section_allowed = True
+    section_weight_is_average = bool(weight_is_average)
+
     for raw in text.splitlines():
         line = raw.rstrip()
         if not line.strip():
@@ -125,34 +206,46 @@ def parse_mem_report(text: str) -> MemoryProfile:
         stripped = line.strip()
         low = stripped.lower()
 
-        # locate the header row once (perf prefixes it with '#')
+        event_match = _EVENT_SAMPLES.search(stripped)
+        if event_match:
+            section_allowed = not expected_events or event_matches(event_match.group(1), expected_events)
+            col = {}
+            continue
+
         if not col:
             hits = sum(1 for k in _HEADER_HINTS if k in low)
             if hits >= 4 and "overhead" in low:
-                cells = [c.strip() for c in _ROW_SPLIT.split(stripped.lstrip("# "))]
+                cells = _split_cells(stripped.lstrip("# "), field_separator)
                 for i, c in enumerate(cells):
                     col[c.lower()] = i
+                if weight_is_average is None:
+                    section_weight_is_average = "pid:command" in col or "tgid:command" in col
+            continue
+
+        if not section_allowed:
             continue
 
         if any(low.startswith(p.lower()) for p in _SKIP_PREFIXES):
             continue
 
-        cells = [c.strip() for c in _ROW_SPLIT.split(stripped)]
+        cells = _split_cells(stripped, field_separator)
 
         def at(name: str) -> str:
             idx = col.get(name.lower())
             return cells[idx] if idx is not None and idx < len(cells) else ""
 
-        try:
-            samples = int(at("Samples") or 0)
-        except ValueError:
-            samples = 0
+        samples = _int_value(at("Samples"))
         if samples <= 0:
             continue
-        try:
-            weight = int(float(at("Local Weight"))) if at("Local Weight") not in ("", "N/A") else 0
-        except ValueError:
-            weight = 0
+        weight = 0
+        total_period = at("Period")
+        if total_period not in ("", "N/A"):
+            weight = _int_value(total_period)
+        else:
+            local_weight = at("Local Weight")
+            if local_weight not in ("", "N/A"):
+                weight = _int_value(local_weight)
+        row_weight_is_average = section_weight_is_average and total_period in ("", "N/A")
 
         access = at("Memory access")
         level = _classify_access(access)
@@ -160,30 +253,26 @@ def parse_mem_report(text: str) -> MemoryProfile:
         dso = at("Shared Object") or "[unknown]"
         tlb = at("TLB access") or "N/A"
 
-        prof.total_samples += samples
-        if level != "unclassified":
-            prof.classified_samples += samples
-            prof.level_samples[level] = prof.level_samples.get(level, 0) + samples
-            prof.level_weight[level] = prof.level_weight.get(level, 0) + weight
+        tgid, tgid_comm = _identity_value(at("Tgid:Command"))
+        tid, tid_comm = _identity_value(at("Pid:Command"))
+        if tid is None:
+            tid, tid_comm = _identity_value(at("Tid:Command"))
+        comm = tid_comm or at("Command") or tgid_comm
 
-            avg = weight / samples if samples else 0
-            for name, lo, hi in LATENCY_BANDS:
-                if lo <= avg < hi or (hi == float("inf") and avg >= lo):
-                    prof.bands[name] = prof.bands.get(name, 0) + samples
-                    break
-
-        tl = tlb if tlb and tlb != "N/A" else "n/a"
-        prof.tlb_samples[tl] = prof.tlb_samples.get(tl, 0) + samples
-
-        ms = prof.by_symbol.get(symbol)
-        if ms is None:
-            ms = prof.by_symbol[symbol] = MemSymbol(symbol=symbol, dso=dso)
-        ms.samples += samples
-        ms.weight += weight if level != "unclassified" else 0
-        if level == "DRAM":
-            ms.dram_samples += samples
+        _add_row(prof, samples, weight, level, symbol, dso, tlb, row_weight_is_average)
+        if tid is not None:
+            thread = prof.by_tid.get(tid)
+            if thread is None:
+                thread = MemoryProfile(tid=tid, tgid=tgid, comm=comm)
+                prof.by_tid[tid] = thread
+            else:
+                if thread.tgid is None and tgid is not None:
+                    thread.tgid = tgid
+                if not thread.comm and comm:
+                    thread.comm = comm
+            _add_row(thread, samples, weight, level, symbol, dso, tlb, row_weight_is_average)
 
     return prof
 
 
-__all__ = ["MemoryProfile", "MemSymbol", "parse_mem_report", "LATENCY_BANDS"]
+__all__ = ["MemoryProfile", "MemSymbol", "event_matches", "parse_mem_report", "LATENCY_BANDS"]

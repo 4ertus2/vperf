@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import html
 import json
-from collections import defaultdict
 
 from .flamegraph import render_flame_svg
 from .memory import LATENCY_BANDS, MemoryProfile
@@ -71,7 +70,8 @@ footer{color:var(--dim);padding:16px 24px;font-size:12px}
 #chart-header .row{display:flex;align-items:center;gap:16px;margin-bottom:8px}
 #chart-header label{color:var(--dim);font-size:12px;text-transform:uppercase}
 #chart-header select{margin:0}
-.mode-btn{background:var(--bg);color:var(--dim);border:1px solid var(--line);border-radius:4px;padding:4px 12px;cursor:pointer;font-size:12px}
+.mode-btn{background:var(--bg);color:var(--dim);border:1px solid var(--line);border-radius:4px;padding:4px 12px;cursor:pointer;
+font-size:12px}
 .mode-btn.active{color:var(--fg);border-color:var(--accent);background:#1a2a44}
 #chart-wrap{position:relative;height:160px;cursor:crosshair;overflow:visible}
 #chart-wrap svg{width:100%;height:100%}
@@ -202,7 +202,9 @@ function renderUtilChart(samples,W,H,pad_l,pad_b,pad_t,pw,ph,nbuckets){
    var v=buckets[i]/(dur*hz);
   pts+=x.toFixed(1)+','+Y(v).toFixed(1)+' ';
  }
- svg+='<polygon points="'+X(T0).toFixed(1)+','+(pad_t+ph)+' '+pts+X(T0+TSPAN).toFixed(1)+','+(pad_t+ph)+'" fill="rgba(64,156,255,0.35)" stroke="#409cff" stroke-width="1.5"/>';
+  svg+='<polygon points="'+X(T0).toFixed(1)+','+(pad_t+ph)+' '+pts
+   +X(T0+TSPAN).toFixed(1)+','+(pad_t+ph)+'" fill="rgba(64,156,255,0.35)" '
+   +'stroke="#409cff" stroke-width="1.5"/>';
  for(var f=0;f<=1;f+=0.25){
   var t=T0+f*TSPAN;
   svg+='<text x="'+X(t).toFixed(1)+'" y="'+(H-4)+'" text-anchor="middle" fill="#999">'+(f*(timeEnd-timeStart)*TSPAN).toFixed(2)+'s</text>';
@@ -242,7 +244,8 @@ function renderFreqChart(W,H,pad_l,pad_b,pad_t,pw,ph,nbuckets){
   pts_max+=X(e[0]).toFixed(1)+','+Y(e[5]).toFixed(1)+' ';
   pts_min=X(e[0]).toFixed(1)+','+Y(e[1]).toFixed(1)+' '+pts_min;
  });
- svg+='<polygon points="'+X(fT0).toFixed(1)+','+(pad_t+ph)+' '+pts_max+pts_min+X(fT0).toFixed(1)+','+(pad_t+ph)+'" fill="rgba(64,156,255,0.20)" stroke="none"/>';
+  svg+='<polygon points="'+X(fT0).toFixed(1)+','+(pad_t+ph)+' '+pts_max+pts_min
+   +X(fT0).toFixed(1)+','+(pad_t+ph)+'" fill="rgba(64,156,255,0.20)" stroke="none"/>';
  var pts_med='';envelope.forEach(function(e){pts_med+=X(e[0]).toFixed(1)+','+Y(e[3]).toFixed(1)+' ';});
  svg+='<polyline points="'+pts_med+'" fill="none" stroke="#409cff" stroke-width="1.5"/>';
  var pts_p75='';envelope.forEach(function(e){pts_p75+=X(e[0]).toFixed(1)+','+Y(e[4]).toFixed(1)+' ';});
@@ -256,9 +259,11 @@ function renderFreqChart(W,H,pad_l,pad_b,pad_t,pw,ph,nbuckets){
  svg+='<rect x="'+lx+'" y="'+ly+'" width="'+lw+'" height="'+lh+'" rx="4" fill="rgba(20,24,33,0.85)" stroke="#2a3247"/>';
  svg+='<line x1="'+(lx+8)+'" y1="'+(ly+12)+'" x2="'+(lx+28)+'" y2="'+(ly+12)+'" stroke="#409cff" stroke-width="1.5"/>';
  svg+='<text x="'+(lx+34)+'" y="'+(ly+15)+'" fill="#bbb" font-size="11">median</text>';
- svg+='<line x1="'+(lx+8)+'" y1="'+(ly+24)+'" x2="'+(lx+28)+'" y2="'+(ly+24)+'" stroke="#409cff" stroke-width="1" stroke-dasharray="6,3" opacity="0.6"/>';
+  svg+='<line x1="'+(lx+8)+'" y1="'+(ly+24)+'" x2="'+(lx+28)+'" y2="'+(ly+24)+'" stroke="#409cff" stroke-width="1" '
+   +'stroke-dasharray="6,3" opacity="0.6"/>';
  svg+='<text x="'+(lx+34)+'" y="'+(ly+27)+'" fill="#bbb" font-size="11">p25 / p75</text>';
- svg+='<line x1="'+(lx+8)+'" y1="'+(ly+36)+'" x2="'+(lx+28)+'" y2="'+(ly+36)+'" stroke="#409cff" stroke-width="1" stroke-dasharray="2,3" opacity="0.4"/>';
+  svg+='<line x1="'+(lx+8)+'" y1="'+(ly+36)+'" x2="'+(lx+28)+'" y2="'+(ly+36)+'" stroke="#409cff" stroke-width="1" '
+   +'stroke-dasharray="2,3" opacity="0.4"/>';
  svg+='<text x="'+(lx+34)+'" y="'+(ly+39)+'" fill="#bbb" font-size="11">min / max</text>';
  svg+='</svg>';
  document.getElementById('chart-svg').innerHTML=svg;
@@ -280,16 +285,32 @@ function setChartMode(mode){
  renderChart();
 }
 
+function renderMemory(){
+ var body=document.getElementById('memory-body');
+ if(!body) return;
+ var key=threadFilter===null?'all':String(threadFilter);
+ if(Object.prototype.hasOwnProperty.call(MEMORY_HTML,key)){
+  body.innerHTML=MEMORY_HTML[key];
+ }else if(threadFilter===null){
+  body.innerHTML=MEMORY_HTML.all||'';
+ }else{
+  body.innerHTML='<div class="panel"><h3>Memory access</h3><em>No IBS / PEBS samples are available for the selected '
+   +'thread in this profile.</em></div>';
+ }
+}
+
 function setThread(tid){
- threadFilter=tid;
- var sel=document.getElementById('thread-sel');
- document.getElementById('thread-label').textContent=sel.options[sel.selectedIndex].text;
- renderHotspots();
- renderChart();
- var flameId=tid!==null?String(tid):'all';
- document.querySelectorAll('#flamewrap .flame').forEach(d=>{
+  threadFilter=tid;
+  var sel=document.getElementById('thread-sel');
+  document.getElementById('thread-label').textContent=sel.options[sel.selectedIndex].text;
+  renderHotspots();
+  renderChart();
+  renderMemory();
+  var flameId=tid!==null?String(tid):'all';
+  document.querySelectorAll('#flamewrap .flame').forEach(d=>{
    d.style.display=(d.dataset.thread===flameId)?'block':'none';});
 }
+
 
 function initDrag(){
  var wrap=document.getElementById('chart-wrap');
@@ -338,9 +359,10 @@ function initDrag(){
 }
 
 function init(){
- initDrag();
- renderHotspots();
- renderChart();
+  initDrag();
+  renderHotspots();
+  renderChart();
+  renderMemory();
 }
 """
 
@@ -453,12 +475,13 @@ def _tree_html(node: TreeNode, total: int, depth: int = 0) -> str:
             f"<span class='selfpct'>{pct:.1f}% · self {self_pct:.1f}%</span></summary>{inner}</details>")
 
 
-def _memory_tab(mem: MemoryProfile | None, backend: str = "ibs") -> str:
+def _memory_content(mem: MemoryProfile | None, backend: str = "ibs",
+                     scope: str = "all threads") -> str:
     label = "IBS" if backend == "ibs" else "PEBS"
     if mem is None or mem.total_samples == 0:
-        return ('<div class="page" id="mem"><div class="panel">'
-                '<h3>Memory access</h3><em>Not collected (AMD IBS / Intel PEBS '
-                'unavailable or disabled with --no-memory).</em></div></div>')
+        return ('<div class="panel"><h3>Memory access</h3><em>Not collected '
+                '(AMD IBS / Intel PEBS unavailable or disabled with '
+                '--no-memory).</em></div>')
     total = max(mem.classified_samples, 1)
 
     def bars(items):
@@ -495,8 +518,7 @@ def _memory_tab(mem: MemoryProfile | None, backend: str = "ibs") -> str:
         "<th onclick='sortTable(this,1)'>DRAM accesses</th>"
         "</tr></thead><tbody>" + stall_rows + "</tbody></table>")
 
-    return f'''<div id="mem" class="page">
-<div class="panel"><h3>Memory access summary ({label})</h3>
+    return f'''<div class="panel"><h3>Memory access summary ({label}) — {esc(scope)}</h3>
 <table><tbody>
 <tr><td>{label} samples collected</td><td>{mem.total_samples:,}</td>
 <td class="mono" style="color:var(--dim)">tagged micro-ops</td></tr>
@@ -508,8 +530,25 @@ def _memory_tab(mem: MemoryProfile | None, backend: str = "ibs") -> str:
 <div class="panel"><h3>Where the data came from</h3>{bars(mix)}</div>
 <div class="panel"><h3>Latency distribution (VTune-style bands)</h3>{bars(bands)}</div>
 <div class="panel"><h3>dTLB outcomes</h3>{bars(tlb)}</div>
-<div class="panel"><h3>Top functions by memory-stall time</h3>{stall_table}</div>
-</div>'''
+<div class="panel"><h3>Top functions by memory-stall time</h3>{stall_table}</div>'''
+
+
+def _memory_tab(mem: MemoryProfile | None, backend: str = "ibs") -> str:
+    return (f'<div id="mem" class="page"><div id="memory-body">'
+            f'{_memory_content(mem, backend)}</div></div>')
+
+
+def _memory_html_map(mem: MemoryProfile | None, backend: str = "ibs",
+                     prof: StackProfile | None = None,
+                     per_thread_enabled: bool = True) -> dict:
+    result = {"all": _memory_content(mem, backend, "all threads")}
+    if per_thread_enabled and mem is not None:
+        for tid, profile in mem.by_tid.items():
+            cpu_thread = prof.by_thread.get(tid) if prof is not None else None
+            comm = cpu_thread.comm if cpu_thread is not None else profile.comm
+            scope = f"{comm or 'thread'} (tid {tid})"
+            result[str(tid)] = _memory_content(profile, backend, scope)
+    return result
 
 
 def _wait_tab(wp: WaitProfile | None) -> str:
@@ -567,12 +606,22 @@ def _wait_tab(wp: WaitProfile | None) -> str:
 </div>'''
 
 
-def _thread_options(prof: StackProfile) -> str:
+def _thread_options(prof: StackProfile, mem: MemoryProfile | None = None) -> str:
     opts = ['<option value="">All threads</option>']
+    seen: set[int] = set()
     for t in top_threads(prof, 20):
         pct = t.cycles / max(prof.total_cycles, 1) * 100
         label = f"{esc(t.comm)} (tid {t.tid}, {pct:.0f}%)"
         opts.append(f'<option value="{t.tid}">{label}</option>')
+        seen.add(t.tid)
+    if mem is not None:
+        memory_threads = sorted(mem.by_tid.values(), key=lambda p: p.total_samples, reverse=True)
+        for profile in memory_threads:
+            if profile.tid is None or profile.tid in seen:
+                continue
+            label = f"{esc(profile.comm or 'thread')} (tid {profile.tid}, memory)"
+            opts.append(f'<option value="{profile.tid}">{label}</option>')
+            seen.add(profile.tid)
     return "".join(opts)
 
 
@@ -581,6 +630,9 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
                wp: WaitProfile | None = None,
                freq_timeline: list | None = None) -> str:
     ncpu = meta.get("ncpus", 1)
+    memory_meta = meta.get("memory", {})
+    memory_backend = memory_meta.get("backend") or "ibs"
+    memory_cojoined = bool(memory_meta.get("cojoined", False))
 
     # ---- flame graphs -------------------------------------------------------
     flame_divs = []
@@ -603,9 +655,11 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
     samples_json = json.dumps([[s.tid, s.time, s.period, s.comm,
                                 [f[0] for f in s.frames]] for s in samples])
     freq_json = json.dumps(freq_timeline or [])
+    memory_json = json.dumps(_memory_html_map(
+        mem, memory_backend, prof, memory_cojoined)).replace("</", "<\\/")
 
     # ---- thread list for selector -------------------------------------------
-    thread_opts = _thread_options(prof)
+    thread_opts = _thread_options(prof, mem if memory_cojoined else None)
 
     # ---- initial hotspots table (server-rendered, replaced by JS) -----------
     initial_hotspots = _hotspots_table(prof)
@@ -700,7 +754,7 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 <div class="panel"><h3>Top functions by self time</h3><div id="hotspots-body">{initial_hotspots}</div></div>
 </div>
 
-{_memory_tab(mem, meta.get("memory", {}).get("backend", "ibs"))}
+{_memory_tab(mem, memory_backend)}
 
 {_wait_tab(wp)}
 
@@ -718,7 +772,10 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 </div>
 
 <footer>Generated by vperf — artifacts: {esc(meta.get('_outdir', ''))}</footer>
-<script>SAMPLES={samples_json};FREQ={freq_json};T0={t0};TSPAN={tspan};NCPU={ncpu};TOTAL_CYCLES={prof.total_cycles};CPU_TIME={m.cpu_time or 0};</script>
+<script>
+SAMPLES={samples_json};FREQ={freq_json};MEMORY_HTML={memory_json};
+T0={t0};TSPAN={tspan};NCPU={ncpu};TOTAL_CYCLES={prof.total_cycles};CPU_TIME={m.cpu_time or 0};
+</script>
 <script>{_JS}</script>
 <script>init();</script>
 </body></html>"""

@@ -16,8 +16,10 @@ CPU analyses on amd64 machine (AMD and Intel), with zero Python dependencies:
   to its source: L2 hit, local L3 hit, or DRAM/MMIO (= true LLC misses)
 - **Effective CPU utilization** — average busy cores + utilization timeline
 - **Reports** — terminal summary + a single-file interactive `report.html`
-  (metric overview, hotspots table, memery access summary, flame graph,
-  timelines, call tree, threads)
+  (metric overview, hotspots table, memory access summary, flame graph,
+  timelines, call tree, threads). The HTML thread selector also scopes the
+  IBS/PEBS Memory tab to the selected thread when profiling collected both
+  streams in one recording.
 
 Artifacts (`stat.csv`, `perf.data`, `script.txt`, `meta.json`) are kept in the
 profile directory so reports can be regenerated any time with `vperf report`.
@@ -114,7 +116,7 @@ Open `report.html` in any browser — fully offline, no CDN.
 | **OS noise** | |
 | Context Switches/s > 100 | scheduling pressure; pin threads or increase work per task |
 | Page Faults/s high | first-touch allocation or huge-page opportunity |
-| **Memory access (IBS, AMD)** | |
+| **Memory access (IBS / PEBS)** | |
 | DRAM access % high | true LLC misses; optimize data layout |
 | L1 access % ≈ 100% | working set fits in cache |
 | Avg latency > 200 cyc | deep memory stalls; prefetching or data restructuring needed |
@@ -128,13 +130,21 @@ Open `report.html` in any browser — fully offline, no CDN.
 1. **Capability probe** — tiny throwaway runs determine supported events,
    `-M` metrics and the best precise cycles event (`cycles:P` → fallbacks).
 2. **Counting pass** — `perf stat -x,` with all counters + metrics.
-3. **Sampling pass** — `perf record -F 199 -e <precise> --call-graph dwarf`.
-4. **Post-processing** — `perf script` dump parsed in pure Python; stacks are
-   folded into self/inclusive times; metrics derived; HTML/SVG rendered.
+3. **Sampling pass** — CPU cycles and AMD IBS or Intel PEBS are recorded in
+   one `perf record` invocation when both are enabled, so TIDs can be joined;
+   unsupported combinations fall back to a separate memory pass, and
+   `--no-record` keeps the memory-only pass separate.
+4. **Post-processing** — `perf script` and `perf mem report` dumps are parsed
+   in pure Python; memory events are kept out of CPU hotspots, stacks are
+   folded into self/inclusive times, metrics derived, and HTML/SVG rendered.
 
 Notes & caveats:
-- Two passes means the workload runs twice (VTune does the same for some
-  analyses). Use `--no-stat`/`--no-record` for single-pass runs.
+- Counting and sampling are still separate passes, so the workload normally
+  runs more than once. CPU cycles and IBS/PEBS are co-recorded within the
+  sampling pass; `--no-record` intentionally disables that TID join.
+- The HTML thread selector scopes CPU views and the Memory tab. Overview
+  cards and the terminal memory section remain whole-run summaries. Profiles
+  collected before per-thread memory reports remain aggregate-only.
 - Multiplexing: counters share PMU registers; perf scales counts, but
   ratios across different groups carry some noise.
 - DWARF unwinding is done offline; `DEBUGINFOD_URLS` is stripped from perf's
