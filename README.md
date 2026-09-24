@@ -3,8 +3,8 @@
 `vperf` wraps the Linux `perf` tool to reproduce Intel VTune's most valuable
 CPU analyses on amd64 machine (AMD and Intel), with zero Python dependencies:
 
-- **Hotspots** — self/inclusive time per function with call stacks (DWARF),
-  per-thread breakdown, flame graphs
+- **Hotspots** — self/inclusive time per function with frame-pointer call
+  stacks by default, optional DWARF, per-thread breakdown, flame graphs
 - **Hardware counters** — instructions retired, clockticks, IPC/CPI,
   branch mispredict %, L1/L2/LLC miss counts and rates, dTLB (page) misses,
   context switches & migrations/s
@@ -103,7 +103,7 @@ vperf run <vperf-args> -- ./yourapp <yourapp-args>
 vperf run -- ./yourapp                            # profile with defaults
 vperf run -o baseline -- ./yourapp input.bin      # save to a named directory
 vperf run -f 999 -- ./yourapp input.bin           # higher sampling frequency
-vperf run --callgraph fp -- ./yourapp             # frame-pointer unwinding (no debug info needed)
+vperf run --callgraph dwarf -- ./yourapp         # higher-quality stacks when DWARF is available
 
 # compare two runs
 vperf diff .vperf/baseline .vperf/optimized
@@ -159,9 +159,10 @@ Open `report.html` in any browser — fully offline, no CDN.
    `-M` metrics and the best precise cycles event (`cycles:P` → fallbacks).
 2. **Counting/sampling pass** — when both are enabled, one synchronized
    `perf stat --per-thread` + `perf record` session collects hardware counters
-   and CPU samples from the same target lifetime. CPU cycles and AMD IBS or
-   Intel PEBS remain in the same recording; the existing Memory data is
-   post-processed from that `perf.data` rather than collected again.
+   and CPU samples from the same target lifetime. The default callgraph mode
+   is frame pointers, so debug info is not required for stack capture. CPU
+   cycles and AMD IBS or Intel PEBS remain in the same recording; the existing
+   Memory data is post-processed from that `perf.data` rather than collected again.
 3. **Fallbacks** — the normal CLI keeps CPU sampling when co-joined memory
    sampling is unavailable; memory analysis is then omitted.
 4. **Post-processing** — `perf stat`, `perf script`, and `perf mem report`
@@ -182,6 +183,12 @@ Notes & caveats:
   recollected when the Overview hardware counters are enabled.
 - Multiplexing: counters share PMU registers; perf scales counts, but ratios
   across different groups carry some noise.
+- Frame-pointer unwinding is the default and does not require DWARF debug info,
+  but the target must preserve frame pointers. Missing frame pointers can
+  produce short, unresolved, or incorrect stacks and may reduce hotspot and
+  call-tree quality. Use `--callgraph dwarf` for optimized binaries with good
+  DWARF/CFI unwind data. Symbol names still require a symbol table; fully
+  stripped binaries can only provide address-based samples.
 - DWARF unwinding is done offline; `DEBUGINFOD_URLS` is stripped from perf's
   environment to prevent multi-second network hangs.
 - True Intel TMA level-1/2 requires Intel's `slots` PMU. On AMD the backend /

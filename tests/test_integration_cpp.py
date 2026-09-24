@@ -329,6 +329,59 @@ class TestCollectionPlumbing:
         assert any(not f.startswith("[k") for f in funcs), funcs
         assert prof.by_thread, "thread aggregation empty"
 
+    def test_fp_default_hotspots_without_debug_info(self, tmp_path):
+        compiler = shutil.which("g++")
+        if not compiler:
+            pytest.skip("g++ not available")
+        binary = tmp_path / "fp-hotspot"
+        source = """
+#include <cstdint>
+
+volatile std::uint64_t sink;
+
+extern "C" __attribute__((noinline)) std::uint64_t leaf(std::uint64_t value) {
+    for (int i = 0; i < 64; ++i) {
+        value = value * 6364136223846793005ULL + 1442695040888963407ULL;
+    }
+    return value;
+}
+
+extern "C" __attribute__((noinline)) std::uint64_t middle(std::uint64_t value) {
+    std::uint64_t result = 0;
+    for (int i = 0; i < 32; ++i) {
+        result += leaf(value + i);
+    }
+    return result;
+}
+
+int main() {
+    std::uint64_t value = 1;
+    for (int i = 0; i < 200000; ++i) {
+        value = middle(value);
+    }
+    sink = value;
+    return sink == 0;
+}
+"""
+        build = subprocess.run(
+            [compiler, "-O2", "-fno-omit-frame-pointer", "-g0", "-x", "c++", "-", "-o", str(binary)],
+            input=source, text=True, capture_output=True, timeout=120,
+        )
+        assert build.returncode == 0, build.stderr
+
+        pd = collect(
+            target_cmd=[str(binary)], pid=None, outdir=str(tmp_path / "fp"),
+            freq=399, use_stat=False, use_memory=False, use_wait=False, use_freq=False,
+        )
+        assert pd.meta["callgraph"] == "fp"
+        assert pd.script_path
+        samples = parse_perf_script(Path(pd.script_path).read_text(errors="replace"))
+        assert samples
+        profile = build_profile(samples)
+        names = {hotspot.name for hotspot in profile.hotspots}
+        assert any(any(token in name for token in ("leaf", "middle", "main")) for name in names), names
+        assert profile.by_thread
+
     def test_cojoined_memory_tids_match_cpu_samples(self, binaries, tmp_path):
         if not (probe_ibs() or probe_intel_mem()):
             pytest.skip("AMD IBS or Intel PEBS unavailable")

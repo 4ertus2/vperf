@@ -77,6 +77,29 @@ class _FakeCollector:
         return self._result
 
 
+def test_callgraph_defaults_to_frame_pointers():
+    parser = build_parser()
+    assert parser.parse_args(["run", "--", "true"]).callgraph == "fp"
+    assert parser.parse_args(["attach", "-p", "123"]).callgraph == "fp"
+
+
+def test_callgraph_arguments_are_mode_specific():
+    assert collector._callgraph_args("fp") == ["--call-graph", "fp"]
+    assert collector._callgraph_args("dwarf") == ["--call-graph", "dwarf,16384"]
+    assert collector._callgraph_args("none") == []
+
+    record = collector._cpu_record_args("perf.data", "cycles:P", 199, "fp")
+    assert record[record.index("--call-graph") + 1] == "fp"
+    assert "fp,16384" not in record
+
+    assert collector._frame_pointer_args(
+        ["record", "--call-graph", "dwarf,16384", "-e", "cycles"],
+    ) == ["record", "--call-graph", "fp", "-e", "cycles"]
+    assert collector._frame_pointer_args(["record", "-e", "cycles"]) == [
+        "record", "--call-graph", "fp", "-e", "cycles",
+    ]
+
+
 def test_collect_cojoins_cpu_and_memory_events(monkeypatch, tmp_path):
     calls = []
 
@@ -111,6 +134,9 @@ def test_collect_cojoins_cpu_and_memory_events(monkeypatch, tmp_path):
     assert profile.meta["memory"]["cojoined"] is True
     assert profile.meta["memory"]["data_file"] == "perf.data"
     assert profile.mem_report_path is not None
+    assert record[record.index("--call-graph") + 1] == "fp"
+    assert "fp,16384" not in record
+    assert profile.meta["callgraph"] == "fp"
 
 
 def test_collect_falls_back_when_cojoined_record_fails(monkeypatch, tmp_path):
@@ -274,6 +300,8 @@ def test_collect_combines_attached_stat_and_record(monkeypatch, tmp_path):
     assert "app" not in stat_call + record_call
     assert "cycles/freq=399/P" in record_call
     assert "ibs_op/period=100003/p" in record_call
+    assert record_call[record_call.index("--call-graph") + 1] == "fp"
+    assert "fp,16384" not in record_call
     assert len(record_calls) == 1
     assert len([call for call in postprocess_calls if call[:1] == ["script"]]) == 1
     assert len([call for call in postprocess_calls if call[:2] == ["mem", "report"]]) == 1

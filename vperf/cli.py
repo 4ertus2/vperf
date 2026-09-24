@@ -10,7 +10,7 @@ import time
 from dataclasses import asdict
 
 from . import __version__
-from .collector import collect, load_profile
+from .collector import DEFAULT_CALLGRAPH, collect, load_profile
 from .doctor import PERF_ACCESS_HINTS, probe_attach, probe_stat, run_doctor
 from .metrics import MetricsReport, compute_metrics, compute_thread_metrics
 from .memory import event_matches
@@ -329,8 +329,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="stat interval in ms for a task-clock timeline "
                              "(default off: timeline is derived from samples)")
         sp.add_argument("--no-stat", action="store_true", help="skip the counting pass")
-        sp.add_argument("--callgraph", choices=["dwarf", "fp", "none"], default="dwarf",
-                        help="call graph unwinding method")
+        sp.add_argument("--callgraph", choices=["dwarf", "fp", "none"], default=DEFAULT_CALLGRAPH,
+                        help="call graph unwinding method (default: fp; dwarf for higher-quality stacks)")
         sp.add_argument("--no-wait", action="store_true",
                         help="skip the wait/off-CPU pass (scheduler tracepoints)")
 

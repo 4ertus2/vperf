@@ -90,6 +90,8 @@ class _MemoryPlan:
     data_file: str
 
 
+DEFAULT_CALLGRAPH = "fp"
+
 _MEMORY_SORT = "tgid,pid,comm,local_weight,mem,sym,dso,tlb"
 _MEMORY_SORT_FALLBACK = "pid,comm,local_weight,mem,sym,dso,tlb"
 
@@ -153,9 +155,19 @@ def _frequency_event(precise_event: str, freq: int) -> str:
     return f"{event}/freq={freq}/" + suffix
 
 
+def _callgraph_args(callgraph_mode: str) -> list[str]:
+    if callgraph_mode == "none":
+        return []
+    if callgraph_mode == "fp":
+        return ["--call-graph", "fp"]
+    return ["--call-graph", "dwarf,16384"]
+
+
 def _cpu_record_args(data_path: str, precise_event: str, freq: int, callgraph_mode: str) -> list[str]:
-    cg = ["--call-graph", f"{callgraph_mode},16384"] if callgraph_mode != "none" else []
-    return ["record", "-F", str(freq), "-e", precise_event, *cg, "-o", data_path]
+    return [
+        "record", "-F", str(freq), "-e", precise_event,
+        *_callgraph_args(callgraph_mode), "-o", data_path,
+    ]
 
 
 def _attached_stat_args(
@@ -188,8 +200,7 @@ def _attached_record_args(
 ) -> list[str]:
     if memory_plan:
         args = ["record", "-q", "-d", "-W", "-o", data_path]
-        cg = ["--call-graph", f"{callgraph_mode},16384"] if callgraph_mode != "none" else []
-        args += cg
+        args += _callgraph_args(callgraph_mode)
         args += ["-e", _frequency_event(precise_event, freq)]
         for event in memory_plan.events:
             args += ["-e", event]
@@ -420,8 +431,12 @@ def _collector_error(result: PerfResult | None) -> str:
 
 
 def _frame_pointer_args(args: list[str]) -> list[str]:
-    args = [arg for arg in args if arg not in ("--call-graph", "dwarf,16384")]
-    args.insert(1, "-g")
+    args = list(args)
+    for index, arg in enumerate(args):
+        if arg == "--call-graph":
+            args[index:index + 2] = _callgraph_args("fp")
+            return args
+    args[1:1] = _callgraph_args("fp")
     return args
 
 
@@ -821,7 +836,7 @@ def collect(
     mem_period: int = 100003,
     use_wait: bool = True,
     use_freq: bool = True,
-    callgraph_mode: str = "dwarf",
+    callgraph_mode: str = DEFAULT_CALLGRAPH,
     quiet_stdout: bool = False,
 ) -> ProfileData:
     """Profile either a new process (`target_cmd`) or an existing one (`pid`)."""
@@ -927,8 +942,7 @@ def collect(
         data_path = os.path.join(outdir, "perf.data")
         if memory_plan:
             args = ["record", "-q", "-d", "-W", "-o", data_path]
-            cg = ["--call-graph", f"{callgraph_mode},16384"] if callgraph_mode != "none" else []
-            args += cg
+            args += _callgraph_args(callgraph_mode)
             args += ["-e", _frequency_event(precise_ev, freq)]
             for event in memory_plan.events:
                 args += ["-e", event]
@@ -947,8 +961,7 @@ def collect(
         freq_timeline = freq_sampler.stop()
         if not r.ok and memory_plan and callgraph_mode == "dwarf":
             warnings.append("DWARF call graphs failed; retrying with frame pointers.")
-            args = [a for a in args if a not in ("--call-graph", f"{callgraph_mode},16384")]
-            args.insert(1, "-g")
+            args = _frame_pointer_args(args)
             r = run_perf(args + ["--", *placeholder], timeout=(duration or 0) + 3600)
         if not r.ok and memory_plan:
             warnings.append(
@@ -960,8 +973,7 @@ def collect(
             r = run_perf(args + ["--", *placeholder], timeout=(duration or 0) + 3600)
         if not r.ok and callgraph_mode == "dwarf":
             warnings.append("DWARF call graphs failed; retrying with frame pointers.")
-            args = [a for a in args if a not in ("--call-graph", f"{callgraph_mode},16384")]
-            args.insert(1, "-g")
+            args = _frame_pointer_args(args)
             r = run_perf(args + ["--", *placeholder], timeout=(duration or 0) + 3600)
         if not r.ok:
             raise PerfError("perf record failed:\n" + (r.stderr or "").strip()[:2000])
@@ -1025,8 +1037,7 @@ def collect(
                     "-e", "ibs_op//p", "-c", str(mem_period)]
         else:
             args = ["mem", "record", "--ldlat", "30", "-o", memory_data_path]
-        cg = ["--call-graph", f"{callgraph_mode},16384"] if callgraph_mode != "none" else []
-        args += cg
+        args += _callgraph_args(callgraph_mode)
         if pid is not None:
             args += ["-p", str(pid)]
             placeholder = ["sleep", f"{duration}" if duration else "5"]
