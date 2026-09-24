@@ -42,6 +42,33 @@ class StatData:
         return out
 
 
+@dataclass
+class ThreadStatData:
+    tid: int
+    comm: str
+    stat: StatData = field(default_factory=StatData)
+
+    @property
+    def stats(self) -> StatData:
+        return self.stat
+
+    @property
+    def data(self) -> StatData:
+        return self.stat
+
+
+ThreadStat = ThreadStatData
+
+
+class ThreadStatMap(dict[int, ThreadStatData]):
+    @property
+    def by_tid(self) -> dict[int, ThreadStatData]:
+        return self
+
+
+ThreadStats = ThreadStatMap
+
+
 _NOT_COUNTED = {"<not counted>", "<not supported>", ""}
 
 
@@ -160,6 +187,162 @@ def parse_stat_csv(text: str, known_names: set[str]) -> StatData:
     return data
 
 
+def _thread_cell(cell: str) -> tuple[str, int] | None:
+    match = re.fullmatch(r"(?P<comm>.*)-(?P<tid>[0-9]+)", cell.strip())
+    if match is None:
+        return None
+    return match.group("comm"), int(match.group("tid"))
+
+
+def _thread_prefix(cells: list[str]) -> tuple[int, str, int, float | None] | None:
+    if not cells:
+        return None
+    start = 0
+    timestamp: float | None = None
+    first_value = _num(cells[0])
+    if first_value is not None:
+        timestamp = first_value
+        start = 1
+    for i in range(start, min(len(cells), start + 3)):
+        parsed = _thread_cell(cells[i])
+        if parsed is not None:
+            comm, tid = parsed
+            return i, comm, tid, timestamp
+    return None
+
+
+def _event_cell(value: str) -> bool:
+    value = value.strip()
+    return bool(value) and value.lower() not in _NOT_COUNTED and _num(value) is None
+
+
+def _event_shape(cells: list[str], event_idx: int) -> bool:
+    if event_idx + 2 >= len(cells) or not _event_cell(cells[event_idx]):
+        return False
+    return _num(cells[event_idx + 1]) is not None and _num(cells[event_idx + 2]) is not None
+
+
+def _event_index(cells: list[str], thread_idx: int, known_names: set[str]) -> int | None:
+    candidates: list[tuple[int, int]] = []
+    for offset in (3, 4):
+        idx = thread_idx + offset
+        if idx >= len(cells) or not _event_cell(cells[idx]):
+            continue
+        score = 1 if _event_shape(cells, idx) else 0
+        if cells[idx] in known_names:
+            score += 4
+        candidates.append((score, idx))
+    if candidates:
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        if candidates[0][0]:
+            return candidates[0][1]
+    for idx in range(thread_idx + 1, len(cells) - 2):
+        if cells[idx] in known_names and _event_shape(cells, idx):
+            return idx
+    return None
+
+
+def _metric_tail(
+    cells: list[str], thread_idx: int, event_idx: int | None, known_names: set[str],
+) -> tuple[str, int] | None:
+    first = thread_idx + 1 if event_idx is None else event_idx + 1
+    for idx in range(len(cells) - 1, first - 1, -1):
+        description = cells[idx].strip()
+        if not description:
+            continue
+        parts = description.split()
+        alias = parts[-1]
+        if alias not in known_names or idx == 0 or _num(cells[idx - 1]) is None:
+            continue
+        return alias, idx
+    return None
+
+
+def _metric_unit(description: str, alias: str) -> str:
+    if description == alias:
+        return ""
+    return description[: -len(alias)].strip()
+
+
+def parse_per_thread_stat_csv(
+    text: str, known_names: set[str] | None = None,
+) -> ThreadStatMap:
+    """Parse whole-run or interval ``perf stat --per-thread`` CSV output."""
+    names = set(known_names or ())
+    threads = ThreadStatMap()
+    interval_values: dict[int, dict[float, dict[str, float]]] = {}
+    interval_order: dict[int, list[float]] = {}
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        cells = [cell.strip() for cell in line.split(",")]
+        prefix = _thread_prefix(cells)
+        if prefix is None:
+            continue
+        thread_idx, comm, tid, timestamp = prefix
+        thread = threads.get(tid)
+        if thread is None:
+            thread = ThreadStatData(tid=tid, comm=comm)
+            threads[tid] = thread
+        elif not thread.comm and comm:
+            thread.comm = comm
+
+        metric = _metric_tail(cells, thread_idx, None, names)
+        event_idx = _event_index(cells, thread_idx, names)
+        if metric is not None and event_idx == metric[1]:
+            event_idx = None
+        if metric is None:
+            metric = _metric_tail(cells, thread_idx, event_idx, names)
+        if metric is not None:
+            alias, metric_idx = metric
+            metric_value = _num(cells[metric_idx - 1])
+            if metric_value is not None:
+                thread.stat.metrics[alias] = metric_value
+                unit = _metric_unit(cells[metric_idx], alias)
+                thread.stat.metric_units.setdefault(alias, unit)
+
+        if event_idx is None:
+            continue
+        event = cells[event_idx]
+        value_idx = event_idx - 2
+        if value_idx <= thread_idx:
+            continue
+        value = _num(cells[value_idx])
+        if value is None:
+            continue
+        unit = cells[event_idx - 1] if event_idx - 1 > thread_idx else ""
+        if unit:
+            thread.stat.units.setdefault(event, unit)
+        if timestamp is None:
+            thread.stat.summary.setdefault(event, value)
+            continue
+        by_time = interval_values.setdefault(tid, {})
+        times = interval_order.setdefault(tid, [])
+        for known_time in times:
+            if abs(known_time - timestamp) <= 1e-9:
+                timestamp = known_time
+                break
+        else:
+            times.append(timestamp)
+        by_time.setdefault(timestamp, {}).setdefault(event, value)
+
+    for tid, times in interval_order.items():
+        by_time = interval_values[tid]
+        threads[tid].stat.intervals = [
+            (timestamp, dict(by_time[timestamp]))
+            for timestamp in times
+            if by_time[timestamp]
+        ]
+    return threads
+
+
+parse_per_thread_stat = parse_per_thread_stat_csv
+parse_thread_stat_csv = parse_per_thread_stat_csv
+parse_stat_csv_per_thread = parse_per_thread_stat_csv
+
+
 # ------------------------------------------------------------- perf script
 
 
@@ -265,4 +448,18 @@ def sanitize_symbol(sym: str) -> str:
     return sym.replace(";", "/")
 
 
-__all__ = ["ScriptSample", "StatData", "parse_perf_script", "parse_stat_csv", "sanitize_symbol"]
+__all__ = [
+    "ScriptSample",
+    "StatData",
+    "ThreadStat",
+    "ThreadStatData",
+    "ThreadStatMap",
+    "ThreadStats",
+    "parse_per_thread_stat",
+    "parse_per_thread_stat_csv",
+    "parse_perf_script",
+    "parse_stat_csv",
+    "parse_stat_csv_per_thread",
+    "parse_thread_stat_csv",
+    "sanitize_symbol",
+]

@@ -17,12 +17,12 @@ CPU analyses on amd64 machine (AMD and Intel), with zero Python dependencies:
 - **Effective CPU utilization** — average busy cores + utilization timeline
 - **Reports** — terminal summary + a single-file interactive `report.html`
   (metric overview, hotspots table, memory access summary, flame graph,
-  timelines, call tree, threads). The HTML thread selector also scopes the
-  IBS/PEBS Memory tab to the selected thread when profiling collected both
-  streams in one recording.
+  timelines, call tree, threads). The HTML thread selector scopes CPU views,
+  the Overview metrics, and the IBS/PEBS Memory tab to the selected thread.
 
-Artifacts (`stat.csv`, `perf.data`, `script.txt`, `meta.json`) are kept in the
-profile directory so reports can be regenerated any time with `vperf report`.
+Artifacts (`stat.csv` or `stat_threads.csv`, `perf.data`, `script.txt`,
+`meta.json`) are kept in the profile directory so reports can be regenerated
+any time with `vperf report`.
 
 ## Setup
 
@@ -129,24 +129,32 @@ Open `report.html` in any browser — fully offline, no CDN.
 
 1. **Capability probe** — tiny throwaway runs determine supported events,
    `-M` metrics and the best precise cycles event (`cycles:P` → fallbacks).
-2. **Counting pass** — `perf stat -x,` with all counters + metrics.
-3. **Sampling pass** — CPU cycles and AMD IBS or Intel PEBS are recorded in
-   one `perf record` invocation when both are enabled, so TIDs can be joined;
-   unsupported combinations fall back to a separate memory pass, and
-   `--no-record` keeps the memory-only pass separate.
-4. **Post-processing** — `perf script` and `perf mem report` dumps are parsed
-   in pure Python; memory events are kept out of CPU hotspots, stacks are
-   folded into self/inclusive times, metrics derived, and HTML/SVG rendered.
+2. **Counting/sampling pass** — when both are enabled, one synchronized
+   `perf stat --per-thread` + `perf record` session collects hardware counters
+   and CPU samples from the same target lifetime. CPU cycles and AMD IBS or
+   Intel PEBS remain in the same recording; the existing Memory data is
+   post-processed from that `perf.data` rather than collected again.
+3. **Fallback passes** — stat-only, record-only, and wait-only modes retain
+   their specialized paths. A separate memory pass is used only when a
+   co-joined memory recording is unavailable.
+4. **Post-processing** — `perf stat`, `perf script`, and `perf mem report`
+   dumps are parsed in pure Python; memory events are kept out of CPU
+   hotspots, stacks are folded into self/inclusive times, metrics derived, and
+   HTML/SVG rendered.
 
 Notes & caveats:
-- Counting and sampling are still separate passes, so the workload normally
-  runs more than once. CPU cycles and IBS/PEBS are co-recorded within the
-  sampling pass; `--no-record` intentionally disables that TID join.
-- The HTML thread selector scopes CPU views and the Memory tab. Overview
-  cards and the terminal memory section remain whole-run summaries. Profiles
-  collected before per-thread memory reports remain aggregate-only.
-- Multiplexing: counters share PMU registers; perf scales counts, but
-  ratios across different groups carry some noise.
+- The normal combined run uses one workload lifetime for per-thread counters,
+  CPU samples, and co-joined memory samples. The HTML thread selector scopes
+  CPU views, Overview cards, and the Memory tab; the terminal report remains
+  whole-run scoped.
+- `perf stat --per-thread` reports independent rows for threads present when
+  collection attaches. TIDs created later may be unavailable rather than
+  estimated, and legacy profiles without `stat_threads.csv` remain
+  aggregate-only for Overview.
+- The Memory section reuses the existing per-TID IBS/PEBS report; it is not
+  recollected when the Overview hardware counters are enabled.
+- Multiplexing: counters share PMU registers; perf scales counts, but ratios
+  across different groups carry some noise.
 - DWARF unwinding is done offline; `DEBUGINFOD_URLS` is stripped from perf's
   environment to prevent multi-second network hangs.
 - True Intel TMA level-1/2 requires Intel's `slots` PMU. On AMD the backend /

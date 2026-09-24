@@ -1,11 +1,13 @@
 """Unit tests for parsers and metric derivation using captured perf output."""
 
 from vperf.parsers import (
+    ScriptSample,
     parse_perf_script,
+    parse_per_thread_stat_csv,
     parse_stat_csv,
     sanitize_symbol,
 )
-from vperf.metrics import compute_metrics, all_hints
+from vperf.metrics import compute_metrics, compute_thread_metrics, all_hints
 from vperf.stacks import build_profile
 from vperf.flamegraph import render_flame_svg, build_tree
 
@@ -30,6 +32,32 @@ WHOLE_RUN = """# started on Mon Aug 24 02:00:00 2026
 890,,context-switches,3010000000,100.00,295.7,cs/sec  cs_per_second
 12,,cpu-migrations,3010000000,100.00,,
 900000,,page-faults,3010000000,100.00,299.0,faults/sec  page_faults_per_second
+"""
+
+THREAD_KNOWN = KNOWN | {"LLC-loads", "LLC-load-misses", "llc_miss_rate", "branch_miss_rate"}
+PER_THREAD = """# started on Mon Aug 24 02:00:00 2026
+worker-alpha-101,1,10.00,msec,task-clock,10000,100.00,,
+worker-alpha-101,1,200,,cycles,10000,100.00,,
+worker-alpha-101,1,400,,instructions,10000,100.00,,
+worker-alpha-101,1,50,,branches,10000,100.00,,
+worker-alpha-101,1,5,,branch-misses,10000,100.00,10.0,%  branch_miss_rate
+worker-alpha-101,1,100,,LLC-loads,10000,100.00,,
+worker-alpha-101,1,12,,LLC-load-misses,10000,100.00,,
+worker-alpha-101,1,<not counted>,,cycles,0,0.00,,
+worker-alpha-101,<not supported>,,LLC-loads,0,0.00,,
+worker-alpha-101,<not supported>,,LLC-load-misses,0,0.00,,
+worker-alpha-101,1,<not counted>,,branch-misses,0,0.00,<not counted>,%  branch_miss_rate
+worker-alpha-101,,,,,,,<not counted>,%  branch_miss_rate
+worker-alpha-101,,,,,,,12.0,%  llc_miss_rate
+worker-alpha-101,,,,,,,0.80,instructions  insn_per_cycle
+worker-beta-two-202,1,20.00,msec,task-clock,20000,100.00,,
+worker-beta-two-202,1,100,,cycles,20000,100.00,,
+worker-beta-two-202,1,50,,instructions,20000,100.00,,
+worker-beta-two-202,1,10,,branches,20000,100.00,,
+worker-beta-two-202,<not counted>,,branch-misses,0,0.00,,
+worker-beta-two-202,<not supported>,,LLC-loads,0,0.00,,
+worker-beta-two-202,<not supported>,,LLC-load-misses,0,0.00,,
+worker-beta-two-202,,,,,,,0.50,insn_per_cycle
 """
 
 INTERVALS = """# started on Mon Aug 24 02:00:00 2026
@@ -87,6 +115,59 @@ def test_parse_intervals_merged_by_timestamp():
 def test_not_counted_skipped():
     d = parse_stat_csv("<not counted>,msec,task-clock,0,100.00,,\n", KNOWN)
     assert "task-clock" not in d.summary
+
+
+def test_parse_per_thread_rows_and_duplicate_handling():
+    threads = parse_per_thread_stat_csv(PER_THREAD, THREAD_KNOWN)
+    assert set(threads) == {101, 202}
+    assert threads[101].comm == "worker-alpha"
+    assert threads[202].comm == "worker-beta-two"
+    assert threads[101].stat.summary["cycles"] == 200
+    assert threads[101].stat.summary["instructions"] == 400
+    assert threads[101].stat.metrics["insn_per_cycle"] == 0.80
+    assert threads[101].stat.metrics["branch_miss_rate"] == 10.0
+    assert threads[101].stat.metrics["llc_miss_rate"] == 12.0
+    assert threads[101].stat.metric_units["insn_per_cycle"] == "instructions"
+    assert "branch-misses" not in threads[202].stat.summary
+    assert "LLC-loads" not in threads[202].stat.summary
+
+
+def test_per_thread_duplicate_valid_counter_keeps_first_value():
+    text = (
+        "worker-7,0,100,,cycles,100,100.00,,\n"
+        "worker-7,0,200,,cycles,100,100.00,,\n"
+    )
+    threads = parse_per_thread_stat_csv(text, {"cycles"})
+    assert threads[7].stat.summary["cycles"] == 100
+
+
+def test_per_thread_interval_rows_are_grouped_by_tid():
+    text = """0.100,worker-one-7,1,1.0,msec,task-clock,100,100.00,,
+0.100,worker-one-7,1,10,,cycles,100,100.00,,
+0.200,worker-one-7,1,2.0,msec,task-clock,200,100.00,,
+0.200,worker-one-7,1,20,,cycles,200,100.00,,
+0.100,worker-two-8,1,3.0,msec,task-clock,100,100.00,,
+0.200,worker-two-8,1,4.0,msec,task-clock,200,100.00,,
+"""
+    threads = parse_per_thread_stat_csv(text, {"task-clock", "cycles"})
+    assert [tid for tid, _ in threads[7].stat.intervals] == [0.1, 0.2]
+    assert threads[7].stat.intervals[0][1]["cycles"] == 10
+    assert threads[8].stat.intervals[0][1]["task-clock"] == 3.0
+    assert threads[8].stat.intervals[1][1]["task-clock"] == 4.0
+
+
+def test_thread_metrics_prefer_raw_counters_for_ipc():
+    threads = parse_per_thread_stat_csv(PER_THREAD, THREAD_KNOWN)
+    thread = threads[101]
+    report = compute_thread_metrics(thread, elapsed=1.0)
+    aggregate_style = compute_metrics(thread.stat, elapsed=1.0, ncpus=1)
+    assert report.ipc == 2.0
+    assert report.cpi == 0.5
+    assert aggregate_style.ipc == 0.80
+    assert report.cpu_time == 0.01
+    assert report.effective_cpu_util == 0.01
+    assert report.branch_mispredict_pct == 10.0
+    assert report.llc_miss_pct == 12.0
 
 
 # ------------------------------------------------------------ perf script
@@ -157,6 +238,30 @@ def test_thread_comm_resolution():
     assert ti.comm == "python3"  # not perf-exec
     # folded roots renamed too
     assert any(k.startswith("python3 (10585);") for k in prof.folded)
+
+
+def test_folded_stacks_are_scoped_by_tid():
+    samples = [
+        ScriptSample("worker", 100, 101, 1.0, 10, "cycles:P", [("alpha", "app")]),
+        ScriptSample("worker", 100, 102, 1.1, 20, "cycles:P", [("beta", "app")]),
+    ]
+
+    prof = build_profile(samples)
+
+    assert prof.folded_by_tid[101] == {"alpha": 10}
+    assert prof.folded_by_tid[102] == {"beta": 20}
+
+
+def test_folded_stacks_sum_comm_changes_for_one_tid():
+    samples = [
+        ScriptSample("perf-exec", 100, 101, 1.0, 10, "cycles:P", [("alpha", "app")]),
+        ScriptSample("worker", 100, 101, 1.1, 20, "cycles:P", [("alpha", "app")]),
+    ]
+
+    prof = build_profile(samples)
+
+    assert prof.by_thread[101].comm == "worker"
+    assert prof.folded_by_tid[101] == {"alpha": 30}
 
 
 def test_flamegraph_svg():
