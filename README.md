@@ -38,13 +38,17 @@ echo 'kernel.perf_event_paranoid=1' | sudo tee /etc/sysctl.d/99-perf.conf
 ### Enable Wait / off-CPU analysis
 
 The Wait report uses scheduler tracepoints, not only PMU counters. On systems
-where tracefs is mounted root-only, `kernel.perf_event_paranoid=0` may not be
-enough. Enable tracepoint access for the user who runs `vperf`:
+where tracefs event files remain root-only, `kernel.perf_event_paranoid=0` and
+a tracefs remount may not be enough. Enable tracepoint access for the user who
+runs `vperf`:
+
+`CAP_DAC_READ_SEARCH` lets `perf` read root-owned tracefs event metadata when
+remounting the tracefs mount does not change the individual file permissions.
 
 ```bash
 sudo sysctl -w kernel.perf_event_paranoid=0
 sudo mount -o remount,mode=755 /sys/kernel/tracing/
-sudo setcap cap_perfmon,cap_sys_ptrace+ep "$(readlink -f "$(command -v perf)")"
+sudo setcap cap_perfmon,cap_sys_ptrace,cap_dac_read_search=ep "$(readlink -f "$(command -v perf)")"
 ```
 
 Verify access before running a profile:
