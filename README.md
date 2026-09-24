@@ -35,6 +35,32 @@ sudo sysctl kernel.perf_event_paranoid=1      # -1 also enables full kernel samp
 echo 'kernel.perf_event_paranoid=1' | sudo tee /etc/sysctl.d/99-perf.conf
 ```
 
+### Enable Wait / off-CPU analysis
+
+The Wait report uses scheduler tracepoints, not only PMU counters. On systems
+where tracefs is mounted root-only, `kernel.perf_event_paranoid=0` may not be
+enough. Enable tracepoint access for the user who runs `vperf`:
+
+```bash
+sudo sysctl -w kernel.perf_event_paranoid=0
+sudo mount -o remount,mode=755 /sys/kernel/tracing/
+sudo setcap cap_perfmon,cap_sys_ptrace+ep "$(readlink -f "$(command -v perf)")"
+```
+
+Verify access before running a profile:
+
+```bash
+perf stat -e sched:sched_switch -- true
+vperf doctor
+```
+
+The `sysctl` and tracefs changes are temporary. For a persistent Wait setting,
+use `kernel.perf_event_paranoid=0` in `/etc/sysctl.d/99-perf.conf` and reapply
+the tracefs mount after reboot.
+
+A profile collected before access was enabled has no `wait.txt`; rerun the
+profiling command to generate a new Wait report.
+
 ### Install with uv (recommended)
 
 ```bash
