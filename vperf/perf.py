@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import shutil
+import signal
 import subprocess
+import tempfile
 from dataclasses import dataclass
+from typing import TextIO
 
 
 class PerfError(RuntimeError):
@@ -14,13 +18,22 @@ class PerfError(RuntimeError):
 PERF = shutil.which("perf") or "/usr/bin/perf"
 
 
+def _perf_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+    env["LC_NUMERIC"] = "C"
+    env.pop("DEBUGINFOD_URLS", None)
+    return env
+
+
 def perf_available() -> bool:
     return shutil.which("perf") is not None
 
 
 def perf_version() -> str:
     r = subprocess.run(
-        [PERF, "--version"], capture_output=True, text=True, timeout=10
+        [PERF, "--version"], capture_output=True, text=True, timeout=10,
+        env=_perf_env(),
     )
     return (r.stdout or r.stderr).strip().splitlines()[-1] if r.returncode == 0 else "?"
 
@@ -36,22 +49,83 @@ class PerfResult:
         return self.returncode == 0
 
 
+@dataclass
+class PerfProcess:
+    process: subprocess.Popen
+    args: list[str]
+    _stdout: TextIO
+    _stderr: TextIO
+
+    def poll(self) -> int | None:
+        return self.process.poll()
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.process.wait(timeout=timeout)
+
+    def result(self, timeout: float | None = None) -> PerfResult:
+        returncode = self.wait(timeout=timeout)
+        self._stdout.seek(0)
+        self._stderr.seek(0)
+        return PerfResult(
+            returncode,
+            self._stdout.read() or "",
+            self._stderr.read() or "",
+        )
+
+    def stop(self, grace: float = 2.0) -> PerfResult:
+        interrupted = False
+        if self.poll() is None:
+            try:
+                self.process.send_signal(signal.SIGINT)
+                interrupted = True
+            except OSError:
+                pass
+            if self.poll() is None:
+                try:
+                    self.wait(timeout=grace)
+                except subprocess.TimeoutExpired:
+                    interrupted = False
+                    try:
+                        self.process.terminate()
+                    except OSError:
+                        pass
+                    if self.poll() is None:
+                        try:
+                            self.process.kill()
+                        except OSError:
+                            pass
+                        self.wait()
+        result = self.result()
+        if interrupted and result.returncode in (-signal.SIGINT, 128 + signal.SIGINT):
+            result.returncode = 0
+        return result
+
+
+def start_perf(args: list[str]) -> PerfProcess:
+    stdout = tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace")
+    stderr = tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace")
+    try:
+        process = subprocess.Popen(
+            [PERF, *args],
+            stdout=stdout,
+            stderr=stderr,
+            text=True,
+            env=_perf_env(),
+        )
+    except Exception:
+        stdout.close()
+        stderr.close()
+        raise
+    return PerfProcess(process, list(args), stdout, stderr)
+
+
 def run_perf(
     args: list[str],
     timeout: float | None = None,
     stdout_file: str | None = None,
 ) -> PerfResult:
     """Run `perf <args>` and capture output."""
-    import os
-
-    env = dict(os.environ)
-    env["LC_ALL"] = "C"          # force '.' decimal separators in CSV output
-    env["LC_NUMERIC"] = "C"
-    # prevent perf from blocking on debuginfod network fetches during
-    # unwinding/reporting (a common multi-second hang).
-    # NOTE: an *empty* string still triggers Ubuntu's compiled-in default URL,
-    # so the variable must be removed entirely.
-    env.pop("DEBUGINFOD_URLS", None)
+    env = _perf_env()
     cmd = [PERF, *args]
     fout = open(stdout_file, "w", encoding="utf-8") if stdout_file else subprocess.PIPE
     try:

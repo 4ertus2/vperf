@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .doctor import AMD_ONLY_EVENTS, GENERIC_EVENTS, branch_mispredict_penalty
-from .parsers import StatData
+from .parsers import StatData, ThreadStatData
 
 # Vendor-aware branch-misprediction recovery penalty in cycles.
 BAD_SPEC_PENALTY_CYCLES = branch_mispredict_penalty()
@@ -69,6 +69,7 @@ def compute_metrics(
     elapsed: float | None,
     ncpus: int,
     stat_interval_ms: int | None = None,
+    prefer_raw_ipc: bool = False,
 ) -> MetricsReport:
     """Derive VTune-style metrics.
 
@@ -101,7 +102,9 @@ def compute_metrics(
     cyc = s.get("cycles")
     ins = s.get("instructions")
     m.cycles, m.instructions = cyc, ins
-    if use_met and met.get("insn_per_cycle"):
+    if prefer_raw_ipc and cyc and ins is not None:
+        m.ipc = ins / cyc
+    elif use_met and met.get("insn_per_cycle"):
         m.ipc = met["insn_per_cycle"]
     elif cyc and ins:
         m.ipc = ins / cyc
@@ -114,6 +117,8 @@ def compute_metrics(
     m.branch_instructions, m.branch_misses = br, bmiss
     if br and bmiss is not None:
         m.branch_mispredict_pct = bmiss / br * 100.0
+    elif met.get("branch_miss_rate") is not None:
+        m.branch_mispredict_pct = met["branch_miss_rate"]
 
     # ---- memory hierarchy ---------------------------------------------------
     # LLC miss %, best source first:
@@ -155,6 +160,8 @@ def compute_metrics(
         m.l1d_miss_rate_pct = l1m / l1_loads * 100.0
     elif l1m is not None and ins:
         m.l1d_miss_rate_pct = l1m / ins * 100.0
+    elif met.get("l1d_miss_rate") is not None:
+        m.l1d_miss_rate_pct = met["l1d_miss_rate"]
     dtm = s.get("dTLB-load-misses")
     dt_loads = s.get("dTLB-loads")
     m.dtlb_misses = dtm
@@ -162,6 +169,8 @@ def compute_metrics(
         m.dtlb_miss_rate_pct = dtm / dt_loads * 100.0
     elif dtm is not None and ins:
         m.dtlb_miss_rate_pct = dtm / ins * 100.0
+    elif met.get("dtlb_miss_rate") is not None:
+        m.dtlb_miss_rate_pct = met["dtlb_miss_rate"]
 
     # ---- bound analysis -----------------------------------------------------
     # prefer perf's TMA-style metric when it is whole-run; otherwise fall back
@@ -238,6 +247,21 @@ def compute_metrics(
         m.timeline = pts
 
     return m
+
+
+def compute_thread_metrics(
+    thread: ThreadStatData | StatData,
+    elapsed: float | None = None,
+    ncpus: int = 1,
+    stat_interval_ms: int | None = None,
+) -> MetricsReport:
+    stat = thread.stat if isinstance(thread, ThreadStatData) else thread
+    return compute_metrics(
+        stat, elapsed, ncpus, stat_interval_ms, prefer_raw_ipc=True,
+    )
+
+
+compute_metrics_for_thread = compute_thread_metrics
 
 
 _BASE_EVENTS = GENERIC_EVENTS + AMD_ONLY_EVENTS

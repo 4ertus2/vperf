@@ -286,17 +286,31 @@ function setChartMode(mode){
 }
 
 function renderMemory(){
- var body=document.getElementById('memory-body');
- if(!body) return;
- var key=threadFilter===null?'all':String(threadFilter);
- if(Object.prototype.hasOwnProperty.call(MEMORY_HTML,key)){
-  body.innerHTML=MEMORY_HTML[key];
- }else if(threadFilter===null){
-  body.innerHTML=MEMORY_HTML.all||'';
- }else{
-  body.innerHTML='<div class="panel"><h3>Memory access</h3><em>No IBS / PEBS samples are available for the selected '
+  var body=document.getElementById('memory-body');
+  if(!body) return;
+  var key=threadFilter===null?'all':String(threadFilter);
+  if(Object.prototype.hasOwnProperty.call(MEMORY_HTML,key)){
+   body.innerHTML=MEMORY_HTML[key];
+  }else if(threadFilter===null){
+   body.innerHTML=MEMORY_HTML.all||'';
+  }else{
+   body.innerHTML='<div class="panel"><h3>Memory access</h3><em>No IBS / PEBS samples are available for the selected '
    +'thread in this profile.</em></div>';
- }
+  }
+}
+
+function renderOverview(){
+  var body=document.getElementById('overview-body');
+  if(!body) return;
+  var key=threadFilter===null?'all':String(threadFilter);
+  if(Object.prototype.hasOwnProperty.call(OVERVIEW_HTML,key)){
+   body.innerHTML=OVERVIEW_HTML[key];
+  }else if(threadFilter===null){
+   body.innerHTML=OVERVIEW_HTML.all||'';
+  }else{
+   body.innerHTML='<div class="panel"><h3>Overview</h3><em>Per-thread hardware counters are unavailable '
+   +'for the selected thread in this profile.</em></div>';
+  }
 }
 
 function setThread(tid){
@@ -306,6 +320,7 @@ function setThread(tid){
   renderHotspots();
   renderChart();
   renderMemory();
+  renderOverview();
   var flameId=tid!==null?String(tid):'all';
   document.querySelectorAll('#flamewrap .flame').forEach(d=>{
    d.style.display=(d.dataset.thread===flameId)?'block':'none';});
@@ -363,6 +378,7 @@ function init(){
   renderHotspots();
   renderChart();
   renderMemory();
+  renderOverview();
 }
 """
 
@@ -415,6 +431,74 @@ def _cards(m: MetricsReport, ncpu: int, prof: StackProfile | None) -> str:
         for k, v, u in cards
     )
     return f'<div class="cards">{cells}</div>'
+
+
+def _overview_content(m: MetricsReport, ncpu: int, scope: str = "all threads",
+                      prof: StackProfile | None = None) -> str:
+    hints_html = "".join(f'<div class="hint">{esc(h)}</div>' for h in all_hints(m)) or \
+                 '<div class="hint">No anomalies flagged.</div>'
+    return f'''<div style="color:var(--dim);font-size:12px;margin-bottom:12px">Scope: {esc(scope)}</div>
+{_cards(m, ncpu, prof)}
+<div class="panel"><h3>Pipeline budget (TMA-like quadrants)</h3>
+{_quad_bar(m)}
+<table><tbody>
+<tr><td>Retiring (remainder)</td><td data-v="{m.retiring_pct or 0}">{_fmt(m.retiring_pct)}%</td>
+<td class="mono" style="color:var(--dim)">budget not lost to stalls/wrong-path</td></tr>
+<tr><td>Backend bound</td><td data-v="{m.backend_bound_pct or 0}">{_fmt(m.backend_bound_pct)}%</td>
+<td class="mono" style="color:var(--dim)">dispatch slots lost to memory/core stalls</td></tr>
+<tr><td>Frontend bound</td><td data-v="{m.frontend_bound_pct or 0}">{_fmt(m.frontend_bound_pct)}%</td>
+<td class="mono" style="color:var(--dim)">slots lost to fetch/decode stalls</td></tr>
+<tr><td>Bad speculation</td><td data-v="{m.bad_speculation_pct or 0}">{_fmt(m.bad_speculation_pct)}%</td>
+<td class="mono" style="color:var(--dim)">est. wrong-path share (mispredict penalty model)</td></tr>
+<tr><td>IPC / CPI</td><td>{_fmt(m.ipc)} / {_fmt(m.cpi)}</td>
+<td class="mono" style="color:var(--dim)">instructions per cycle</td></tr>
+<tr><td>Branch mispredict rate</td><td>{_fmt(m.branch_mispredict_pct)}%</td>
+<td class="mono" style="color:var(--dim)">of all branch instructions</td></tr>
+<tr><td>LLC miss rate</td><td>{_fmt(m.llc_miss_pct)}%</td>
+<td class="mono" style="color:var(--dim)">DRAM fills / L3 lookups</td></tr>
+<tr><td>LLC misses (DRAM fills)</td><td>{_fmt_count(m.llc_misses)}</td>
+<td class="mono" style="color:var(--dim)">L3 hits {_fmt_count(m.llc_hits)}</td></tr>
+<tr><td>L1 misses (DC fills)</td><td>{_fmt_count(m.l1_misses)}</td>
+<td class="mono" style="color:var(--dim)">L2 misses {_fmt_count(m.l2_misses)}</td></tr>
+<tr><td>L1D miss rate</td><td>{_fmt(m.l1d_miss_rate_pct)}%</td>
+<td class="mono" style="color:var(--dim)">per instruction</td></tr>
+<tr><td>dTLB miss rate</td><td>{_fmt(m.dtlb_miss_rate_pct)}%</td>
+<td class="mono" style="color:var(--dim)">per instruction</td></tr>
+<tr><td>Context switches/s</td><td>{_fmt(m.cs_per_sec)}</td>
+<td class="mono" style="color:var(--dim)">CPU migrations/s {_fmt(m.migrations_per_sec)}</td></tr>
+<tr><td>Page faults/s</td><td>{_fmt(m.page_faults_per_sec)}</td>
+<td class="mono" style="color:var(--dim)">soft+hard</td></tr>
+<tr><td>FP ops retired</td><td data-v="{m.fp_ops_total or 0}">{_fmt_count(m.fp_ops_total)}</td>
+<td class="mono" style="color:var(--dim)">{_fmt_count(m.fp_ops_per_sec)}/s</td></tr>
+<tr><td>Vectorization ratio</td><td data-v="{m.vectorization_pct or 0}">{_fmt(m.vectorization_pct)}%</td>
+<td class="mono" style="color:var(--dim)">scalar {_fmt(m.fp_scalar_pct, "%")} ·
+ 128b {_fmt(m.fp_128_pct, "%")} · 256b {_fmt(m.fp_256_pct, "%")} · 512b {_fmt(m.fp_512_pct, "%")}</td></tr>
+</tbody></table></div>
+<div class="panel"><h3>Observations</h3>{hints_html}</div>'''
+
+
+def _overview_html_map(m: MetricsReport, ncpu: int, prof: StackProfile,
+                       thread_metrics: dict | None = None) -> dict[str, str]:
+    result = {"all": _overview_content(m, ncpu, "all threads", prof)}
+    for key, payload in (thread_metrics or {}).items():
+        if key == "all" or not isinstance(payload, dict):
+            continue
+        try:
+            tid = int(payload.get("tid", key))
+            thread_report = MetricsReport(**payload.get("metrics", {}))
+        except (TypeError, ValueError):
+            continue
+        thread_report.ncpus = 1
+        if thread_report.cpu_time is not None and thread_report.elapsed:
+            thread_report.effective_cpu_util = min(
+                thread_report.cpu_time / thread_report.elapsed, 1.0,
+            )
+        cpu_thread = prof.by_thread.get(tid)
+        comm = payload.get("comm") or (cpu_thread.comm if cpu_thread else "thread")
+        result[str(tid)] = _overview_content(
+            thread_report, 1, f"{comm} (tid {tid})", prof,
+        )
+    return result
 
 
 def _hotspots_table(prof: StackProfile) -> str:
@@ -606,7 +690,8 @@ def _wait_tab(wp: WaitProfile | None) -> str:
 </div>'''
 
 
-def _thread_options(prof: StackProfile, mem: MemoryProfile | None = None) -> str:
+def _thread_options(prof: StackProfile, mem: MemoryProfile | None = None,
+                    thread_metrics: dict | None = None) -> str:
     opts = ['<option value="">All threads</option>']
     seen: set[int] = set()
     for t in top_threads(prof, 20):
@@ -622,6 +707,16 @@ def _thread_options(prof: StackProfile, mem: MemoryProfile | None = None) -> str
             label = f"{esc(profile.comm or 'thread')} (tid {profile.tid}, memory)"
             opts.append(f'<option value="{profile.tid}">{label}</option>')
             seen.add(profile.tid)
+    for key, payload in sorted((thread_metrics or {}).items(), key=lambda item: str(item[0])):
+        try:
+            tid = int(payload.get("tid", key)) if isinstance(payload, dict) else int(key)
+        except (TypeError, ValueError):
+            continue
+        if tid in seen:
+            continue
+        comm = (payload.get("comm") or "thread") if isinstance(payload, dict) else "thread"
+        opts.append(f'<option value="{tid}">{esc(comm)} (tid {tid}, counters)</option>')
+        seen.add(tid)
     return "".join(opts)
 
 
@@ -633,19 +728,44 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
     memory_meta = meta.get("memory", {})
     memory_backend = memory_meta.get("backend") or "ibs"
     memory_cojoined = bool(memory_meta.get("cojoined", False))
+    thread_metrics = meta.get("_thread_metrics") or {}
 
     # ---- flame graphs -------------------------------------------------------
     flame_divs = []
     svg_all, _ = render_flame_svg(prof.folded, title=f"All threads — {prof.samples:,} samples")
     flame_divs.append(f'<div class="flame" data-thread="all">{svg_all}</div>')
-    for t in top_threads(prof, 8):
-        pid_tag = f"({t.pid})"
-        sub = {k.split(";", 1)[1]: v for k, v in prof.folded.items() if pid_tag in k.split(";")[0]}
-        if not sub:
+    cpu_thread_ids: set[int] = set()
+    flame_thread_ids: set[int] = set()
+    for t in top_threads(prof, 20):
+        cpu_thread_ids.add(t.tid)
+        flame_thread_ids.add(t.tid)
+        sub = prof.folded_by_tid.get(t.tid, {})
+        if sub:
+            svg, _ = render_flame_svg(sub, title=f"{t.comm} (tid {t.tid})")
+        else:
+            svg = '<em>No CPU samples for this thread.</em>'
+        flame_divs.append(
+            f'<div class="flame" data-thread="{t.tid}" style="display:none">{svg}</div>')
+    if mem is not None and memory_cojoined:
+        memory_threads = sorted(mem.by_tid.values(), key=lambda p: p.total_samples, reverse=True)
+        for profile in memory_threads:
+            if profile.tid is None or profile.tid in cpu_thread_ids:
+                continue
+            flame_thread_ids.add(profile.tid)
+            flame_divs.append(
+                f'<div class="flame" data-thread="{profile.tid}" style="display:none">'
+                '<em>No CPU samples for this thread.</em></div>')
+    for key, payload in (thread_metrics or {}).items():
+        try:
+            tid = int(payload.get("tid", key)) if isinstance(payload, dict) else int(key)
+        except (TypeError, ValueError):
             continue
-        key = f"{t.tid}"
-        svg, _ = render_flame_svg(sub, title=f"{t.comm} (tid {t.tid})")
-        flame_divs.append(f'<div class="flame" data-thread="{key}" style="display:none">{svg}</div>')
+        if tid in flame_thread_ids:
+            continue
+        flame_thread_ids.add(tid)
+        flame_divs.append(
+            f'<div class="flame" data-thread="{tid}" style="display:none">'
+            '<em>No CPU samples for this thread.</em></div>')
 
     # ---- time range ---------------------------------------------------------
     t0, t1 = prof.time_range if prof.time_range else (0.0, 1.0)
@@ -653,19 +773,19 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 
     # ---- embed sample data as JSON ------------------------------------------
     samples_json = json.dumps([[s.tid, s.time, s.period, s.comm,
-                                [f[0] for f in s.frames]] for s in samples])
-    freq_json = json.dumps(freq_timeline or [])
+                                [f[0] for f in s.frames]] for s in samples]).replace("</", "<\\/")
+    freq_json = json.dumps(freq_timeline or []).replace("</", "<\\/")
     memory_json = json.dumps(_memory_html_map(
         mem, memory_backend, prof, memory_cojoined)).replace("</", "<\\/")
+    overview_json = json.dumps(_overview_html_map(
+        m, ncpu, prof, thread_metrics)).replace("</", "<\\/")
 
     # ---- thread list for selector -------------------------------------------
-    thread_opts = _thread_options(prof, mem if memory_cojoined else None)
+    thread_opts = _thread_options(
+        prof, mem if memory_cojoined else None, thread_metrics)
 
     # ---- initial hotspots table (server-rendered, replaced by JS) -----------
     initial_hotspots = _hotspots_table(prof)
-
-    hints_html = "".join(f'<div class="hint">{esc(h)}</div>' for h in all_hints(m)) or \
-                 '<div class="hint">No anomalies flagged.</div>'
 
     meta_line = (
         f"{esc(meta.get('mode', ''))}: {esc(' '.join(meta['target'].get('cmd') or []) or ('PID ' + str(meta['target'].get('pid'))))}"
@@ -711,43 +831,7 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 </div>
 
 <div id="overview" class="page active">
-{_cards(m, ncpu, prof)}
-<div class="panel"><h3>Pipeline budget (TMA-like quadrants)</h3>
-{_quad_bar(m)}
-<table><tbody>
-<tr><td>Retiring (remainder)</td><td data-v="{m.retiring_pct or 0}">{_fmt(m.retiring_pct)}%</td>
-<td class="mono" style="color:var(--dim)">budget not lost to stalls/wrong-path</td></tr>
-<tr><td>Backend bound</td><td data-v="{m.backend_bound_pct or 0}">{_fmt(m.backend_bound_pct)}%</td>
-<td class="mono" style="color:var(--dim)">dispatch slots lost to memory/core stalls</td></tr>
-<tr><td>Frontend bound</td><td data-v="{m.frontend_bound_pct or 0}">{_fmt(m.frontend_bound_pct)}%</td>
-<td class="mono" style="color:var(--dim)">slots lost to fetch/decode stalls</td></tr>
-<tr><td>Bad speculation</td><td data-v="{m.bad_speculation_pct or 0}">{_fmt(m.bad_speculation_pct)}%</td>
-<td class="mono" style="color:var(--dim)">est. wrong-path share (mispredict penalty model)</td></tr>
-<tr><td>IPC / CPI</td><td>{_fmt(m.ipc)} / {_fmt(m.cpi)}</td>
-<td class="mono" style="color:var(--dim)">instructions per cycle</td></tr>
-<tr><td>Branch mispredict rate</td><td>{_fmt(m.branch_mispredict_pct)}%</td>
-<td class="mono" style="color:var(--dim)">of all branch instructions</td></tr>
-<tr><td>LLC miss rate</td><td>{_fmt(m.llc_miss_pct)}%</td>
-<td class="mono" style="color:var(--dim)">DRAM fills / L3 lookups</td></tr>
-<tr><td>LLC misses (DRAM fills)</td><td>{_fmt_count(m.llc_misses)}</td>
-<td class="mono" style="color:var(--dim)">L3 hits {_fmt_count(m.llc_hits)}</td></tr>
-<tr><td>L1 misses (DC fills)</td><td>{_fmt_count(m.l1_misses)}</td>
-<td class="mono" style="color:var(--dim)">L2 misses {_fmt_count(m.l2_misses)}</td></tr>
-<tr><td>L1D miss rate</td><td>{_fmt(m.l1d_miss_rate_pct)}%</td>
-<td class="mono" style="color:var(--dim)">per instruction</td></tr>
-<tr><td>dTLB miss rate</td><td>{_fmt(m.dtlb_miss_rate_pct)}%</td>
-<td class="mono" style="color:var(--dim)">per instruction</td></tr>
-<tr><td>Context switches/s</td><td>{_fmt(m.cs_per_sec)}</td>
-<td class="mono" style="color:var(--dim)">CPU migrations/s {_fmt(m.migrations_per_sec)}</td></tr>
-<tr><td>Page faults/s</td><td>{_fmt(m.page_faults_per_sec)}</td>
-<td class="mono" style="color:var(--dim)">soft+hard</td></tr>
-<tr><td>FP ops retired</td><td data-v="{m.fp_ops_total or 0}">{_fmt_count(m.fp_ops_total)}</td>
-<td class="mono" style="color:var(--dim)">{_fmt_count(m.fp_ops_per_sec)}/s</td></tr>
-<tr><td>Vectorization ratio</td><td data-v="{m.vectorization_pct or 0}">{_fmt(m.vectorization_pct)}%</td>
-<td class="mono" style="color:var(--dim)">scalar {_fmt(m.fp_scalar_pct, "%")} ·
-128b {_fmt(m.fp_128_pct, "%")} · 256b {_fmt(m.fp_256_pct, "%")} · 512b {_fmt(m.fp_512_pct, "%")}</td></tr>
-</tbody></table></div>
-<div class="panel"><h3>Observations</h3>{hints_html}</div>
+<div id="overview-body">{_overview_content(m, ncpu, "all threads", prof)}</div>
 </div>
 
 <div id="hotspots" class="page">
@@ -773,7 +857,7 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 
 <footer>Generated by vperf — artifacts: {esc(meta.get('_outdir', ''))}</footer>
 <script>
-SAMPLES={samples_json};FREQ={freq_json};MEMORY_HTML={memory_json};
+SAMPLES={samples_json};FREQ={freq_json};MEMORY_HTML={memory_json};OVERVIEW_HTML={overview_json};
 T0={t0};TSPAN={tspan};NCPU={ncpu};TOTAL_CYCLES={prof.total_cycles};CPU_TIME={m.cpu_time or 0};
 </script>
 <script>{_JS}</script>

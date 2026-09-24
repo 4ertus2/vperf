@@ -41,6 +41,7 @@ class StackProfile:
     by_thread: dict[int, ThreadInfo] = field(default_factory=dict)
     by_dso: dict[str, int] = field(default_factory=dict)          # self cycles
     folded: dict[str, int] = field(default_factory=dict)          # "root;a;b;c" -> cycles
+    folded_by_tid: dict[int, dict[str, int]] = field(default_factory=dict)
     call_tree: TreeNode | None = None
     time_range: tuple[float, float] | None = None                  # first/last sample ts
 
@@ -97,6 +98,10 @@ def build_profile(samples: list[ScriptSample]) -> StackProfile:
 
         if not callers:
             callers = ["[unknown]"]
+
+        thread_folded = prof.folded_by_tid.setdefault(s.tid, {})
+        thread_key = ";".join(callers)
+        thread_folded[thread_key] = thread_folded.get(thread_key, 0) + w
 
         leaf = callers[-1]
         self_by_func[leaf] += w
