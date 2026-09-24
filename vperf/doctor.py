@@ -215,7 +215,7 @@ def run_doctor() -> DoctorReport:
                 "Intel PEBS mem-loads/stores available (--ldlat 30)")
     else:
         rep.add("memory analysis", "WARN",
-                "neither AMD IBS nor Intel PEBS memory sampling available; --no-memory implied")
+                "neither AMD IBS nor Intel PEBS memory sampling available")
 
     if probe_wait():
         rep.add("wait analysis (sched tracepoints)", "OK",

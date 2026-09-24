@@ -73,8 +73,6 @@ vperf run <vperf-args> -- ./yourapp <yourapp-args>
 vperf run -- ./yourapp                            # profile with defaults
 vperf run -o baseline -- ./yourapp input.bin      # save to a named directory
 vperf run -f 999 -- ./yourapp input.bin           # higher sampling frequency
-vperf run --no-record -- ./yourapp input.bin      # counters only (faster, no call stacks)
-vperf run --no-memory --no-wait -- ./yourapp      # skip optional passes
 vperf run --callgraph fp -- ./yourapp             # frame-pointer unwinding (no debug info needed)
 
 # compare two runs
@@ -134,9 +132,8 @@ Open `report.html` in any browser — fully offline, no CDN.
    and CPU samples from the same target lifetime. CPU cycles and AMD IBS or
    Intel PEBS remain in the same recording; the existing Memory data is
    post-processed from that `perf.data` rather than collected again.
-3. **Fallback passes** — stat-only, record-only, and wait-only modes retain
-   their specialized paths. A separate memory pass is used only when a
-   co-joined memory recording is unavailable.
+3. **Fallbacks** — the normal CLI keeps CPU sampling when co-joined memory
+   sampling is unavailable; memory analysis is then omitted.
 4. **Post-processing** — `perf stat`, `perf script`, and `perf mem report`
    dumps are parsed in pure Python; memory events are kept out of CPU
    hotspots, stacks are folded into self/inclusive times, metrics derived, and

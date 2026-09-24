@@ -142,9 +142,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         freq=args.freq,
         interval_ms=args.interval,
         use_stat=not args.no_stat,
-        use_record=not args.no_record,
+        use_record=True,
         callgraph_mode=args.callgraph,
-        use_memory=not args.no_memory,
+        use_memory=True,
         use_wait=not args.no_wait,
     )
     _finish(outdir, pd.meta, pd.warnings, pd.stat, pd.elapsed, pd.script_path,
@@ -177,9 +177,9 @@ def cmd_attach(args: argparse.Namespace) -> int:
         interval_ms=args.interval,
         duration=args.duration,
         use_stat=not args.no_stat,
-        use_record=not args.no_record,
+        use_record=True,
         callgraph_mode=args.callgraph,
-        use_memory=not args.no_memory,
+        use_memory=True,
         use_wait=not args.no_wait,
     )
     _finish(outdir, pd.meta, pd.warnings, pd.stat, pd.elapsed or args.duration,
@@ -329,11 +329,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="stat interval in ms for a task-clock timeline "
                              "(default off: timeline is derived from samples)")
         sp.add_argument("--no-stat", action="store_true", help="skip the counting pass")
-        sp.add_argument("--no-record", action="store_true", help="skip the sampling pass")
         sp.add_argument("--callgraph", choices=["dwarf", "fp", "none"], default="dwarf",
                         help="call graph unwinding method")
-        sp.add_argument("--no-memory", action="store_true",
-                        help="skip the memory-access pass (AMD IBS or Intel PEBS)")
         sp.add_argument("--no-wait", action="store_true",
                         help="skip the wait/off-CPU pass (scheduler tracepoints)")
 

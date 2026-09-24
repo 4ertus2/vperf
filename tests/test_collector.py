@@ -2,8 +2,10 @@ import json
 import signal
 from pathlib import Path
 
+import pytest
+
 from vperf import collector
-from vperf.cli import _analyze, _thread_metrics_payload
+from vperf.cli import _analyze, _thread_metrics_payload, build_parser
 from vperf.perf import PerfResult
 from vperf.parsers import StatData
 
@@ -311,3 +313,15 @@ def test_attach_duration_signals_only_stop_and_continue(monkeypatch, tmp_path):
     assert signal.SIGTERM not in [sig for _pid, sig in signals]
     assert signal.SIGKILL not in [sig for _pid, sig in signals]
     assert profile.meta["mode"] == "attach"
+
+
+def test_profile_commands_do_not_expose_record_or_memory_toggles():
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["run", "--no-record", "--", "true"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["run", "--no-memory", "--", "true"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["attach", "-p", "123", "--no-record"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["attach", "-p", "123", "--no-memory"])
