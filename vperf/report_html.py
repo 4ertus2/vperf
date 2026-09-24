@@ -704,10 +704,10 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 <div class="tab active" onclick="showTab(this,'overview')">Overview</div>
 <div class="tab" onclick="showTab(this,'hotspots')">Hotspots</div>
 <div class="tab" onclick="showTab(this,'mem')">Memory</div>
-<div class="tab" onclick="showTab(this,'wait')">Wait</div>
 <div class="tab" onclick="showTab(this,'flame')">Flame Graph</div>
 <div class="tab" onclick="showTab(this,'tree')">Call Tree</div>
 <div class="tab" onclick="showTab(this,'threads')">Threads</div>
+<div class="tab" onclick="showTab(this,'wait')">Wait</div>
 </div>
 
 <div id="overview" class="page active">
