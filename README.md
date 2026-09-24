@@ -167,8 +167,9 @@ Open `report.html` in any browser — fully offline, no CDN.
    sampling is unavailable; memory analysis is then omitted.
 4. **Post-processing** — `perf stat`, `perf script`, and `perf mem report`
    dumps are parsed in pure Python; memory events are kept out of CPU
-   hotspots, stacks are folded into self/inclusive times, metrics derived, and
-   HTML/SVG rendered.
+   hotspots, full stacks are folded for hotspot analysis, and a user-only
+   stack view is built for the Flame Graph and Call Tree. Metrics are derived
+   and HTML/SVG rendered.
 
 Notes & caveats:
 - The normal combined run uses one workload lifetime for per-thread counters,
@@ -181,6 +182,10 @@ Notes & caveats:
   aggregate-only for Overview.
 - The Memory section reuses the existing per-TID IBS/PEBS report; it is not
   recollected when the Overview hardware counters are enabled.
+- The Flame Graph and Call Tree show user-space frames only. Kernel frames are
+  replaced by a synthetic `[kernel boundary]` leaf while preserving their
+  original sample weight; unclassifiable frames are omitted. Hotspots and
+  metrics retain the full sample data.
 - Multiplexing: counters share PMU registers; perf scales counts, but ratios
   across different groups carry some noise.
 - Frame-pointer unwinding is the default and does not require DWARF debug info,

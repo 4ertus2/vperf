@@ -730,19 +730,24 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
     thread_metrics = meta.get("_thread_metrics") or {}
 
     # ---- flame graphs -------------------------------------------------------
+    user = prof.user_stacks
     flame_divs = []
-    svg_all, _ = render_flame_svg(prof.folded, title=f"All threads — {prof.samples:,} samples")
+    if user.folded:
+        svg_all, _ = render_flame_svg(
+            user.folded, title=f"All threads (user space) — {user.samples:,} samples")
+    else:
+        svg_all = '<em>No classifiable user-space samples.</em>'
     flame_divs.append(f'<div class="flame" data-thread="all">{svg_all}</div>')
     cpu_thread_ids: set[int] = set()
     flame_thread_ids: set[int] = set()
     for t in top_threads(prof, 20):
         cpu_thread_ids.add(t.tid)
         flame_thread_ids.add(t.tid)
-        sub = prof.folded_by_tid.get(t.tid, {})
+        sub = user.folded_by_tid.get(t.tid, {})
         if sub:
-            svg, _ = render_flame_svg(sub, title=f"{t.comm} (tid {t.tid})")
+            svg, _ = render_flame_svg(sub, title=f"{t.comm} (tid {t.tid}) — user space")
         else:
-            svg = '<em>No CPU samples for this thread.</em>'
+            svg = '<em>No classifiable user-space samples for this thread.</em>'
         flame_divs.append(
             f'<div class="flame" data-thread="{t.tid}" style="display:none">{svg}</div>')
     if mem is not None and memory_cojoined:
@@ -753,7 +758,7 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
             flame_thread_ids.add(profile.tid)
             flame_divs.append(
                 f'<div class="flame" data-thread="{profile.tid}" style="display:none">'
-                '<em>No CPU samples for this thread.</em></div>')
+                '<em>No classifiable user-space samples for this thread.</em></div>')
     for key, payload in (thread_metrics or {}).items():
         try:
             tid = int(payload.get("tid", key)) if isinstance(payload, dict) else int(key)
@@ -764,7 +769,7 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
         flame_thread_ids.add(tid)
         flame_divs.append(
             f'<div class="flame" data-thread="{tid}" style="display:none">'
-            '<em>No CPU samples for this thread.</em></div>')
+            '<em>No classifiable user-space samples for this thread.</em></div>')
 
     # ---- time range ---------------------------------------------------------
     t0, t1 = prof.time_range if prof.time_range else (0.0, 1.0)
@@ -846,8 +851,8 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 </div>
 
 <div id="tree" class="page">
-<div class="panel"><h3>Call tree (inclusive time)</h3>
-{_tree_html(prof.call_tree, prof.total_cycles) if prof.call_tree else '<em>n/a</em>'}</div>
+<div class="panel"><h3>Call tree (inclusive time, user space)</h3>
+{_tree_html(user.call_tree, user.total_cycles) if user.call_tree else '<em>No classifiable user-space samples.</em>'}</div>
 </div>
 
 <div id="threads" class="page">

@@ -34,6 +34,15 @@ class TreeNode:
 
 
 @dataclass
+class UserStackView:
+    total_cycles: int = 0
+    samples: int = 0
+    folded: dict[str, int] = field(default_factory=dict)
+    folded_by_tid: dict[int, dict[str, int]] = field(default_factory=dict)
+    call_tree: TreeNode | None = None
+
+
+@dataclass
 class StackProfile:
     total_cycles: int = 0
     samples: int = 0
@@ -44,13 +53,81 @@ class StackProfile:
     folded_by_tid: dict[int, dict[str, int]] = field(default_factory=dict)
     call_tree: TreeNode | None = None
     time_range: tuple[float, float] | None = None                  # first/last sample ts
+    user_stacks: UserStackView = field(default_factory=UserStackView)
 
 
 _TRANSIENT_COMM = {"perf-exec", "perf", "?", "", "[unknown]"}
+_KERNEL_BOUNDARY = "[kernel boundary]"
 
 
 def _is_transient(comm: str) -> bool:
     return comm in _TRANSIENT_COMM or comm.startswith("perf-")
+
+
+def _frame_domain(sym: str, dso: str) -> str:
+    normalized = dso.lower()
+    if (
+        sym == "[kernel]"
+        or normalized.startswith("[kernel")
+        or normalized in {"kernel", "vmlinux", "bpf", "[bpf]"}
+        or normalized.endswith(".ko")
+        or "/lib/modules/" in normalized
+        or normalized.startswith("/sys/kernel/")
+    ):
+        return "kernel"
+    if normalized in {"inlined", "(inlined)"}:
+        return "inline"
+    if not dso or normalized in {"[unknown]", "[unresolved]"}:
+        return "unknown"
+    return "user"
+
+
+def _user_stack_frames(frames: list[tuple[str, str]]) -> tuple[list[str], bool]:
+    user_frames: list[str] = []
+    pending_inline: list[str] = []
+    has_kernel = False
+    last_domain = "unknown"
+
+    for sym, dso in frames:
+        domain = _frame_domain(sym, dso)
+        if domain == "inline":
+            pending_inline.append(sym)
+            continue
+        if domain == "kernel":
+            has_kernel = True
+            pending_inline.clear()
+        elif domain == "user":
+            user_frames.extend(pending_inline)
+            pending_inline.clear()
+            user_frames.append(sym)
+        else:
+            pending_inline.clear()
+        last_domain = domain
+
+    if pending_inline and last_domain == "user":
+        user_frames.extend(pending_inline)
+    return user_frames, has_kernel
+
+
+def _rename_folded_roots(
+    folded: dict[str, int], chains: dict[tuple[str, ...], int], renames: dict[str, str],
+) -> tuple[dict[str, int], dict[tuple[str, ...], int]]:
+    if not renames:
+        return folded, chains
+
+    def fix(key: str) -> str:
+        head, *tail = key.split(";")
+        return ";".join([renames.get(head, head), *tail])
+
+    new_folded: dict[str, int] = {}
+    for key, value in folded.items():
+        renamed = fix(key)
+        new_folded[renamed] = new_folded.get(renamed, 0) + value
+    new_chains: dict[tuple[str, ...], int] = {}
+    for chain, value in chains.items():
+        renamed = tuple(fix(";".join(chain)).split(";"))
+        new_chains[renamed] = new_chains.get(renamed, 0) + value
+    return new_folded, new_chains
 
 
 def _build_call_tree(chains: dict[tuple[str, ...], int]) -> TreeNode:
@@ -71,6 +148,8 @@ def build_profile(samples: list[ScriptSample]) -> StackProfile:
     dso_by_func: dict[str, str] = {}
     incl_by_func: dict[str, int] = defaultdict(int)
     chains: dict[tuple[str, ...], int] = defaultdict(int)
+    user = prof.user_stacks
+    user_chains: dict[tuple[str, ...], int] = defaultdict(int)
 
     tmin: float | None = None
     tmax: float | None = None
@@ -120,6 +199,20 @@ def build_profile(samples: list[ScriptSample]) -> StackProfile:
         chains[chain] += w
         prof.folded[";".join(chain)] = prof.folded.get(";".join(chain), 0) + w
 
+        user_frames, has_kernel = _user_stack_frames(s.frames)
+        if user_frames or has_kernel:
+            user_callers = [sanitize_symbol(sym) for sym in reversed(user_frames)]
+            if has_kernel or not user_callers:
+                user_callers.append(_KERNEL_BOUNDARY)
+            user.total_cycles += w
+            user.samples += 1
+            user_thread_folded = user.folded_by_tid.setdefault(s.tid, {})
+            user_thread_key = ";".join(user_callers)
+            user_thread_folded[user_thread_key] = user_thread_folded.get(user_thread_key, 0) + w
+            user_chain = (key_root, *user_callers)
+            user_chains[user_chain] += w
+            user.folded[";".join(user_chain)] = user.folded.get(";".join(user_chain), 0) + w
+
     total = max(prof.total_cycles, 1)
 
     # normalize transient comm labels (perf-exec) across folded keys/threads
@@ -134,19 +227,8 @@ def build_profile(samples: list[ScriptSample]) -> StackProfile:
             renames[f"{ti.comm} ({ti.pid})"] = f"{real} ({ti.pid})"
             ti.comm = real
     if renames:
-        def fix(key: str) -> str:
-            head, *tailr = key.split(";")
-            return ";".join([renames.get(head, head), *tailr])
-        new_folded: dict[str, int] = {}
-        for k, v in prof.folded.items():
-            nk = fix(k)
-            new_folded[nk] = new_folded.get(nk, 0) + v
-        prof.folded = new_folded
-        new_chains: dict[tuple, int] = {}
-        for k, v in chains.items():
-            nk = fix(k)
-            new_chains[nk] = new_chains.get(nk, 0) + v
-        chains = new_chains
+        prof.folded, chains = _rename_folded_roots(prof.folded, chains, renames)
+        user.folded, user_chains = _rename_folded_roots(user.folded, user_chains, renames)
 
     rows: dict[str, Hotspot] = {}
     for fname, sc in self_by_func.items():
@@ -160,6 +242,7 @@ def build_profile(samples: list[ScriptSample]) -> StackProfile:
         r.self_pct = r.self_cycles / total * 100.0
     prof.hotspots = sorted(rows.values(), key=lambda h: h.self_cycles, reverse=True)
     prof.call_tree = _build_call_tree(chains)
+    user.call_tree = _build_call_tree(user_chains) if user_chains else None
     if tmin is not None and tmax is not None:
         prof.time_range = (tmin, tmax)
     return prof
