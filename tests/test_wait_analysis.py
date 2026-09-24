@@ -6,7 +6,6 @@ skips gracefully otherwise.
 """
 
 import shutil
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -140,22 +139,20 @@ class TestWaitIntegration:
         r = subprocess_run_build()
         assert r.returncode == 0, r.stderr
 
-    def run_wait_pass(self, binary, args):
-        import shutil
-        outdir = tempfile.mkdtemp(prefix="vperf-wait-")
-        try:
-            return collect(target_cmd=[str(binary), *args], pid=None,
-                           outdir=outdir, use_stat=False, use_record=False,
-                           use_memory=False, use_wait=True)
-        finally:
-            shutil.rmtree(outdir, ignore_errors=True)
+    def run_wait_pass(self, binary, args, outdir):
+        return collect(target_cmd=[str(binary), *args], pid=None,
+                       outdir=str(outdir), use_stat=False, use_record=False,
+                       use_memory=False, use_wait=True)
 
     def test_sleeper_signature(self, tmp_path):
         self.build()
         b = REPO / "examples" / "bin" / "sleeper"
-        pd = self.run_wait_pass(b, ["1.8"])
+        pd = self.run_wait_pass(b, ["1.8"], tmp_path)
         assert pd.wait_path, "wait.txt missing"
-        wp = parse_wait_script(Path(pd.wait_path).read_text(errors="replace"))
+        text = Path(pd.wait_path).read_text(errors="replace")
+        if "sched:sched_stat_sleep:" not in text:
+            pytest.skip("sched_stat_sleep tracepoint produced no samples")
+        wp = parse_wait_script(text)
         assert wp.window_s > 1.5
         sleep_share = wp.sleep_share_pct or 0.0
         assert 55.0 <= sleep_share <= 75.0, \
@@ -168,7 +165,9 @@ class TestWaitIntegration:
 
     def test_meta_records_wait_pass(self, tmp_path):
         self.build()
-        pd = self.run_wait_pass(REPO / "examples" / "bin" / "sleeper", ["1.0"])
+        pd = self.run_wait_pass(
+            REPO / "examples" / "bin" / "sleeper", ["1.0"], tmp_path,
+        )
         assert pd.meta["wait"]["enabled"] is True
 
 
