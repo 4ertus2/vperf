@@ -232,12 +232,65 @@ def test_build_profile_self_and_inclusive():
     assert by_name["[kernel]"].self_cycles == 0
 
 
+def test_user_stacks_filter_kernel_frames_and_keep_boundary():
+    samples = [
+        ScriptSample("worker", 100, 101, 1.0, 10, "cycles:P", [
+            ("leaf", "app"),
+            ("kernel_fn", "[kernel.kallsyms]"),
+            ("caller", "app"),
+        ]),
+        ScriptSample("worker", 100, 101, 1.1, 20, "cycles:P", [
+            ("kernel_only", "[kernel]"),
+        ]),
+        ScriptSample("worker", 100, 101, 1.2, 30, "cycles:P", [
+            ("[unresolved]", "[unresolved]"),
+        ]),
+        ScriptSample("worker", 100, 102, 1.3, 40, "cycles:P", [
+            ("inline_leaf", "inlined"),
+            ("physical", "libapp.so"),
+            ("inline_caller", "inlined"),
+            ("root", "libapp.so"),
+        ]),
+    ]
+
+    prof = build_profile(samples)
+    user = prof.user_stacks
+
+    assert prof.total_cycles == 100
+    assert user.total_cycles == 70
+    assert user.samples == 3
+    assert user.folded_by_tid[101] == {
+        "caller;leaf;[kernel boundary]": 10,
+        "[kernel boundary]": 20,
+    }
+    assert user.folded_by_tid[102] == {
+        "root;inline_caller;physical;inline_leaf": 40,
+    }
+    assert user.call_tree is not None
+    assert user.call_tree.value == 70
+    assert "kernel_fn" in " ".join(prof.folded)
+    assert "kernel_fn" not in " ".join(user.folded)
+
+
+def test_user_stacks_use_dso_for_same_named_frames():
+    samples = [ScriptSample("worker", 100, 101, 1.0, 10, "cycles:P", [
+        ("shared", "app"),
+        ("shared", "[kernel.kallsyms]"),
+    ])]
+
+    prof = build_profile(samples)
+
+    assert prof.user_stacks.folded_by_tid[101] == {"shared;[kernel boundary]": 10}
+    assert prof.folded_by_tid[101] == {"shared;shared": 10}
+
+
 def test_thread_comm_resolution():
     prof = build_profile(_samples())
     ti = prof.by_thread[10585]
     assert ti.comm == "python3"  # not perf-exec
     # folded roots renamed too
     assert any(k.startswith("python3 (10585);") for k in prof.folded)
+    assert any(k.startswith("python3 (10585);") for k in prof.user_stacks.folded)
 
 
 def test_folded_stacks_are_scoped_by_tid():

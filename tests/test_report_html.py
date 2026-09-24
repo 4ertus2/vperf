@@ -56,13 +56,9 @@ def test_legacy_memory_profile_does_not_expose_thread_views():
 
 
 def test_build_html_embeds_cojoined_memory_threads():
-    prof = StackProfile(
-        total_cycles=1,
-        samples=1,
-        by_thread={42: ThreadInfo(42, 42, "canonical", 1)},
-        folded={"canonical (42);worker": 1},
-        time_range=(1.0, 2.0),
-    )
+    prof = build_profile([
+        ScriptSample("canonical", 42, 42, 1.0, 1, "cycles:P", [("worker", "app")]),
+    ])
     meta = {
         "target": {"cmd": ["app"]},
         "mode": "run",
@@ -74,7 +70,7 @@ def test_build_html_embeds_cojoined_memory_threads():
     assert "MEMORY_HTML=" in html
     assert "canonical (tid 42)" in html
     assert 'data-thread="43"' in html
-    assert "No CPU samples for this thread." in html
+    assert "No classifiable user-space samples for this thread." in html
 
 
 def test_build_html_uses_tid_scoped_flame_graphs():
@@ -109,6 +105,68 @@ def test_build_html_uses_tid_scoped_flame_graphs():
     assert "alpha" not in beta
     assert "10" in alpha
     assert "20" in beta
+
+
+def test_build_html_flame_and_tree_are_user_space_only():
+    samples = [
+        ScriptSample("worker", 100, 101, 1.0, 10, "cycles:P", [
+            ("user_fn", "app"),
+            ("kernel_fn", "[kernel.kallsyms]"),
+        ]),
+        ScriptSample("worker", 100, 101, 1.1, 20, "cycles:P", [
+            ("kernel_only", "[kernel]"),
+        ]),
+        ScriptSample("worker", 100, 101, 1.2, 40, "cycles:P", [
+            ("[unresolved]", "[unresolved]"),
+        ]),
+    ]
+    prof = build_profile(samples)
+    html = build_html(
+        {"target": {"cmd": ["app"]}, "mode": "run"},
+        samples,
+        MetricsReport(elapsed=1.0),
+        prof,
+    )
+
+    flame_start = html.index('id="flamewrap"')
+    flame_end = html.index('<div id="tree"', flame_start)
+    flame = html[flame_start:flame_end]
+    tree_start = flame_end
+    tree_end = html.index('<div id="threads"', tree_start)
+    tree = html[tree_start:tree_end]
+    hotspot_start = html.index('id="hotspots"')
+    hotspot_end = html.index('id="mem"', hotspot_start)
+    hotspots = html[hotspot_start:hotspot_end]
+
+    assert "[kernel boundary]" in flame
+    assert "[kernel boundary]" in tree
+    assert "kernel_fn" not in flame
+    assert "kernel_fn" not in tree
+    assert "kernel_only" not in flame
+    assert "kernel_only" not in tree
+    assert "66.7%" in tree
+    assert "14.3%" not in tree
+    assert "kernel_fn" in hotspots
+
+
+def test_build_html_handles_empty_user_stack_view():
+    samples = [ScriptSample("worker", 100, 101, 1.0, 10, "cycles:P", [
+        ("[unresolved]", "[unresolved]"),
+    ])]
+    prof = build_profile(samples)
+    html = build_html(
+        {"target": {"cmd": ["app"]}, "mode": "run"},
+        samples,
+        MetricsReport(elapsed=1.0),
+        prof,
+    )
+
+    flame_start = html.index('id="flamewrap"')
+    flame_end = html.index('<div id="tree"', flame_start)
+    assert "No classifiable user-space samples." in html[flame_start:flame_end]
+    tree_start = flame_end
+    tree_end = html.index('<div id="threads"', tree_start)
+    assert "No classifiable user-space samples." in html[tree_start:tree_end]
 
 
 def test_build_html_embeds_thread_overview_metrics():
