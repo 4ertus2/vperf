@@ -564,8 +564,7 @@ def _memory_content(mem: MemoryProfile | None, backend: str = "ibs",
     label = "IBS" if backend == "ibs" else "PEBS"
     if mem is None or mem.total_samples == 0:
         return ('<div class="panel"><h3>Memory access</h3><em>Not collected '
-                '(AMD IBS / Intel PEBS unavailable or disabled with '
-                '--no-memory).</em></div>')
+                '(AMD IBS / Intel PEBS unavailable or not collected).</em></div>')
     total = max(mem.classified_samples, 1)
 
     def bars(items):
