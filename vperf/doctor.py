@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 
 from .perf import perf_available, perf_version, run_perf
+
+# CAP_PERFMON covers the PMU, CAP_SYS_PTRACE lets perf attach to and read other
+# processes, and CAP_DAC_READ_SEARCH is what gets past the root-only tracefs
+# event files that the Wait report needs.
+SETCAP_CAPS = "cap_perfmon,cap_sys_ptrace,cap_dac_read_search"
 
 CANDIDATE_METRICS = [
     "insn_per_cycle",
@@ -145,6 +151,56 @@ def has_cap(cap: str) -> bool:
         return False
 
 
+def versioned_perf_path() -> str:
+    """Where Debian/Ubuntu's ``/usr/bin/perf`` wrapper execs the real ELF."""
+    return f"/usr/lib/linux-tools/{os.uname().release}/perf"
+
+
+def perf_executable() -> tuple[str, str]:
+    """Return ``(path on PATH, path that actually runs)``.
+
+    Ubuntu and Debian install ``/usr/bin/perf`` as a bash wrapper that execs
+    ``/usr/lib/linux-tools/$(uname -r)/perf``. The kernel ignores file
+    capabilities on an interpreted script — only the interpreter is exec'd,
+    and bash has no capabilities — so ``setcap ... $(which perf)`` reports
+    success and then does nothing. The two paths differ exactly when this
+    wrapper is in play, which is the one case where a setcap hint is wrong.
+    """
+    path = shutil.which("perf") or ""
+    if not path:
+        return "", ""
+    try:
+        with open(path, "rb") as f:
+            magic = f.read(2)
+    except OSError:
+        return path, path
+    if magic != b"#!":
+        return path, os.path.realpath(path)
+    versioned = versioned_perf_path()
+    if os.path.exists(versioned):
+        return path, os.path.realpath(versioned)
+    return path, ""
+
+
+def setcap_command() -> str:
+    """The setcap invocation that actually takes effect on this host."""
+    _, real = perf_executable()
+    return f"sudo setcap {SETCAP_CAPS}=ep {real or '$(which perf)'}"
+
+
+def wait_denial_reason() -> str:
+    """Explain a failed sched-tracepoint probe instead of blaming paranoid."""
+    on_path, real = perf_executable()
+    if real and real != on_path:
+        return (f"perf on PATH is a wrapper script ({on_path}); the kernel ignores "
+                f"file capabilities on scripts, so caps set there never take effect — "
+                f"the ELF it execs is {real}, and that is where they must go: "
+                f"{setcap_command()}")
+    return ("scheduler tracepoint files are root-only (tracefs keeps mode 0640 even "
+            f"after a remount); perf needs CAP_DAC_READ_SEARCH to read them: "
+            f"{setcap_command()}")
+
+
 def probe_stat(extra_args: list[str]) -> tuple[bool, str]:
     """Run a tiny perf stat to test whether given args are supported."""
     r = run_perf(["stat", *extra_args, "--", "true"], timeout=30)
@@ -180,7 +236,6 @@ PERF_ACCESS_HINTS = (
     "perf cannot access PMU counters. Fix with ONE of:\n"
     "  sudo sysctl kernel.perf_event_paranoid=1        # user-space profiling\n"
     "  sudo sysctl kernel.perf_event_paranoid=-1       # full incl. kernel samples\n"
-    "  sudo setcap cap_perfmon,cap_sys_ptrace+ep $(which perf)\n"
     "To make permanent: echo 'kernel.perf_event_paranoid=1' | sudo tee /etc/sysctl.d/99-perf.conf"
 )
 
@@ -250,8 +305,7 @@ def run_doctor() -> DoctorReport:
                 "scheduler tracepoints accessible")
     else:
         rep.add("wait analysis (sched tracepoints)", "WARN",
-                "tracepoints denied at this paranoid level; --no-wait implied "
-                "(CAP_PERFMON or paranoid<=0 unlocks)")
+                f"{wait_denial_reason()}; --no-wait implied")
     return rep
 
 
@@ -333,7 +387,7 @@ def probe_attach() -> tuple[bool, str]:
             pass
         if "<not counted>" in body:
             return False, ("counts came back <not counted>: attach needs CAP_PERFMON/"
-                           "CAP_SYS_PTRACE (sudo setcap cap_perfmon,cap_sys_ptrace+ep $(which perf))")
+                           f"CAP_SYS_PTRACE ({setcap_command()})")
         return True, ""
     finally:
         try:
@@ -355,17 +409,21 @@ __all__ = [
     "GENERIC_EVENTS",
     "INTEL_LDLAT",
     "PERF_ACCESS_HINTS",
+    "SETCAP_CAPS",
     "VENDOR_AMD",
     "VENDOR_INTEL",
     "DoctorReport",
     "branch_mispredict_penalty",
     "cpu_vendor",
     "paranoid_level",
+    "perf_executable",
     "probe_ibs",
     "probe_intel_mem",
     "probe_record",
     "probe_stat",
     "run_doctor",
+    "setcap_command",
     "supported_events",
     "supported_metrics",
+    "wait_denial_reason",
 ]

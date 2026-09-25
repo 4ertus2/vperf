@@ -70,7 +70,30 @@ remounting the tracefs mount does not change the individual file permissions.
 ```bash
 sudo sysctl -w kernel.perf_event_paranoid=0
 sudo mount -o remount,mode=755 /sys/kernel/tracing/
-sudo setcap cap_perfmon,cap_sys_ptrace,cap_dac_read_search=ep "$(readlink -f "$(command -v perf)")"
+```
+
+Now grant the capabilities — **to the perf binary that actually executes**:
+
+```bash
+sudo setcap cap_perfmon,cap_sys_ptrace,cap_dac_read_search=ep "$(command -v perf)"
+```
+
+On Debian and Ubuntu that is not enough. `/usr/bin/perf` is a shell wrapper that
+`exec`s a versioned ELF, and **the kernel ignores file capabilities on a
+script** — only the interpreter is executed, and `bash` has no capabilities. So
+`setcap` on `/usr/bin/perf` succeeds, `getcap` reports the caps, and `perf` still
+runs with an empty capability set. Point `setcap` at the ELF instead:
+
+```bash
+sudo setcap cap_perfmon,cap_sys_ptrace,cap_dac_read_search=ep \
+  "/usr/lib/linux-tools/$(uname -r)/perf"
+```
+
+`vperf doctor` detects this case and prints the exact command for your host, so
+the shortest path is to run it and copy the `setcap` line it reports:
+
+```bash
+vperf doctor
 ```
 
 Verify access before running a profile:
@@ -82,7 +105,8 @@ vperf doctor
 
 The `sysctl` and tracefs changes are temporary. For a persistent Wait setting,
 use `kernel.perf_event_paranoid=0` in `/etc/sysctl.d/99-perf.conf` and reapply
-the tracefs mount after reboot.
+the tracefs mount after reboot. The `setcap` is permanent until the `perf`
+package is upgraded, which replaces the binary and drops the xattr.
 
 A profile collected before access was enabled has no `wait.txt`; rerun the
 profiling command to generate a new Wait report.
@@ -276,7 +300,8 @@ Notes & caveats:
   a model, not measurements; the assumed recovery penalty is printed next to
   the result.
 - Attach mode (`-p`) needs `CAP_PERFMON`/`CAP_SYS_PTRACE`
-  (`sudo setcap cap_perfmon,cap_sys_ptrace+ep $(which perf)`) on recent kernels.
+  (`vperf doctor` prints the exact `setcap` command; on Debian/Ubuntu it must
+  target the versioned ELF, not the `/usr/bin/perf` wrapper) on recent kernels.
 
 ## Development
 
