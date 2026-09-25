@@ -7,8 +7,37 @@ from dataclasses import dataclass, field
 from .doctor import AMD_ONLY_EVENTS, GENERIC_EVENTS, branch_mispredict_penalty
 from .parsers import StatData, ThreadStatData
 
-# Vendor-aware branch-misprediction recovery penalty in cycles.
-BAD_SPEC_PENALTY_CYCLES = branch_mispredict_penalty()
+# Cache-hierarchy counters come from one of two vendor event sets:
+#
+#   AMD Zen   ls_any_fills_from_sys.* / l2_cache_req_stat.* -- true data-source
+#             classification: every L1D miss is attributed to local L3 or
+#             DRAM/MMIO, so "LLC miss %" is fills_from_dram / L3 lookups.
+#   Intel     LLC-loads / LLC-load-misses (LONGEST_LAT_CACHE) -- the miss
+#             counter is "L1 miss that went past L2", so the same ratio means
+#             "fraction of L1 misses that reached L3", not DRAM traffic.
+#
+# Both are reported, but they are not the same measurement; the report labels
+# the source so a number is never read with the wrong definition.
+LLC_SOURCE_AMD = "AMD data-source fills"
+LLC_SOURCE_GENERIC = "LLC-load counters"
+
+_VENDOR_SHORT = {"GenuineIntel": "Intel", "AuthenticAMD": "AMD"}
+
+
+def vendor_short(vendor: str | None) -> str:
+    """Compact vendor name for the fixed-width terminal tables."""
+    if not vendor:
+        return ""
+    return _VENDOR_SHORT.get(vendor, vendor)
+
+
+def branch_penalty_note(m: "MetricsReport") -> str:
+    """One-line description of the Bad Speculation model actually used."""
+    if not m.branch_penalty_cycles:
+        return "est. wrong-path share (mispredict penalty model)"
+    vendor = vendor_short(m.cpu_vendor)
+    return (f"est. wrong-path share ({m.branch_penalty_cycles:.0f} cyc/mispredict"
+            + (f", {vendor} model)" if vendor else " model)"))
 
 
 @dataclass
@@ -28,10 +57,13 @@ class MetricsReport:
     branch_mispredict_pct: float | None = None
     # memory hierarchy
     llc_miss_pct: float | None = None     # LLC misses as % of L3 lookups
-    llc_misses: float | None = None       # fills from DRAM/MMIO (AMD data-source)
-    llc_hits: float | None = None         # fills from local L3
-    l1_misses: float | None = None        # all data-cache fills
-    l2_misses: float | None = None        # DC requests missing in L2
+    llc_misses: float | None = None       # AMD: fills from DRAM/MMIO
+                                           # Intel: LLC-load-misses
+    llc_hits: float | None = None         # AMD: fills from local L3
+                                           # Intel: LLC-loads - LLC-load-misses
+    l1_misses: float | None = None        # AMD: all data-cache fills
+    l2_misses: float | None = None        # AMD: DC requests missing in L2
+    llc_source: str | None = None         # which event set produced the above
     l1d_miss_rate_pct: float | None = None
     dtlb_miss_rate_pct: float | None = None
     dtlb_misses: float | None = None
@@ -42,6 +74,9 @@ class MetricsReport:
     frontend_bound_pct: float | None = None
     bad_speculation_pct: float | None = None  # est. cycles lost to wrong-path exec
     retiring_pct: float | None = None         # remainder: useful execution share
+    # vendor context actually used for the estimates above
+    cpu_vendor: str | None = None
+    branch_penalty_cycles: float = 0.0        # cycles assumed per mispredict (0 = unknown)
     # OS noise
     context_switches: float | None = None
     migrations: float | None = None
@@ -70,14 +105,18 @@ def compute_metrics(
     ncpus: int,
     stat_interval_ms: int | None = None,
     prefer_raw_ipc: bool = False,
+    vendor: str | None = None,
 ) -> MetricsReport:
     """Derive VTune-style metrics.
 
-    BAD_SPEC_PENALTY_CYCLES approximates the average branch-misprediction
-    recovery cost on Zen 3/4 (13 cycles); exposed as a module constant so
-    callers can tune it per microarchitecture.
+    *vendor* is the CPU vendor the profile was collected on (from
+    ``meta.json``).  It selects the branch-misprediction recovery penalty used
+    for the Bad Speculation quadrant, so replaying a profile on a different
+    machine reproduces the original numbers.  ``None`` means "this machine".
     """
     m = MetricsReport(elapsed=elapsed, ncpus=ncpus)
+    m.branch_penalty_cycles = branch_mispredict_penalty(vendor)
+    m.cpu_vendor = vendor
     s = stat.effective_summary(_BASE_EVENTS)
     met = stat.metrics
     # In interval mode perf emits -M metrics per interval; the stored value is
@@ -136,6 +175,7 @@ def compute_metrics(
     if l2m is not None:
         m.l2_misses = l2m
     if fills_ccx is not None and fills_dram is not None:
+        m.llc_source = LLC_SOURCE_AMD
         m.llc_hits = fills_ccx
         m.llc_misses = fills_dram
         lookups = fills_ccx + fills_dram
@@ -145,8 +185,10 @@ def compute_metrics(
         lloads = s.get("LLC-loads")
         lmiss = s.get("LLC-load-misses")
         if lloads and lmiss is not None:
-            m.llc_miss_pct = lmiss / lloads * 100.0
+            m.llc_source = LLC_SOURCE_GENERIC
             m.llc_misses = lmiss
+            m.llc_hits = max(0.0, lloads - lmiss)
+            m.llc_miss_pct = lmiss / lloads * 100.0
         elif met.get("llc_miss_rate") is not None:
             v = met["llc_miss_rate"]
             if 0.0 <= v <= 100.0:
@@ -187,12 +229,14 @@ def compute_metrics(
         m.frontend_bound_pct = s["stalled-cycles-frontend"] / cyc * 100.0
 
     # ---- bad speculation (TMA quadrant) -------------------------------------
-    # No direct slots event on AMD: estimate wrong-path cycles as
-    # mispredicted branches x typical recovery penalty (Zen 4 ~13 cycles),
-    # expressed as % of total cycles. Retiring is the remainder of the
-    # pipeline budget not consumed by the three loss sources.
+    # No direct slots event is requested on either vendor, so wrong-path
+    # cycles are estimated as mispredicted branches x the vendor recovery
+    # penalty, expressed as % of total cycles.  Retiring is the remainder of
+    # the pipeline budget not consumed by the three loss sources.
     if cyc and bmiss is not None:
-        m.bad_speculation_pct = min(bmiss * BAD_SPEC_PENALTY_CYCLES / cyc * 100.0, 100.0)
+        m.bad_speculation_pct = min(
+            bmiss * m.branch_penalty_cycles / cyc * 100.0, 100.0,
+        )
     parts = [m.backend_bound_pct, m.frontend_bound_pct, m.bad_speculation_pct]
     if any(p is not None for p in parts):
         m.retiring_pct = max(0.0, 100.0 - sum(p for p in parts if p is not None))
@@ -254,10 +298,12 @@ def compute_thread_metrics(
     elapsed: float | None = None,
     ncpus: int = 1,
     stat_interval_ms: int | None = None,
+    vendor: str | None = None,
 ) -> MetricsReport:
     stat = thread.stat if isinstance(thread, ThreadStatData) else thread
     return compute_metrics(
         stat, elapsed, ncpus, stat_interval_ms, prefer_raw_ipc=True,
+        vendor=vendor,
     )
 
 
@@ -265,6 +311,44 @@ compute_metrics_for_thread = compute_thread_metrics
 
 
 _BASE_EVENTS = GENERIC_EVENTS + AMD_ONLY_EVENTS
+
+
+# (row key, label, value, note).  Labels name the event set that produced the
+# number, so an Intel LLC-loads reading is never presented as an AMD DRAM-fill
+# count.  Notes only repeat what the label does not already say.  Rendered
+# verbatim by both the terminal and the HTML report.
+def cache_hierarchy_rows(m: "MetricsReport") -> list[tuple[str, str, float | None, str]]:
+    amd = m.llc_source == LLC_SOURCE_AMD
+    generic = m.llc_source == LLC_SOURCE_GENERIC
+    if amd:
+        llc_pct_note = "DRAM/MMIO fills per L3 lookup (AMD data-source fills)"
+    elif generic:
+        llc_pct_note = "LLC-load-misses per LLC-loads (share of L1 misses reaching L3)"
+    else:
+        llc_pct_note = ""
+    rows: list[tuple[str, str, float | None, str]] = [
+        ("llc_miss_pct", "LLC Miss %", m.llc_miss_pct, llc_pct_note),
+        ("llc_misses",
+         "LLC Misses (DRAM fills)" if amd else "LLC Misses",
+         m.llc_misses,
+         "" if amd else "LLC-load-misses"),
+        ("llc_hits",
+         "LLC Hits (local L3)" if amd else "LLC Hits",
+         m.llc_hits,
+         "" if amd else "LLC-loads - LLC-load-misses"),
+    ]
+    if m.l1_misses is not None:
+        rows.append((
+            "l1_misses",
+            "L1 Misses (all DC fills)" if amd else "L1 Misses",
+            m.l1_misses, "",
+        ))
+    if m.l2_misses is not None:
+        rows.append((
+            "l2_misses", "L2 Misses", m.l2_misses,
+            "DC requests missing in L2" if amd else "",
+        ))
+    return rows
 
 
 def all_hints(m: MetricsReport) -> list[str]:
@@ -284,7 +368,9 @@ def all_hints(m: MetricsReport) -> list[str]:
         out.append(f"Low IPC ({m.ipc:.2f}): execution is heavily stalled; check memory access "
                    "patterns and branch behavior below.")
     if m.llc_miss_pct is not None and m.llc_miss_pct > 10.0:
-        out.append(f"High LLC miss rate ({m.llc_miss_pct:.1f}%): significant DRAM-bound work; "
+        scope = "DRAM-bound" if m.llc_source == LLC_SOURCE_AMD \
+            else "misses reaching L3; check DRAM traffic in the Memory tab"
+        out.append(f"High LLC miss rate ({m.llc_miss_pct:.1f}%): {scope}; "
                    "improve data locality or use blocking.")
     if m.backend_bound_pct is not None and m.backend_bound_pct > 40.0:
         out.append(f"Backend bound ({m.backend_bound_pct:.0f}%): limited by memory/core stalls.")

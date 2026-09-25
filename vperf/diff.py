@@ -40,7 +40,8 @@ def _analyze_dir(dirpath: str) -> tuple[MetricsReport, StackProfile, dict]:
     cpu_ms = stat_data.summary.get("task-clock")
     scale_hotspot_times(prof, cpu_ms / 1000.0 if cpu_ms else None)
     m = compute_metrics(stat_data, meta.get("elapsed_wall"),
-                        meta.get("ncpus", 1), meta.get("interval_ms"))
+                        meta.get("ncpus", 1), meta.get("interval_ms"),
+                        vendor=meta.get("cpu_vendor"))
     return m, prof, meta
 
 

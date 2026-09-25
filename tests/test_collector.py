@@ -6,6 +6,7 @@ import pytest
 
 from vperf import collector
 from vperf.cli import _analyze, _thread_metrics_payload, build_parser
+from vperf.doctor import INTEL_LDLAT, VENDOR_AMD, VENDOR_INTEL
 from vperf.perf import PerfResult
 from vperf.parsers import StatData
 
@@ -15,6 +16,25 @@ MEM_REPORT = "\n".join([
     "# Overhead       Samples  Tgid:Command  Pid:Command  Command  Local Weight  Memory access  Symbol  Shared Object  TLB access",
     "     1%          4       100:app       42:worker     worker   400          RAM hit       [.] worker      app          L2 miss",
 ])
+
+PEBS_REPORT = "\n".join([
+    "# Samples: 4 of event 'cpu/mem-loads,ldlat=30/P'",
+    "# Overhead       Samples  Tgid:Command  Pid:Command  Command  Local Weight  Memory access  Symbol  Shared Object  TLB access",
+    "     1%          4       100:app       42:worker     worker   400          RAM hit       [.] worker      app          L2 miss",
+    "# Samples: 2 of event 'cpu/mem-stores/P'",
+    "# Overhead       Samples  Tgid:Command  Pid:Command  Command  Local Weight  Memory access  Symbol  Shared Object  TLB access",
+    "     1%          2       100:app       42:worker     worker   200          L1 hit        [.] worker      app          L1 hit",
+])
+
+
+def _amd_vendor(monkeypatch):
+    """Pin the probed vendor so IBS/PEBS selection is machine-independent."""
+    monkeypatch.setattr(collector.doctor, "cpu_vendor", lambda: VENDOR_AMD)
+
+
+def _intel_vendor(monkeypatch):
+    monkeypatch.setattr(collector.doctor, "cpu_vendor", lambda: VENDOR_INTEL)
+
 
 THREAD_STATS = """worker-a-101,100.00,msec,task-clock,100,100.00,,
 worker-a-101,200,,cycles,100,100.00,,
@@ -101,6 +121,7 @@ def test_callgraph_arguments_are_mode_specific():
 
 
 def test_collect_cojoins_cpu_and_memory_events(monkeypatch, tmp_path):
+    _amd_vendor(monkeypatch)
     calls = []
 
     def fake_run_perf(args, timeout=None, stdout_file=None):
@@ -140,6 +161,7 @@ def test_collect_cojoins_cpu_and_memory_events(monkeypatch, tmp_path):
 
 
 def test_collect_falls_back_when_cojoined_record_fails(monkeypatch, tmp_path):
+    _amd_vendor(monkeypatch)
     calls = []
 
     def fake_run_perf(args, timeout=None, stdout_file=None):
@@ -192,6 +214,129 @@ def test_intel_memory_discovery_keeps_all_pmus(monkeypatch):
         "cpu_atom/mem-loads,ldlat=30/P",
         "cpu_atom/mem-stores/P",
     ]
+
+
+def test_intel_memory_discovery_uses_the_shared_ldlat(monkeypatch):
+    """The probe, the discovered events and meta.json must not drift apart."""
+    def fake_run_perf(args, timeout=None, stdout_file=None):
+        return PerfResult(0, "", "ldlat-loads cpu/mem-loads/P : available\n")
+
+    monkeypatch.setattr(collector, "run_perf", fake_run_perf)
+
+    assert collector._intel_memory_events() == [
+        f"cpu/mem-loads,ldlat={INTEL_LDLAT}/P",
+    ]
+
+
+def test_memory_plan_prefers_ibs_on_amd(monkeypatch):
+    _amd_vendor(monkeypatch)
+    monkeypatch.setattr(collector, "probe_ibs", lambda: True)
+    monkeypatch.setattr(collector, "probe_intel_mem", lambda: True)
+    monkeypatch.setattr(collector, "_intel_memory_events",
+                        lambda *a, **k: ["cpu/mem-loads,ldlat=30/P"])
+
+    plan = collector._memory_plan(100003)
+    assert plan.backend == "ibs"
+    assert plan.events == ["ibs_op/period=100003/p"]
+    assert plan.data_file == "perf_ibs.data"
+
+
+def test_memory_plan_skips_the_ibs_probe_on_intel(monkeypatch):
+    """ibs_op cannot exist on Intel, so its probe is a guaranteed failure."""
+    _intel_vendor(monkeypatch)
+    calls = []
+    monkeypatch.setattr(collector, "probe_ibs", lambda: calls.append("ibs") or True)
+    monkeypatch.setattr(collector, "probe_intel_mem", lambda: True)
+    monkeypatch.setattr(collector, "_intel_memory_events",
+                        lambda *a, **k: ["cpu/mem-loads,ldlat=30/P",
+                                          "cpu/mem-stores/P"])
+
+    plan = collector._memory_plan(100003)
+    assert calls == []
+    assert plan.backend == "pebs"
+    assert plan.events == ["cpu/mem-loads,ldlat=30/P", "cpu/mem-stores/P"]
+    assert plan.data_file == "perf_mem.data"
+
+
+def test_memory_plan_probes_both_when_vendor_is_unknown(monkeypatch):
+    monkeypatch.setattr(collector.doctor, "cpu_vendor", lambda: "unknown")
+    calls = []
+    monkeypatch.setattr(collector, "probe_ibs", lambda: calls.append("ibs") or False)
+    monkeypatch.setattr(collector, "probe_intel_mem",
+                        lambda: calls.append("pebs") or True)
+    monkeypatch.setattr(collector, "_intel_memory_events",
+                        lambda *a, **k: ["cpu/mem-loads,ldlat=30/P"])
+
+    assert collector._memory_plan(100003).backend == "pebs"
+    assert calls == ["ibs", "pebs"]
+
+
+def test_standalone_pebs_pass_records_the_discovered_event_names(monkeypatch, tmp_path):
+    """The recorded event names must be the ones the report parser filters on.
+
+    `perf mem record` picks its own events, so the names in perf.data need not
+    match `meta["memory"]["events"]`; naming them explicitly removes the
+    mismatch and is the only way to cover every PMU on hybrid parts.
+    """
+    calls = []
+    events = ["cpu/mem-loads,ldlat=30/P", "cpu/mem-stores/P"]
+
+    def fake_run_perf(args, timeout=None, stdout_file=None):
+        calls.append(list(args))
+        if args[:2] == ["mem", "report"]:
+            Path(stdout_file).write_text(PEBS_REPORT, encoding="utf-8")
+        elif args[:1] == ["script"]:
+            Path(stdout_file).write_text("worker 42/42 1.0: 100 cycles:P:\n",
+                                         encoding="utf-8")
+        return PerfResult(0, "", "")
+
+    monkeypatch.setattr(collector, "_probe_capabilities",
+                        lambda: (["task-clock"], [], "cycles:P"))
+    _intel_vendor(monkeypatch)
+    monkeypatch.setattr(collector, "probe_ibs", lambda: True)
+    monkeypatch.setattr(collector, "probe_intel_mem", lambda: True)
+    monkeypatch.setattr(collector, "_intel_memory_events", lambda *a, **k: events)
+    monkeypatch.setattr(collector, "probe_wait", lambda: False)
+    monkeypatch.setattr(collector, "run_perf", fake_run_perf)
+    monkeypatch.setattr(collector, "perf_version", lambda: "perf test")
+    monkeypatch.setattr(collector, "_FreqSampler", _FakeSampler)
+
+    profile = collector.collect(
+        target_cmd=["true"], pid=None, outdir=str(tmp_path / "pebs"),
+        use_stat=False, use_record=False, use_memory=True,
+        use_wait=False, use_freq=False,
+    )
+
+    mem_calls = [c for c in calls if "-o" in c and c[-1] == "true"]
+    assert mem_calls, [c for c in calls]
+    record = mem_calls[-1]
+    assert record[0] == "record"
+    for event in events:
+        assert event in record
+    assert not any(c[:2] == ["mem", "record"] for c in calls)
+    assert profile.meta["memory"]["backend"] == "pebs"
+    assert profile.mem_report_path is not None
+    # meta must describe the knob PEBS actually honours
+    assert profile.meta["memory"]["ldlat"] == INTEL_LDLAT
+    assert profile.meta["memory"]["period"] is None
+
+
+def test_memory_meta_reports_the_backend_specific_knob():
+    ibs = collector._memory_meta(enabled=True, backend="ibs", period=100003,
+                                 events=["ibs_op/period=100003/p"],
+                                 data_file="perf_ibs.data", cojoined=True)
+    assert ibs["period"] == 100003
+    assert ibs["ldlat"] is None
+
+    pebs = collector._memory_meta(enabled=True, backend="pebs", period=100003,
+                                  events=["cpu/mem-loads,ldlat=30/P"],
+                                  data_file="perf_mem.data", cojoined=True)
+    assert pebs["period"] is None, "PEBS has no sampling period"
+    assert pebs["ldlat"] == INTEL_LDLAT
+
+    off = collector._memory_meta(enabled=False, backend=None, period=100003,
+                                 events=[], data_file=None, cojoined=False)
+    assert off["period"] is None and off["ldlat"] is None
 
 
 def test_analysis_excludes_memory_samples_from_cpu_profile(tmp_path):
@@ -247,12 +392,12 @@ def test_load_profile_falls_back_to_aggregate_stat_csv(tmp_path):
     )
 
     loaded = collector.load_profile(str(tmp_path), include_threads=True)
-
     assert loaded[1].summary["task-clock"] == 250
     assert loaded[6] is None
 
 
 def test_collect_combines_attached_stat_and_record(monkeypatch, tmp_path):
+    _amd_vendor(monkeypatch)
     collector_calls = []
     postprocess_calls = []
     target_signals = []
@@ -353,3 +498,69 @@ def test_profile_commands_do_not_expose_record_or_memory_toggles():
         parser.parse_args(["attach", "-p", "123", "--no-record"])
     with pytest.raises(SystemExit):
         parser.parse_args(["attach", "-p", "123", "--no-memory"])
+
+
+def _write_profile_dir(path: Path, vendor: str) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "meta.json").write_text(json.dumps({
+        "version": 1,
+        "mode": "run",
+        "target": {"cmd": ["app"], "pid": None},
+        "started": "2026-01-01 00:00:00",
+        "host": "bench",
+        "cpu_vendor": vendor,
+        "ncpus": 8,
+        "events": ["task-clock", "cycles", "instructions", "branch-misses"],
+        "metrics": [],
+        "memory": {"enabled": False, "backend": None, "events": []},
+        "wait": {"enabled": False},
+        "elapsed_wall": 1.0,
+    }), encoding="utf-8")
+    (path / "stat.csv").write_text(
+        "1000,,task-clock,1000,100.00,,\n"
+        "1000000000,,cycles,1000000000,100.00,,\n"
+        "2000000000,,instructions,1000000000,100.00,,\n"
+        "10000000,,branch-misses,1000000000,100.00,,\n",
+        encoding="utf-8",
+    )
+
+
+def test_report_reuses_the_profiled_vendor_not_the_reporting_host(monkeypatch, tmp_path,
+                                                                 capsys):
+    """`vperf report` on an Intel box must reproduce an AMD profile's numbers."""
+    from vperf.cli import main
+
+    outdir = tmp_path / "amd-profile"
+    _write_profile_dir(outdir, VENDOR_AMD)
+    # the machine doing the reporting is Intel
+    monkeypatch.setattr(collector.doctor, "cpu_vendor", lambda: VENDOR_INTEL)
+
+    assert main(["report", str(outdir)]) == 0
+
+    out = capsys.readouterr().out
+    assert VENDOR_AMD in out, "profile vendor must be shown in the header"
+    assert "13 cyc/mispredict" in out
+    assert "15 cyc/mispredict" not in out
+    # 10M mispredicts x 13 cyc / 1G cycles = 13% of the pipeline budget
+    assert "13.00 %" in out
+    assert (outdir / "report.html").exists()
+    html = (outdir / "report.html").read_text()
+    assert "13 cyc/mispredict" in html
+
+
+def test_report_falls_back_to_the_host_vendor_for_legacy_profiles(monkeypatch, tmp_path,
+                                                                  capsys):
+    """Profiles predating the cpu_vendor key have no vendor of their own."""
+    from vperf.cli import main
+
+    outdir = tmp_path / "legacy"
+    _write_profile_dir(outdir, VENDOR_AMD)
+    meta = json.loads((outdir / "meta.json").read_text())
+    meta.pop("cpu_vendor")
+    (outdir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    monkeypatch.setattr(collector.doctor, "cpu_vendor", lambda: VENDOR_INTEL)
+
+    assert main(["report", str(outdir)]) == 0
+
+    out = capsys.readouterr().out
+    assert "15 cyc/mispredict" in out

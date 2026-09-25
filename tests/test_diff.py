@@ -61,3 +61,41 @@ def test_render_diff_smoke():
 def test_diff_row_none_handling():
     row = DiffRow("x", None, 5.0)
     assert row.delta is None
+
+
+def test_diff_uses_each_profile_own_vendor(monkeypatch, tmp_path):
+    """Two profiles from different vendors must not be scored with the same
+    mispredict penalty just because they are diffed from one machine."""
+    import json
+    from pathlib import Path
+
+    from vperf import collector
+    from vperf.diff import _analyze_dir
+    from vperf.doctor import VENDOR_AMD, VENDOR_INTEL
+
+    csv = ("1000000000,,cycles,1000000000,100.00,,\n"
+           "10000000,,branch-misses,1000000000,100.00,,\n")
+
+    def profile(name: str, vendor: str) -> Path:
+        d = tmp_path / name
+        d.mkdir()
+        (d / "meta.json").write_text(json.dumps({
+            "version": 1, "mode": "run",
+            "target": {"cmd": ["prog"], "pid": None},
+            "started": "t", "host": "h", "cpu_vendor": vendor, "ncpus": 8,
+            "events": ["cycles", "branch-misses"], "metrics": [],
+            "memory": {"enabled": False, "backend": None, "events": []},
+            "wait": {"enabled": False}, "elapsed_wall": 1.0,
+        }), encoding="utf-8")
+        (d / "stat.csv").write_text(csv, encoding="utf-8")
+        return d
+
+    # reporting from an AMD box
+    monkeypatch.setattr(collector.doctor, "cpu_vendor", lambda: VENDOR_AMD)
+    amd_m, _p, _meta = _analyze_dir(str(profile("amd", VENDOR_AMD)))
+    intel_m, _p, _meta = _analyze_dir(str(profile("intel", VENDOR_INTEL)))
+
+    assert amd_m.branch_penalty_cycles == 13.0
+    assert intel_m.branch_penalty_cycles == 15.0
+    assert amd_m.bad_speculation_pct == pytest.approx(13.0)
+    assert intel_m.bad_speculation_pct == pytest.approx(15.0)

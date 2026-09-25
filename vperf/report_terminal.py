@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
-from .metrics import BAD_SPEC_PENALTY_CYCLES, MetricsReport, all_hints
-from .wait import WAIT_BANDS_MS, WaitProfile
-from .memory import LATENCY_BANDS, MemoryProfile
+from .memory import LATENCY_BANDS, MemoryProfile, backend_label
+from .metrics import (
+    MetricsReport,
+    all_hints,
+    branch_penalty_note,
+    cache_hierarchy_rows,
+)
 from .stacks import StackProfile, top_threads
+from .wait import WAIT_BANDS_MS, WaitProfile
 
 
 def _fmt(v: float | None, suffix: str = "", prec: int = 2) -> str:
@@ -35,8 +40,8 @@ def _table(rows: list[list[str]], headers: list[str]) -> str:
     return f"{head}\n{sep}\n{body}"
 
 
-def _memory_section(mp: MemoryProfile, backend: str = "ibs") -> list[str]:
-    label = "IBS" if backend == "ibs" else "PEBS"
+def _memory_section(mp: MemoryProfile, backend: str | None = "ibs") -> list[str]:
+    label = backend_label(backend)
     out = ["", f"-- Memory Access ({label}) " + "-" * (56 - len(label))]
     if mp.total_samples == 0:
         return out + [" (no samples)"]
@@ -111,7 +116,11 @@ def render_terminal(meta: dict, m: MetricsReport, prof: StackProfile | None,
     what = ("PID " + str(tgt["pid"])) if tgt.get("pid") else " ".join(tgt.get("cmd") or [])
     out.append("=" * 78)
     out.append(f" vperf summary  |  {what}")
-    out.append(f" {meta['started']}  on {meta['host']}  ({meta.get('perf_version', '?')})")
+    vendor = meta.get("cpu_vendor")
+    if vendor:
+        vendor = f"  [{vendor}]"
+    out.append(f" {meta['started']}  on {meta['host']}  ({meta.get('perf_version', '?')})"
+               f"{vendor}")
     out.append("=" * 78)
 
     ncpu = meta.get("ncpus", 1)
@@ -139,11 +148,13 @@ def render_terminal(meta: dict, m: MetricsReport, prof: StackProfile | None,
         ["Branch Instructions", _fmt_count(m.branch_instructions)],
         ["Branch Mispredicts", _fmt_count(m.branch_misses)],
         ["Branch Mispredict %", _fmt(m.branch_mispredict_pct, " %")],
-        ["LLC Miss %", _fmt(m.llc_miss_pct, " %")],
-        ["LLC Misses (DRAM fills)", _fmt_count(m.llc_misses)],
-        ["LLC Hits (local L3)", _fmt_count(m.llc_hits)],
-        ["L1 Misses (all DC fills)", _fmt_count(m.l1_misses)],
-        ["L2 Misses", _fmt_count(m.l2_misses)],
+    ]
+    for _key, label, value, note in cache_hierarchy_rows(m):
+        if value is None and "%" not in label:
+            continue
+        cell = _fmt(value, " %") if "%" in label else _fmt_count(value)
+        hw_rows.append([f"{label}  ({note})" if note else label, cell])
+    hw_rows += [
         ["L1D Miss Rate", _fmt(m.l1d_miss_rate_pct, " %")],
         ["dTLB Miss Rate", _fmt(m.dtlb_miss_rate_pct, " %")],
         ["Context Switches/s", _fmt(m.cs_per_sec)],
@@ -170,7 +181,7 @@ def render_terminal(meta: dict, m: MetricsReport, prof: StackProfile | None,
         ["Frontend Bound", _fmt(m.frontend_bound_pct, " %"),
          "slots lost to fetch/decode stalls"],
         ["Bad Speculation", _fmt(m.bad_speculation_pct, " %"),
-         f"est. wrong-path share ({int(BAD_SPEC_PENALTY_CYCLES)} cyc/mispredict model)"],
+         branch_penalty_note(m)],
         ["Retiring (remainder)", _fmt(m.retiring_pct, " %"),
          "pipeline budget not lost to the above"],
     ]

@@ -39,7 +39,8 @@ def _ensure_access() -> None:
 
 def _analyze(stat_data: StatData, elapsed: float | None, script_path: str | None,
              ncpus: int, interval_ms: int | None,
-             memory_events: set[str] | None = None) -> tuple[list, StackProfile, MetricsReport]:
+             memory_events: set[str] | None = None,
+             vendor: str | None = None) -> tuple[list, StackProfile, MetricsReport]:
     samples = []
     if script_path:
         with open(script_path, encoding="utf-8", errors="replace") as f:
@@ -52,7 +53,7 @@ def _analyze(stat_data: StatData, elapsed: float | None, script_path: str | None
     cpu_ms = stat_data.summary.get("task-clock")
     scale_hotspot_times(prof, cpu_ms / 1000.0 if cpu_ms else None)
 
-    m = compute_metrics(stat_data, elapsed, ncpus, interval_ms)
+    m = compute_metrics(stat_data, elapsed, ncpus, interval_ms, vendor=vendor)
 
     # timeline: prefer exact task-clock intervals; else derive from samples
     if not m.timeline and samples and prof.total_cycles:
@@ -65,9 +66,10 @@ def _analyze(stat_data: StatData, elapsed: float | None, script_path: str | None
 
 def _thread_metrics_payload(thread_stats, meta: dict, elapsed: float | None) -> dict:
     payload = {}
+    vendor = meta.get("cpu_vendor")
     for tid, thread in (thread_stats or {}).items():
         report = compute_thread_metrics(
-            thread, elapsed, 1, meta.get("interval_ms"),
+            thread, elapsed, 1, meta.get("interval_ms"), vendor=vendor,
         )
         payload[str(tid)] = {
             "tid": tid,
@@ -87,6 +89,7 @@ def _finish(outdir: str, meta: dict, warnings: list[str], stat_data: StatData,
     samples, prof, m = _analyze(
         stat_data, elapsed, script_path,
         meta.get("ncpus", 1), meta.get("interval_ms"), memory_events,
+        meta.get("cpu_vendor"),
     )
     mem = _load_mem_profile(mem_report_path, memory_events)
     wp = _load_wait_profile(wait_path)
@@ -200,6 +203,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     samples, prof, m = _analyze(
         stat_data, meta.get("elapsed_wall"), script_path,
         meta.get("ncpus", 1), meta.get("interval_ms"), memory_events,
+        meta.get("cpu_vendor"),
     )
     mem = _load_mem_profile(mem_report_path, memory_events)
     wp = _load_wait_profile(wait_path)
@@ -255,7 +259,8 @@ def cmd_cycle(args: argparse.Namespace) -> int:
                      use_stat=True, use_record=False,
                      use_memory=False, use_wait=False, quiet_stdout=True)
         m = compute_metrics(pd.stat, pd.elapsed,
-                            pd.meta.get("ncpus", 1), pd.meta.get("interval_ms"))
+                            pd.meta.get("ncpus", 1), pd.meta.get("interval_ms"),
+                            vendor=pd.meta.get("cpu_vendor"))
         ipc_s = f"{m.ipc:.3f}" if m.ipc is not None else "na"
         tag = (f"[warmup {idx}/{args.warmup}]" if is_warmup
                else f"[{idx - (args.warmup or 0)}/{args.runs}]")

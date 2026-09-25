@@ -34,6 +34,24 @@ LATENCY_BANDS = [
 _ROW_SPLIT = re.compile(r"\s{2,}")
 _EVENT_SAMPLES = re.compile(r"#\s*Samples:.*event ['\"]([^'\"]+)")
 
+_BACKEND_LABELS = {
+    "ibs": "IBS",
+    "pebs": "PEBS",
+}
+
+
+def backend_label(backend: str | None) -> str:
+    """Human-readable name for a memory backend recorded in ``meta.json``.
+
+    Shared by the terminal and HTML reports so both label a profile
+    identically, including profiles that predate the ``backend`` key (those
+    are all AMD IBS captures, so they fall back to the IBS label rather than
+    being mislabelled as PEBS).
+    """
+    if not backend:
+        return _BACKEND_LABELS["ibs"]
+    return _BACKEND_LABELS.get(backend.lower(), backend.upper())
+
 _SKIP_PREFIXES = (
     "#", "Warning:", "Kernel address", "Check ", "As no ",
     "Samples in kernel", "can't be resolved",
@@ -275,4 +293,5 @@ def parse_mem_report(text: str, memory_events: set[str] | None = None,
     return prof
 
 
-__all__ = ["MemoryProfile", "MemSymbol", "event_matches", "parse_mem_report", "LATENCY_BANDS"]
+__all__ = ["MemoryProfile", "MemSymbol", "backend_label", "event_matches",
+           "parse_mem_report", "LATENCY_BANDS"]
