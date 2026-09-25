@@ -1,8 +1,12 @@
 // Runs all four SIMD tiers (scalar, SSE, AVX, AVX-512) in separate threads.
 // Each thread gets its own copy of the working set so there is no sharing.
 //
-// Build: make simd_levels_all  (needs -pthread -mavx512f -mavx512dq)
+// Build: make simd_levels_all  (needs -pthread)
 // Usage: simd_levels_all <passes-per-thread>
+//
+// The AVX-512 tier is selected at runtime with __builtin_cpu_supports, so the
+// binary is built and linked with just the baseline -march=x86-64-v3 flags and
+// stays runnable on CPUs without AVX-512. See kernel_avx512 below.
 
 #include <cstdio>
 #include <cstdlib>
@@ -21,7 +25,7 @@ static void set_thread_name(const char* name) {
 static void set_thread_name(const char*) {}
 #endif
 
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) || defined(VPERF_HAVE_AVX512_KERNEL)
 #include <immintrin.h>
 #endif
 
@@ -108,10 +112,21 @@ double kernel_avx(const double* x, const double* w) {
 #endif
 
 // ---- AVX-512 kernel -------------------------------------------------------
+//
+// The ISA requirement is attached to this function only, never to the whole
+// translation unit. Building the TU with -mavx512f would let the compiler
+// auto-vectorize the other tiers and init_arrays with zmm registers, and those
+// run before any runtime check -- an illegal instruction on every CPU without
+// AVX-512 (Broadwell, Zen 1/2/3, ...).  A per-function target keeps the rest
+// of the file at the baseline ISA and leaves the dispatch to the CPU.
 
-#if defined(__AVX512F__)
+#if defined(__GNUC__) || defined(__clang__)
+#define VPERF_HAVE_AVX512_KERNEL 1
 #include <immintrin.h>
+#endif
 
+#ifdef VPERF_HAVE_AVX512_KERNEL
+__attribute__((target("avx512f,avx512dq")))
 double kernel_avx512(const double* x, const double* w) {
     __m512d a0 = _mm512_setzero_pd();
     __m512d a1 = _mm512_setzero_pd();
@@ -178,7 +193,7 @@ int main(int argc, char** argv) {
     threads.emplace_back(run_tier, &results[2], "avx", kernel_avx, passes);
 #endif
 
-#if defined(__AVX512F__)
+#ifdef VPERF_HAVE_AVX512_KERNEL
     if (__builtin_cpu_supports("avx512f")) {
         threads.emplace_back(run_tier, &results[3], "avx512", kernel_avx512, passes);
     }

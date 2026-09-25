@@ -112,8 +112,13 @@ def _memory_meta(*, enabled: bool, backend: str | None, period: int,
 
 DEFAULT_CALLGRAPH = "fp"
 
-_MEMORY_SORT = "tgid,pid,comm,local_weight,mem,sym,dso,tlb"
-_MEMORY_SORT_FALLBACK = "pid,comm,local_weight,mem,sym,dso,tlb"
+# `perf report -s` accepts: pid, comm, dso, symbol, parent, cpu, socket, srcline,
+# weight, local_weight, cgroup_id, addr.  There is no `tgid` key, and a rejected
+# key makes perf exit 0 with an *empty* report, so a bogus key silently costs the
+# whole memory analysis.  `pid` already means "command and tid", which is the
+# column parse_mem_report() uses for per-thread views, so no tgid sort is needed.
+_MEMORY_SORT = "pid,comm,local_weight,mem,sym,dso,tlb"
+_MEMORY_SORT_FALLBACK = "comm,pid,local_weight,mem,sym,dso,tlb"
 
 
 def _intel_memory_events(ldlat: int = doctor.INTEL_LDLAT) -> list[str]:
@@ -260,28 +265,47 @@ def _aggregate_thread_stats(thread_stats: ThreadStatMap) -> StatData:
     return aggregate
 
 
+def _perf_error_summary(error_lines: list[str]) -> str:
+    """Pick the actionable line out of perf's stderr noise.
+
+    perf prefixes real errors with ``Error:`` and follows them with indented
+    detail; the indented detail is the useful part.
+    """
+    meaningful = [ln.strip() for ln in error_lines if ln.strip()]
+    if not meaningful:
+        return ""
+    for line in meaningful:
+        if not line.startswith(("Error:", "Warning:")) and "error" not in line.lower():
+            return line[:160]
+    return meaningful[0][:160]
+
+
 def _memory_report(data_path: str, outdir: str, events: list[str],
-                   backend: str, warnings: list[str],
-                   retry_sorts: bool = True) -> str | None:
+                   backend: str, warnings: list[str]) -> str | None:
     report_path = os.path.join(outdir, "mem_report.txt")
-    sorts = [_MEMORY_SORT, _MEMORY_SORT_FALLBACK, ""] if retry_sorts else [_MEMORY_SORT]
     saw_report = False
     last_error = ""
     last_report_text = None
-    for sort_name in sorts:
+    for sort_name in (_MEMORY_SORT, _MEMORY_SORT_FALLBACK, ""):
         args = ["mem", "report", "-i", data_path, "--stdio", "--field-separator=\t",
                 "--show-total-period"]
         if sort_name:
             args += ["--sort", sort_name]
         result = run_perf(args, timeout=900, stdout_file=report_path)
+        error_lines = (result.stderr or "").strip().splitlines()
         if not result.ok:
-            error_lines = (result.stderr or "").strip().splitlines()
             last_error = error_lines[-1][:160] if error_lines else "unknown error"
             continue
         try:
             with open(report_path, encoding="utf-8", errors="replace") as f:
                 report_text = f.read()
         except OSError:
+            continue
+        if not report_text.strip():
+            # perf exits 0 but writes nothing when it rejects an argument (an
+            # unknown --sort key, for instance).  Keep the reason so the
+            # warning points at the cause instead of claiming zero samples.
+            last_error = _perf_error_summary(error_lines) or "perf produced no report"
             continue
         profile = parse_mem_report(report_text, set(events), "\t", None)
         if profile.total_samples > 0:
@@ -298,7 +322,6 @@ def _memory_report(data_path: str, outdir: str, events: list[str],
     elif last_error:
         warnings.append(f"{backend.upper()} memory report failed: {last_error}")
     return None
-
 
 def _ncpus() -> int:
     return os.cpu_count() or 1
@@ -783,7 +806,6 @@ def _collect_combined(
     if record_ok and active_memory_plan is not None and os.path.exists(data_path):
         mem_report_path = _memory_report(
             data_path, outdir, memory_events, mem_backend or "memory", warnings,
-            retry_sorts=False,
         )
         memory_enabled = mem_report_path is not None
         memory_cojoined = memory_enabled

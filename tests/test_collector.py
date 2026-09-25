@@ -500,6 +500,36 @@ def test_profile_commands_do_not_expose_record_or_memory_toggles():
         parser.parse_args(["attach", "-p", "123", "--no-memory"])
 
 
+def test_runs_as_a_module_without_installation():
+    """`python3 -m vperf` must work straight from a checkout, no venv needed."""
+    import subprocess
+    import sys
+
+    repo = Path(__file__).resolve().parents[1]
+    r = subprocess.run(
+        [sys.executable, "-m", "vperf", "--version"],
+        cwd=repo, capture_output=True, text=True, timeout=60,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "vperf" in r.stdout
+
+
+def test_runs_as_a_module_from_any_directory_via_pythonpath():
+    import os
+    import subprocess
+    import sys
+
+    repo = Path(__file__).resolve().parents[1]
+    env = dict(os.environ, PYTHONPATH=str(repo))
+    r = subprocess.run(
+        [sys.executable, "-m", "vperf", "doctor"],
+        cwd=os.sep, env=env, capture_output=True, text=True, timeout=120,
+    )
+    # doctor needs perf on PATH; only the failure mode differs
+    assert r.returncode in (0, 2), r.stderr
+    assert "usage: vperf" not in r.stderr, "module entry point not reached"
+
+
 def _write_profile_dir(path: Path, vendor: str) -> None:
     path.mkdir(parents=True, exist_ok=True)
     (path / "meta.json").write_text(json.dumps({
@@ -564,3 +594,72 @@ def test_report_falls_back_to_the_host_vendor_for_legacy_profiles(monkeypatch, t
 
     out = capsys.readouterr().out
     assert "15 cyc/mispredict" in out
+
+
+def test_memory_sort_keys_are_accepted_by_perf_report():
+    """perf rejects an unknown --sort key by exiting 0 with an empty report.
+
+    That used to cost the whole memory analysis, so every key we send must be
+    one perf accepts.  Verified against perf 6.8 `perf mem report`: the
+    documented `perf report` keys plus the memory-specific sym/mem/tlb, and
+    notably *not* `tgid` -- `pid` already means "command and tid", which is
+    the column the parser groups threads by.
+    """
+    accepted = {
+        "pid", "comm", "dso", "symbol", "sym", "parent", "cpu", "socket",
+        "srcline", "weight", "local_weight", "cgroup_id", "addr", "mem", "tlb",
+    }
+    keys = set()
+    for spec in (collector._MEMORY_SORT, collector._MEMORY_SORT_FALLBACK):
+        keys.update(part.strip() for part in spec.split(",") if part.strip())
+    assert keys, "no sort keys configured"
+    assert keys <= accepted, f"perf report would reject sort keys: {keys - accepted}"
+    assert "tgid" not in keys
+
+
+def test_memory_report_retries_when_perf_exits_zero_with_no_output(monkeypatch, tmp_path):
+    """An argument perf rejects yields rc=0 and an empty file, not a failure."""
+    sorts_tried = []
+
+    def fake_run_perf(args, timeout=None, stdout_file=None):
+        sorts_tried.append(args[args.index("--sort") + 1]
+                           if "--sort" in args else "<none>")
+        if len(sorts_tried) == 1:
+            # first (preferred) sort is rejected: rc 0, stderr error, empty stdout
+            Path(stdout_file).write_text("", encoding="utf-8")
+            return PerfResult(0, "", "Error:\nUnknown --sort key: `tgid'\n"
+                                   " Usage: perf report [<options>]\n")
+        Path(stdout_file).write_text(PEBS_REPORT, encoding="utf-8")
+        return PerfResult(0, "", "")
+
+    monkeypatch.setattr(collector, "run_perf", fake_run_perf)
+    warnings: list[str] = []
+
+    report = collector._memory_report(
+        str(tmp_path / "perf.data"), str(tmp_path), ["cpu/mem-loads,ldlat=30/P"],
+        "pebs", warnings,
+    )
+
+    assert report is not None, warnings
+    assert len(sorts_tried) >= 2, "a rejected sort key must be retried"
+    assert not warnings, warnings
+    assert "Samples:" in Path(report).read_text()
+
+
+def test_memory_report_names_the_cause_when_every_sort_fails(monkeypatch, tmp_path):
+    def fake_run_perf(args, timeout=None, stdout_file=None):
+        Path(stdout_file).write_text("", encoding="utf-8")
+        return PerfResult(0, "", "Error:\nUnknown --sort key: `bogus'\n")
+
+    monkeypatch.setattr(collector, "run_perf", fake_run_perf)
+    warnings: list[str] = []
+
+    report = collector._memory_report(
+        str(tmp_path / "perf.data"), str(tmp_path), ["cpu/mem-loads,ldlat=30/P"],
+        "pebs", warnings,
+    )
+
+    assert report is None
+    assert warnings == ["PEBS memory report failed: Unknown --sort key: `bogus'"]
+    assert "contained no samples" not in warnings[0], (
+        "an empty report caused by a rejected argument is not 'no samples'")
