@@ -23,7 +23,10 @@ CPU analyses on amd64 machine (AMD and Intel), with zero Python dependencies:
 - **Reports** — terminal summary + a single-file interactive `report.html`
   (metric overview, hotspots table, memory access summary, click-to-zoom flame
   graph, timelines, call tree, threads). The HTML thread selector scopes CPU
-  views, the Overview metrics, and the IBS/PEBS Memory tab to the selected thread.
+  views, the Overview metrics, and the IBS/PEBS Memory tab to the selected
+  thread. The Threads tab merges the per-thread CPU and wait tables: each row
+  carries sampled cycles next to on/off-CPU seconds, joined on tid, and the
+  wait columns read `n/a` when scheduler tracepoints were not collected.
 
 Artifacts (`stat.csv` or `stat_threads.csv`, `perf.data`, `script.txt`,
 `meta.json`) are kept in the profile directory so reports can be regenerated
