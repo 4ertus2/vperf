@@ -326,6 +326,27 @@ def test_flamegraph_svg():
     assert tree.value == prof.total_cycles
 
 
+def test_flamegraph_svg_carries_zoom_geometry():
+    """Click-to-zoom re-lays out frames in the browser, so each frame has to
+    carry its own row, span and weight."""
+    prof = build_profile(_samples())
+    svg, _ = render_flame_svg(prof.folded, title="all")
+
+    assert 'class="fg"' in svg
+    assert f'data-v="{prof.total_cycles}"' in svg
+    assert 'data-n="root"' in svg
+    assert 'class="ftitle"' in svg
+    # every frame declares a row, otherwise the greyed call path lands nowhere
+    assert svg.count('data-y="') == svg.count('class="fg"')
+    assert svg.count('data-d="') == svg.count('class="fg"')
+    assert svg.count('data-x="') == svg.count('class="fg"')
+    # the overlay the zoom reveals: context bands plus the way back out
+    assert 'class="fovl"' in svg
+    assert 'class="fctx"' in svg
+    assert 'class="freset"' in svg
+    assert "Reset Zoom" in svg
+
+
 # ---------------------------------------------------------------- metrics
 
 def test_compute_metrics_whole_run():

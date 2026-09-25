@@ -155,6 +155,32 @@ def test_build_html_flame_and_tree_are_user_space_only():
     assert "kernel_fn" in hotspots
 
 
+def test_flame_graph_is_click_to_zoom_with_a_reset_link():
+    samples = [
+        ScriptSample("worker", 100, 101, 1.0, 10, "cycles:P", [("alpha", "app")]),
+        ScriptSample("worker", 100, 101, 1.1, 20, "cycles:P", [("beta", "app")]),
+    ]
+    prof = build_profile(samples)
+
+    html = build_html(
+        {"target": {"cmd": ["app"]}, "mode": "run"},
+        samples,
+        MetricsReport(elapsed=1.0),
+        prof,
+    )
+
+    # the panel tells the user the graph is live and offers a way back out
+    assert "click a frame to zoom into that branch" in html
+    assert 'class="flame-reset"' in html
+    assert "resetFlameZoom(event)" in html
+    # the per-thread graphs are wired up on load
+    assert "function flameInit()" in _JS
+    assert "function flameRender(st,f)" in _JS
+    assert "flameInit();" in _JS
+    # switching thread starts the new graph un-zoomed
+    assert "resetFlameZoom();" in _JS
+
+
 def test_build_html_handles_empty_user_stack_view():
     samples = [ScriptSample("worker", 100, 101, 1.0, 10, "cycles:P", [
         ("[unresolved]", "[unresolved]"),

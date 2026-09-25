@@ -21,9 +21,9 @@ CPU analyses on amd64 machine (AMD and Intel), with zero Python dependencies:
   exposes (see `vperf doctor`)
 - **Effective CPU utilization** — average busy cores + utilization timeline
 - **Reports** — terminal summary + a single-file interactive `report.html`
-  (metric overview, hotspots table, memory access summary, flame graph,
-  timelines, call tree, threads). The HTML thread selector scopes CPU views,
-  the Overview metrics, and the IBS/PEBS Memory tab to the selected thread.
+  (metric overview, hotspots table, memory access summary, click-to-zoom flame
+  graph, timelines, call tree, threads). The HTML thread selector scopes CPU
+  views, the Overview metrics, and the IBS/PEBS Memory tab to the selected thread.
 
 Artifacts (`stat.csv` or `stat_threads.csv`, `perf.data`, `script.txt`,
 `meta.json`) are kept in the profile directory so reports can be regenerated
@@ -172,6 +172,21 @@ vperf report .vperf/run_20260824_021912
 ```
 
 Open `report.html` in any browser — fully offline, no CDN.
+
+### Flame graph
+
+The Flame Graph tab behaves like the SVG `flamegraph.pl` output:
+
+- **Click a frame** to zoom into that branch — its subtree is re-laid out to the
+  full width, the call path leading to it is greyed underneath, and the focused
+  frame is outlined in yellow. Percentages in tooltips become relative to the
+  focused frame.
+- **Click the focused frame again** to go back up one level, or click any greyed
+  ancestor band to jump straight to it.
+- **Reset Zoom** (top-right of the graph) or **Reset zoom** (panel header) returns
+  to the full graph. Switching thread in the header selector also resets the zoom.
+- The graph scales to the panel width, and frames too narrow to show a label get
+  one as soon as they are zoomed into.
 
 ### Reading the output like a VTune veteran
 
