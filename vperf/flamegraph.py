@@ -49,6 +49,25 @@ def _esc(s: str) -> str:
     return html.escape(s, quote=True)
 
 
+# Layout constants. The ones the browser needs for click-to-zoom are emitted as
+# data-* attributes on the <svg> so the client never re-guesses the geometry.
+FRAME_GAP = 0.5        # px kept between neighbouring frames
+LABEL_MIN_W = 28.0     # frames narrower than this get no text label
+CHAR_W = 0.62          # approximate glyph width as a fraction of font-size
+
+
+def _frame_text(name: str, w: float, font_size: int) -> str:
+    """Frame label truncated to fit `w` px, or '' when the frame is too narrow."""
+    if w <= LABEL_MIN_W:
+        return ""
+    max_chars = int(w / (font_size * CHAR_W)) - 2
+    if max_chars < 1:
+        return ""
+    if max_chars < len(name):
+        return name[: max(max_chars - 1, 1)] + "…"
+    return name
+
+
 def render_flame_svg(
     folded: dict[str, int],
     title: str = "",
@@ -56,7 +75,13 @@ def render_flame_svg(
     row_height: int = 17,
     font_size: int = 11,
 ) -> tuple[str, int]:
-    """Return (svg, height). Flame grows bottom-up (roots at the bottom)."""
+    """Return (svg, height). Flame grows bottom-up (roots at the bottom).
+
+    Every frame is emitted as `<g class="fg">` carrying its name, weight, depth
+    and x-extent in data attributes. `report_html` re-lays those out in the
+    browser so a click can zoom into a branch and a "Reset Zoom" link can undo
+    it, mirroring what `flamegraph.pl` does with a plain PNG.
+    """
     root = build_tree(folded)
     total = max(root.value, 1)
 
@@ -66,7 +91,6 @@ def render_flame_svg(
     def walk(node: _Node, x0: float, depth: int) -> None:
         if len(levels) <= depth:
             levels.append([])
-        node.value / total
         levels[depth].append((node, x0))
         cx = x0
         for child in sorted(node.children.values(), key=lambda c: -c.value):
@@ -78,11 +102,13 @@ def render_flame_svg(
 
     out = [
         (f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-        f'viewBox="0 0 {width} {height}" font-family="Verdana,sans-serif" font-size="{font_size}">')
+         f'viewBox="0 0 {width} {height}" font-family="Verdana,sans-serif" font-size="{font_size}" '
+         f'data-row="{row_height}" data-font="{font_size}" data-gap="{FRAME_GAP}" '
+         f'data-lmin="{LABEL_MIN_W}" data-cw="{CHAR_W}">')
     ]
     if title:
         out.append(
-            f'<text x="4" y="14" fill="#ccc">{_esc(title)}</text>'
+            f'<text class="ftitle" x="4" y="14" fill="#ccc">{_esc(title)}</text>'
         )
 
     def pct(v: int) -> float:
@@ -92,23 +118,30 @@ def render_flame_svg(
         y = height - (li + 1) * row_height
         for node, x0 in level:
             w = node.value / total * width
-            if w < 0.15:
-                continue
+            if w <= 0.01:
+                continue  # below a hundredth of a pixel: nothing to show or click
             label = f"{node.name} ({pct(node.value):.1f}%, {node.value:,})"
             out.append(
-                f'<g><title>{_esc(label)}</title>'
-                f'<rect x="{x0:.2f}" y="{y}" width="{max(w - 0.5, 0.5):.2f}" '
+                f'<g class="fg" data-n="{_esc(node.name)}" data-v="{node.value}" '
+                f'data-d="{li}" data-y="{y}" data-x="{x0:.4f}" data-w="{w:.4f}">'
+                f'<title>{_esc(label)}</title>'
+                f'<rect x="{x0:.2f}" y="{y}" width="{max(w - FRAME_GAP, FRAME_GAP):.2f}" '
                 f'height="{row_height - 2}" rx="1" fill="{_color(node.name)}"/>'
             )
-            if w > 28:
-                text = node.name
-                max_chars = int(w / (font_size * 0.62)) - 2
-                if max_chars < len(text):
-                    text = text[: max(max_chars - 1, 1)] + "…"
-                if max_chars >= 1:
-                    out.append(
-                        f'<text x="{x0 + 2:.2f}" y="{y + row_height - 5}" fill="#111">{_esc(text)}</text>'
-                    )
+            text = _frame_text(node.name, w, font_size)
+            if text:
+                out.append(
+                    f'<text x="{x0 + 2:.2f}" y="{y + row_height - 5}" fill="#111">{_esc(text)}</text>'
+                )
             out.append("</g>")
+
+    # Overlay: the greyed call path plus the "Reset Zoom" link, both revealed by
+    # flameRender() once the user zooms into a branch.
+    out.append(
+        '<g class="fovl" style="display:none">'
+        '<g class="fctx"></g>'
+        f'<text class="freset" x="{width - 6}" y="14" text-anchor="end" fill="#409cff">Reset Zoom</text>'
+        f'<rect class="fhit" x="{width - 100}" y="0" width="100" height="22" fill="none"/>'
+        '</g>')
     out.append("</svg>")
     return "".join(out), height

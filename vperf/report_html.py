@@ -65,7 +65,18 @@ tr:hover td{background:#212941}
 .mono{font-family:'SF Mono',Consolas,Menlo,monospace;font-size:12px}
 select{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 10px}
 .flame{overflow-x:auto}
-.flame svg{min-width:900px}
+.flame svg{width:100%;height:auto;min-width:900px;display:block}
+.flame g.fg{cursor:pointer}
+.flame g.fg:hover rect{stroke:#fff;stroke-width:.8}
+.flame g.fg.ffocus rect{stroke:#ffd24f;stroke-width:1.4}
+.flame .fhit{pointer-events:all}
+.flame .freset{cursor:pointer}
+.flame .freset:hover{text-decoration:underline}
+.flame-head{display:flex;align-items:baseline;gap:12px;margin-bottom:12px}
+.flame-head h3{margin:0}
+.flame-hint{color:var(--dim);font-size:12px}
+.flame-reset{color:var(--accent);cursor:pointer;font-size:12px;text-decoration:none}
+.flame-reset:hover{text-decoration:underline}
 details{padding-left:14px}summary{cursor:pointer;padding:2px 4px;border-radius:4px;white-space:nowrap}
 summary:hover{background:#253048}
 .selfpct{color:var(--dim);font-size:11px;margin-left:6px}
@@ -318,6 +329,116 @@ function renderOverview(){
   }
 }
 
+var flameStates=[];
+
+/* data-x/data-w carry four decimals, so a frame's edge can sit a rounding step
+   outside its parent's span; FLAME_EPS absorbs that without being wide enough
+   to swallow a neighbouring sibling. */
+var FLAME_EPS=1e-3;
+
+function flameLabel(st,n,w){
+ if(w<=st.lmin) return '';
+ var maxc=Math.floor(w/(st.font*st.cw))-2;
+ if(maxc<1) return '';
+ if(maxc<n.length) return n.slice(0,Math.max(maxc-1,1))+'…';
+ return n;}
+
+function flameInitOne(div){
+ var svg=div.querySelector('svg');
+ if(!svg) return;
+ var ds=svg.dataset;
+ var st={svg:svg,frames:[],focus:null,anc:[],byEl:new Map(),
+  row:+ds.row,font:+ds.font,gap:+ds.gap,lmin:+ds.lmin,cw:+ds.cw,total:1,
+  ovl:svg.querySelector('.fovl'),ctx:svg.querySelector('.fctx'),
+  head:svg.querySelector('.ftitle'),reset:svg.querySelector('.freset')};
+ var gs=svg.querySelectorAll('g.fg');
+ for(var i=0;i<gs.length;i++){
+  var g=gs[i];
+  var fr={g:g,rect:g.querySelector('rect'),txt:g.querySelector('text'),
+   n:g.dataset.n,v:+g.dataset.v,d:+g.dataset.d,
+   x:+g.dataset.x,w:+g.dataset.w,y:+g.dataset.y};
+  st.frames.push(fr);st.byEl.set(g,fr);
+  if(fr.d===0) st.total=fr.v;}  /* the depth-0 root spans the whole graph */
+ if(st.head) st.orig=st.head.textContent;
+
+ function focusFrame(f){
+  if(!f||f.d===0) flameRender(st,null);
+  else if(f===st.focus) flameRender(st,flameParent(st,f));  /* click again -> up one level */
+  else flameRender(st,f);}
+
+ svg.addEventListener('click',function(e){
+  var hit=e.target.closest?e.target.closest('g.fg,g.fcx'):null;
+  if(!hit) return;
+  focusFrame(hit.classList.contains('fcx')?st.anc[+hit.dataset.i]:st.byEl.get(hit));});
+ [st.reset,svg.querySelector('.fhit')].forEach(function(el){
+  if(el) el.addEventListener('click',function(e){e.stopPropagation();flameRender(st,null);});});
+ flameStates.push(st);}
+
+function flameInit(){
+ var divs=document.querySelectorAll('#flamewrap .flame');
+ for(var i=0;i<divs.length;i++) flameInitOne(divs[i]);}
+
+function flameParent(st,f){
+ var p=null;
+ st.frames.forEach(function(o){
+  if(o.d>=f.d) return;
+  if(o.x>f.x+FLAME_EPS||o.x+o.w<f.x+f.w-FLAME_EPS) return;
+  if(!p||o.d>p.d) p=o;});
+ return p;}
+
+function flameRender(st,f){
+ var W=+st.svg.getAttribute('width'),ep=FLAME_EPS,gap=st.gap;
+ st.focus=f;
+ var tot=f?f.v:st.total,anc=[],s='';
+ st.frames.forEach(function(fr){
+  var show=true,x=fr.x,w=fr.w;
+  if(f){
+   if(fr.d===f.d){show=(fr===f);x=0;w=W;}
+   else if(fr.d>f.d){
+    /* the layout keeps every subtree inside its parent's span, so containment
+       in x plus a deeper level is exactly "is a descendant of f" */
+    show=(fr.x>=f.x-ep&&fr.x+fr.w<=f.x+f.w+ep);
+    x=(fr.x-f.x)/f.w*W;w=fr.w/f.w*W;
+   } else {
+    show=false;
+    if(fr.x<=f.x+ep&&fr.x+fr.w>=f.x+f.w-ep) anc.push(fr);}}  /* greyed call path */
+  fr.g.style.display=show?'':'none';
+  if(!show) return;
+  var dw=Math.max(w-gap,gap);
+  fr.rect.setAttribute('x',x.toFixed(2));
+  fr.rect.setAttribute('width',dw.toFixed(2));
+  fr.g.classList.toggle('ffocus',fr===f);
+  fr.g.querySelector('title').textContent=
+   fr.n+' ('+(fr.v/tot*100).toFixed(1)+'%, '+fr.v.toLocaleString()+')';
+  var t=flameLabel(st,fr.n,dw);
+  if(t){
+   if(!fr.txt){
+    fr.txt=document.createElementNS('http://www.w3.org/2000/svg','text');
+    fr.txt.setAttribute('y',fr.y+st.row-5);
+    fr.txt.setAttribute('fill','#111');
+    fr.g.appendChild(fr.txt);}
+   fr.txt.setAttribute('x',(x+2).toFixed(2));
+   fr.txt.textContent=t;
+  } else if(fr.txt) fr.txt.textContent='';
+ });
+ st.anc=anc;
+ for(var i=0;i<anc.length;i++){
+  var a=anc[i];
+  /* ancestors are drawn full width, but their weight is reported against the
+     whole graph — otherwise the root would read as >100% of the zoom */
+  s+='<g class="fcx" data-i="'+i+'"><title>'
+   +escHtml(a.n+' ('+(a.v/st.total*100).toFixed(1)+'%, '+a.v.toLocaleString()+')')
+   +'</title><rect x="0" y="'+a.y+'" width="'+W+'" height="'+(st.row-2)
+   +'" rx="1" fill="#3c4459"/><text x="2" y="'+(a.y+st.row-5)
+   +'" fill="#c3cbe0">'+escHtml(flameLabel(st,a.n,W))+'</text></g>';}
+ st.ctx.innerHTML=s;
+ st.ovl.style.display=f?'':'none';
+ if(st.head) st.head.textContent=st.orig+(f?' ▸ '+f.n:'');}
+
+function resetFlameZoom(e){
+ if(e) e.preventDefault();
+ for(var i=0;i<flameStates.length;i++) flameRender(flameStates[i],null);}
+
 function setThread(tid){
   threadFilter=tid;
   var sel=document.getElementById('thread-sel');
@@ -329,6 +450,7 @@ function setThread(tid){
   var flameId=tid!==null?String(tid):'all';
   document.querySelectorAll('#flamewrap .flame').forEach(d=>{
    d.style.display=(d.dataset.thread===flameId)?'block':'none';});
+  resetFlameZoom();
 }
 
 
@@ -380,6 +502,7 @@ function initDrag(){
 
 function init(){
   initDrag();
+  flameInit();
   renderHotspots();
   renderChart();
   renderMemory();
@@ -870,7 +993,11 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 {_wait_tab(wp)}
 
 <div id="flame" class="page">
-<div class="panel"><h3>Flame graph</h3><div id="flamewrap">{''.join(flame_divs)}</div></div>
+<div class="panel"><div class="flame-head"><h3>Flame graph</h3>
+<span class="flame-hint">click a frame to zoom into that branch — click it again to go back up</span>
+<span style="flex:1"></span>
+<a href="#" class="flame-reset" onclick="resetFlameZoom(event)">Reset zoom</a></div>
+<div id="flamewrap">{''.join(flame_divs)}</div></div>
 </div>
 
 <div id="tree" class="page">
