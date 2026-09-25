@@ -46,8 +46,11 @@ $(BINDIR)/simd_levels_avx: $(SRCDIR)/simd_levels.cpp | $(BINDIR)
 $(BINDIR)/simd_levels_avx512: $(SRCDIR)/simd_levels.cpp | $(BINDIR)
 	$(CXX) $(CXXFLAGS) -mavx512f -mavx512dq -DUSE_AVX512 -o $@ $<
 
+# multi-tier: one binary, all four tiers, AVX-512 dispatched at runtime.
+# Must NOT be built with TU-wide -mavx512f, or the compiler emits zmm code
+# into the non-AVX512 tiers and the binary dies on CPUs without AVX-512.
 $(BINDIR)/simd_levels_all: $(SRCDIR)/simd_levels_all.cpp | $(BINDIR)
-	$(CXX) $(CXXFLAGS) -mavx512f -mavx512dq -pthread -o $@ $<
+	$(CXX) $(CXXFLAGS) -pthread -o $@ $<
 
 clean:
 	rm -rf $(BINDIR)

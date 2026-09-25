@@ -87,10 +87,44 @@ the tracefs mount after reboot.
 A profile collected before access was enabled has no `wait.txt`; rerun the
 profiling command to generate a new Wait report.
 
-### Install with uv (recommended)
+### Run without installing (no venv)
+
+`vperf` has **zero runtime dependencies** — everything it imports is in the
+Python standard library, so a virtualenv buys you nothing but an isolated
+place to put pytest and ruff. To run straight from a checkout with the system
+`python3`:
 
 ```bash
-# Create a virtual environment (required on Ubuntu/Debian).
+cd /path/to/vperf
+
+python3 -m vperf doctor
+python3 -m vperf run -- ./yourapp
+python3 -m vperf report .vperf/run_20260824_021912
+```
+
+`python3 -m vperf` runs from the repository root. From anywhere else, put the
+checkout on the import path:
+
+```bash
+PYTHONPATH=/path/to/vperf python3 -m vperf run -- ./yourapp
+```
+
+Or make a one-line wrapper, so you can type `vperf` without a venv:
+
+```bash
+printf '#!/bin/sh\nexec python3 -m vperf "$@"\n' > ~/.local/bin/vperf
+chmod +x ~/.local/bin/vperf
+export PATH="$HOME/.local/bin:$PATH"   # add to ~/.bashrc to persist
+```
+
+The examples in this README use the bare `vperf` command. Everything below
+works identically as `python3 -m vperf`; only the venv-activated console
+script provides the short name.
+
+### Install with uv (recommended, for development)
+
+```bash
+# Create a virtual environment (required on Ubuntu/Debian for pip installs).
 uv venv
 
 # Install vperf in editable mode inside the venv
@@ -231,12 +265,19 @@ Notes & caveats:
 
 ## Development
 
+pytest and ruff are the only things a virtualenv is actually for; `vperf`
+itself runs uninstalled.
+
 ```bash
 uv venv && uv pip install -e . pytest ruff
 source .venv/bin/activate
 vperf doctor                           # verify setup
 pytest tests/ -q                       # unit + integration (needs perf access)
 ruff check vperf/ tests/
+
+# Without a venv, the profiler itself still works — only the tooling needs one:
+python3 -m vperf doctor
+PYTHONPATH=$PWD python3 -m pytest tests/ -q
 
 # Note: run the suite WITHOUT pytest-xdist/-n. The integration tests assert
 # exact PMU counter relationships; concurrent profiling sessions multiplex
