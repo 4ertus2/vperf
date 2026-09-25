@@ -9,9 +9,11 @@ from vperf.report_html import (
     _memory_html_map,
     _memory_tab,
     _overview_content,
+    _threads_table,
     build_html,
 )
 from vperf.stacks import StackProfile, ThreadInfo, build_profile
+from vperf.wait import ThreadWait, WaitProfile
 
 
 def _profile() -> MemoryProfile:
@@ -308,3 +310,122 @@ def test_overview_labels_cache_rows_per_event_set():
     amd.branch_penalty_cycles = 13.0
     html_amd = _overview_content(amd, 4, "all threads", prof)
     assert "DRAM/MMIO fills" in html_amd
+
+
+# ------------------------------------------------- threads + wait in one tab
+
+def _cpu_samples():
+    return [
+        ScriptSample("worker", 100, 101, 1.0, 10, "cycles:P", [("alpha", "app")]),
+        ScriptSample("io-pool", 100, 102, 1.2, 30, "cycles:P", [("gamma", "app")]),
+    ]
+
+
+def _wait_profile() -> WaitProfile:
+    wp = WaitProfile(window_s=2.0)
+    wp.threads[101] = ThreadWait(tid=101, comm="worker", runtime_s=0.9, sleep_s=0.4,
+                                 blocked_s=0.02, iowait_s=0.01, sleep_count=12,
+                                 blocked_count=3, preempted=7)
+    # a thread the sampler never saw, but the scheduler did
+    wp.threads[999] = ThreadWait(tid=999, comm="ghost", sleep_s=1.2, sleep_count=3)
+    return wp
+
+
+def _threads_page(html: str) -> str:
+    start = html.index('<div id="threads"')
+    return html[start:html.index("<footer>", start)]
+
+
+def test_threads_table_merges_cpu_and_wait_columns():
+    samples = _cpu_samples()
+    prof = build_profile(samples)
+    html = _threads_table(prof, _wait_profile())
+
+    # the two former tables now sit side by side under one set of headers
+    assert "Profiler — CPU samples" in html
+    assert "Scheduler tracepoints — wait</th>" in html
+    for heading in ("Cycles", "% of sampled cycles", "On-CPU", "Sleep",
+                    "Blocked/IO", "Off-CPU", "Off-CPU % of window",
+                    "Preempted", "Sleeps", "Blocks"):
+        assert f">{heading}</th>" in html
+    # worker: sleep 0.4 + blocked 0.03 = 0.43 off-CPU of a 2.0s window
+    assert "0.900 s" in html
+    assert "0.400 s" in html
+    assert "0.030 s" in html
+    assert "0.430 s" in html
+    assert "21.5%" in html
+    # a thread only the scheduler saw keeps a row, with no PID to show
+    assert "ghost" in html
+    assert "999" in html
+    ghost_row = next(r for r in html.split("<tbody>")[1].split("</tbody>")[0].split("<tr>")
+                     if "ghost" in r)
+    cells = ghost_row.split("</td>")
+    assert cells[0].endswith(">ghost")
+    # no PID to show, and n/a for the wait columns it has no samples for
+    assert cells[1] == "<td class='na'>n/a"
+    assert cells[2] == "<td>999"
+
+
+def test_threads_table_marks_wait_fields_na_without_wait_data():
+    samples = _cpu_samples()
+    prof = build_profile(samples)
+
+    html = _threads_table(prof, None)
+
+    assert "n/a: not collected" in html
+    # every row carries one n/a per wait column, and none of them sort
+    rows = [r for r in html.split("<tr>") if "<td" in r]
+    assert rows
+    for row in rows:
+        # one n/a per wait column, none of them carrying a sort value
+        assert row.count(">n/a<") == 8
+        assert "data-v" not in row.split(">n/a<", 1)[1]
+    # the CPU half still reports real numbers
+    assert "worker" in html and "io-pool" in html
+
+
+def test_wait_tab_is_folded_into_the_threads_tab():
+    samples = _cpu_samples()
+    prof = build_profile(samples)
+    wp = _wait_profile()
+    html = build_html({"target": {"cmd": ["app"]}, "mode": "run"}, samples,
+                      MetricsReport(elapsed=2.0), prof, wp=wp)
+    page = _threads_page(html)
+
+    assert "showTab(this,'threads')" in html
+    assert "showTab(this,'wait')" not in html
+    assert 'id="wait"' not in html
+    # the run-level wait content moved into the same page, under the table
+    assert "Where the time went" in page
+    assert "Sleep/block delay distribution" in page
+    assert page.index("On-CPU / off-CPU come from scheduler tracepoints") \
+        < page.index("Where the time went")
+
+
+def test_threads_page_explains_missing_wait_data():
+    samples = _cpu_samples()
+    prof = build_profile(samples)
+    html = build_html({"target": {"cmd": ["app"]}, "mode": "run"}, samples,
+                      MetricsReport(elapsed=2.0), prof, wp=None)
+    page = _threads_page(html)
+
+    assert "Wait columns are n/a: scheduler tracepoints were not collected" in page
+    assert "Where the time went" not in page
+
+
+def test_threads_table_nas_a_thread_the_scheduler_never_saw():
+    """Wait data can exist while an individual thread has no record in it."""
+    samples = _cpu_samples()
+    prof = build_profile(samples)
+    wp = _wait_profile()
+    # io-pool (tid 102) has CPU samples but no ThreadWait entry
+    assert 102 not in wp.threads
+
+    html = _threads_table(prof, wp)
+    body = html.split("<tbody>")[1].split("</tbody>")[0]
+    io_row = next(r for r in body.split("<tr>") if "io-pool" in r)
+
+    assert io_row.count(">n/a<") == 8
+    assert "<td></td>" not in html  # never a silently blank cell
+    # the thread that does have wait data is unaffected
+    assert "0.900 s" in html

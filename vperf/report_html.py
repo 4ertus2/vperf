@@ -74,12 +74,13 @@ select{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-
 .flame .freset:hover{text-decoration:underline}
 .flame-head{display:flex;align-items:baseline;gap:12px;margin-bottom:12px}
 .flame-head h3{margin:0}
-.flame-hint{color:var(--dim);font-size:12px}
+.note{color:var(--dim);font-size:12px}
 .flame-reset{color:var(--accent);cursor:pointer;font-size:12px;text-decoration:none}
 .flame-reset:hover{text-decoration:underline}
 details{padding-left:14px}summary{cursor:pointer;padding:2px 4px;border-radius:4px;white-space:nowrap}
 summary:hover{background:#253048}
 .selfpct{color:var(--dim);font-size:11px;margin-left:6px}
+.na{color:var(--dim)}
 .hint{border-left:3px solid var(--accent);padding:8px 12px;margin:8px 0;background:var(--panel);border-radius:0 6px 6px 0}
 footer{color:var(--dim);padding:16px 24px;font-size:12px}
 #chart-header{padding:12px 24px;border-bottom:1px solid var(--line);background:var(--panel)}
@@ -676,18 +677,91 @@ def _hotspots_table(prof: StackProfile) -> str:
             f"<tbody>{''.join(rows)}</tbody></table>")
 
 
-def _threads_table(prof: StackProfile) -> str:
-    total = max(prof.total_cycles, 1)
+def _wait_note(wp: WaitProfile | None) -> str:
+    """One line telling the reader why the wait half of the table is n/a."""
+    if wp is not None and wp.window_s and wp.threads:
+        return ("On-CPU / off-CPU come from scheduler tracepoints; cycles come "
+                "from the sampling profiler.")
+    return ("Wait columns are n/a: scheduler tracepoints were not collected "
+            "(see vperf doctor for the required capability).")
+
+
+def _threads_table(prof: StackProfile, wp: WaitProfile | None = None) -> str:
+    """One row per thread: PMU samples beside the scheduler's on/off-CPU
+    accounting, joined on tid. Threads seen by only one of the two sources
+    still get a row. Wait columns read n/a when the scheduler tracepoints
+    were not collected, since there is nothing to report for them.
+    """
+    waits = wp.threads if (wp is not None and wp.window_s and wp.threads) else {}
+    window = (wp.window_s if wp is not None and wp.window_s else 0.0) or 0.0
+    total_cycles = max(prof.total_cycles, 1)
+    cpu = prof.by_thread
+
+    def observed(tid: int) -> float:
+        """Wall time the scheduler attributed to this thread."""
+        t = waits.get(tid)
+        if t is None:
+            return 0.0
+        return t.runtime_s + t.sleep_s + t.blocked_s + t.iowait_s
+
+    def order(tid: int) -> tuple[float, int]:
+        # with wait data, order by how much wall time the thread accounts for;
+        # without it, fall back to sampled cycles
+        return (observed(tid), cpu[tid].cycles if tid in cpu else 0) if waits \
+            else (float(cpu[tid].cycles if tid in cpu else 0), 0)
+
+    def wait_cell(body: str, sort_value: float | int | None = None) -> str:
+        v = "" if sort_value is None else f" data-v='{sort_value}'"
+        return f"<td{v}>{body}</td>"
+
+    na = "<td class='na'>n/a</td>"
+
     rows = []
-    for t in top_threads(prof, 20):
-        rows.append(
-            f"<tr><td class='mono'>{esc(t.comm)}</td><td>{t.pid}</td><td>{t.tid}</td>"
-            f"<td data-v='{t.cycles}' class='mono'>{_fmt_count(t.cycles)}</td>"
-            f"<td data-v='{t.cycles/total*100:.3f}'>{t.cycles/total*100:.1f}%</td></tr>"
-        )
-    head = "".join(f"<th onclick='sortTable(this,{i})'>{t}</th>" for i, t in
-                   [(0, "Thread"), (0, "PID"), (0, "TID"), (1, "Cycles"), (1, "% of sampled cycles")])
-    return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+    for tid in sorted(set(cpu) | set(waits), key=order, reverse=True)[:20]:
+        t_cpu = cpu.get(tid)
+        t_wait = waits.get(tid)
+        comm = (t_cpu.comm if t_cpu else None) or (t_wait.comm if t_wait else "?")
+        cycles = t_cpu.cycles if t_cpu else 0
+        share = cycles / total_cycles * 100
+        cells = [f"<td class='mono'>{esc(comm)}</td>",
+                 f"<td>{t_cpu.pid}</td>" if t_cpu else na,
+                 f"<td>{tid}</td>",
+                 f"<td data-v='{cycles}' class='mono'>{_fmt_count(cycles)}</td>",
+                 f"<td data-v='{share:.3f}'>{share:.1f}%</td>"]
+        if t_wait is not None:
+            blocked = t_wait.blocked_s + t_wait.iowait_s
+            off = t_wait.sleep_s + blocked
+            off_pct = off / window * 100 if window else 0.0
+            bar = min(off_pct * 1.2, 100)
+            cells += [
+                wait_cell(f"{t_wait.runtime_s:,.3f} s", f"{t_wait.runtime_s:.6f}"),
+                wait_cell(f"{t_wait.sleep_s:,.3f} s", f"{t_wait.sleep_s:.6f}"),
+                wait_cell(f"{blocked:,.3f} s", f"{blocked:.6f}"),
+                wait_cell(f"{off:,.3f} s", f"{off:.6f}"),
+                wait_cell(f"<span class='bar' style='width:{bar:.1f}px'></span> "
+                          f"{off_pct:.1f}%", f"{off_pct:.3f}"),
+                wait_cell(f"{t_wait.preempted:,}", t_wait.preempted),
+                wait_cell(f"{t_wait.sleep_count:,}", t_wait.sleep_count),
+                wait_cell(f"{t_wait.blocked_count:,}", t_wait.blocked_count),
+            ]
+        else:
+            # the sampler saw this thread but the scheduler recorded nothing
+            # for it, or no wait data was collected at all
+            cells += [na] * 8
+        rows.append(f"<tr>{''.join(cells)}</tr>")
+
+    head = "".join(f"<th onclick='sortTable(this,{num})'>{t}</th>" for num, t in
+                   [(0, "Thread"), (0, "PID"), (0, "TID"), (1, "Cycles"),
+                    (1, "% of sampled cycles"), (1, "On-CPU"), (1, "Sleep"),
+                    (1, "Blocked/IO"), (1, "Off-CPU"), (1, "Off-CPU % of window"),
+                    (1, "Preempted"), (1, "Sleeps"), (1, "Blocks")])
+    group = (
+        "<tr><th colspan='5'>Profiler — CPU samples</th>"
+        f"<th colspan='8'{' class=na' if not waits else ''}>"
+        f"Scheduler tracepoints — wait{' (n/a: not collected)' if not waits else ''}"
+        "</th></tr>")
+    return (f"<table><thead>{group}<tr>{head}</tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>")
 
 
 def _tree_html(node: TreeNode, total: int, depth: int = 0) -> str:
@@ -780,11 +854,14 @@ def _memory_html_map(mem: MemoryProfile | None, backend: str | None = "ibs",
     return result
 
 
-def _wait_tab(wp: WaitProfile | None) -> str:
+def _wait_panels(wp: WaitProfile | None) -> str:
+    """Run-level wait content: where the window went and the delay spread.
+
+    Per-thread wait data lives in the merged Threads table, so this is only
+    the aggregate view. Returns '' when the tracepoints were not collected.
+    """
     if wp is None or wp.window_s is None or not wp.threads:
-        return ('<div class="page" id="wait"><div class="panel">'
-                '<h3>Wait / Off-CPU</h3><em>Not collected (scheduler '
-                'tracepoints unavailable; needs CAP_PERFMON).</em></div></div>')
+        return ""
     w = max(wp.window_s, 1e-9)
     parts = [
         ("On-CPU", wp.runtime_s / w * 100, "#59d499"),
@@ -808,31 +885,10 @@ def _wait_tab(wp: WaitProfile | None) -> str:
                 f"<tbody>{rows}</tbody></table>")
 
     bands = [(nm, wp.bands.get(nm, 0)) for nm, _lo, _hi in WAIT_BANDS_MS]
-    trows = ""
-    for t in wp.top_threads(20):
-        off = t.sleep_s + t.blocked_s + t.iowait_s
-        share = off / w * 100 if w else 0
-        trows += (f"<tr><td class='mono'>{esc(t.comm)} ({t.tid})</td>"
-                  f"<td data-v='{t.runtime_s:.6f}' class='mono'>{t.runtime_s:,.3f} s</td>"
-                  f"<td data-v='{off:.6f}' class='mono'>{off:,.3f} s</td>"
-                  f"<td data-v='{share:.3f}'>{share:.1f}%</td>"
-                  f"<td data-v='{t.preempted}'>{t.preempted:,}</td></tr>")
-    thread_table = (
-        "<table><thead><tr>"
-        "<th onclick='sortTable(this,0)'>Thread</th>"
-        "<th onclick='sortTable(this,1)'>On-CPU</th>"
-        "<th onclick='sortTable(this,1)'>Off-CPU (sleep+blocked)</th>"
-        "<th onclick='sortTable(this,1)'>Off-CPU % of window</th>"
-        "<th onclick='sortTable(this,1)'>Preempted</th>"
-        "</tr></thead><tbody>" + trows + "</tbody></table>")
-
-    return f'''<div id="wait" class="page">
-<div class="panel"><h3>Where the time went (window {wp.window_s:.2f}s)</h3>
+    return f'''<div class="panel"><h3>Where the time went (window {wp.window_s:.2f}s)</h3>
 <div style="display:flex;height:22px;border-radius:5px;overflow:hidden;margin-bottom:8px">{segs}</div>
 <div style="font-size:12px;color:var(--dim)">{legend}</div></div>
-<div class="panel"><h3>Sleep/block delay distribution</h3>{bars(bands)}</div>
-<div class="panel"><h3>Threads by wait time</h3>{thread_table}</div>
-</div>'''
+<div class="panel"><h3>Sleep/block delay distribution</h3>{bars(bands)}</div>'''
 
 
 def _thread_options(prof: StackProfile, mem: MemoryProfile | None = None,
@@ -977,7 +1033,6 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 <div class="tab" onclick="showTab(this,'flame')">Flame Graph</div>
 <div class="tab" onclick="showTab(this,'tree')">Call Tree</div>
 <div class="tab" onclick="showTab(this,'threads')">Threads</div>
-<div class="tab" onclick="showTab(this,'wait')">Wait</div>
 </div>
 
 <div id="overview" class="page active">
@@ -990,11 +1045,9 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 
 {_memory_tab(mem, memory_backend)}
 
-{_wait_tab(wp)}
-
 <div id="flame" class="page">
 <div class="panel"><div class="flame-head"><h3>Flame graph</h3>
-<span class="flame-hint">click a frame to zoom into that branch — click it again to go back up</span>
+<span class="note">click a frame to zoom into that branch — click it again to go back up</span>
 <span style="flex:1"></span>
 <a href="#" class="flame-reset" onclick="resetFlameZoom(event)">Reset zoom</a></div>
 <div id="flamewrap">{''.join(flame_divs)}</div></div>
@@ -1006,7 +1059,10 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 </div>
 
 <div id="threads" class="page">
-<div class="panel"><h3>Threads</h3>{_threads_table(prof)}</div>
+<div class="panel"><h3>Threads — CPU samples and wait time</h3>
+<div class="note" style="margin-bottom:8px">{_wait_note(wp)}</div>
+{_threads_table(prof, wp)}</div>
+{_wait_panels(wp)}
 </div>
 
 <footer>Generated by vperf — artifacts: {esc(meta.get('_outdir', ''))}</footer>
