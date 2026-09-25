@@ -6,9 +6,14 @@ import html
 import json
 
 from .flamegraph import render_flame_svg
-from .memory import LATENCY_BANDS, MemoryProfile
+from .memory import LATENCY_BANDS, MemoryProfile, backend_label
 from .wait import WAIT_BANDS_MS, WaitProfile
-from .metrics import MetricsReport, all_hints
+from .metrics import (
+    MetricsReport,
+    all_hints,
+    branch_penalty_note,
+    cache_hierarchy_rows,
+)
 from .stacks import StackProfile, TreeNode, top_threads
 
 
@@ -433,10 +438,37 @@ def _cards(m: MetricsReport, ncpu: int, prof: StackProfile | None) -> str:
     return f'<div class="cards">{cells}</div>'
 
 
+def _cache_rows_html(m: MetricsReport) -> str:
+    """LLC/L1/L2 rows, labelled with the event set that produced them.
+
+    AMD's ls_any_fills_from_sys.* numbers and Intel's LLC-load counters share
+    a row shape but not a definition, so each row names its own source.
+    """
+    out = ""
+    for _key, label, value, note in cache_hierarchy_rows(m):
+        if value is None:
+            continue
+        suffix = "%" if "%" in label else ""
+        note_html = (f"<td class=\"mono\" style=\"color:var(--dim)\">{esc(note)}</td>"
+                     if note else "<td></td>")
+        out += (f"<tr><td>{esc(label)}</td>"
+                f"<td data-v=\"{value:.4f}\">{_fmt(value)}{suffix}</td>{note_html}</tr>")
+    return out
+
+
 def _overview_content(m: MetricsReport, ncpu: int, scope: str = "all threads",
                       prof: StackProfile | None = None) -> str:
     hints_html = "".join(f'<div class="hint">{esc(h)}</div>' for h in all_hints(m)) or \
                  '<div class="hint">No anomalies flagged.</div>'
+    penalty_note = branch_penalty_note(m)
+    fp_rows = ""
+    if m.fp_ops_total is not None or m.vectorization_pct is not None:
+        fp_rows = f'''
+<tr><td>FP ops retired</td><td data-v="{m.fp_ops_total or 0}">{_fmt_count(m.fp_ops_total)}</td>
+<td class="mono" style="color:var(--dim)">{_fmt_count(m.fp_ops_per_sec)}/s</td></tr>
+<tr><td>Vectorization ratio</td><td data-v="{m.vectorization_pct or 0}">{_fmt(m.vectorization_pct)}%</td>
+<td class="mono" style="color:var(--dim)">scalar {_fmt(m.fp_scalar_pct, "%")} ·
+ 128b {_fmt(m.fp_128_pct, "%")} · 256b {_fmt(m.fp_256_pct, "%")} · 512b {_fmt(m.fp_512_pct, "%")}</td></tr>'''
     return f'''<div style="color:var(--dim);font-size:12px;margin-bottom:12px">Scope: {esc(scope)}</div>
 {_cards(m, ncpu, prof)}
 <div class="panel"><h3>Pipeline budget (TMA-like quadrants)</h3>
@@ -449,17 +481,12 @@ def _overview_content(m: MetricsReport, ncpu: int, scope: str = "all threads",
 <tr><td>Frontend bound</td><td data-v="{m.frontend_bound_pct or 0}">{_fmt(m.frontend_bound_pct)}%</td>
 <td class="mono" style="color:var(--dim)">slots lost to fetch/decode stalls</td></tr>
 <tr><td>Bad speculation</td><td data-v="{m.bad_speculation_pct or 0}">{_fmt(m.bad_speculation_pct)}%</td>
-<td class="mono" style="color:var(--dim)">est. wrong-path share (mispredict penalty model)</td></tr>
+<td class="mono" style="color:var(--dim)">{esc(penalty_note)}</td></tr>
 <tr><td>IPC / CPI</td><td>{_fmt(m.ipc)} / {_fmt(m.cpi)}</td>
 <td class="mono" style="color:var(--dim)">instructions per cycle</td></tr>
 <tr><td>Branch mispredict rate</td><td>{_fmt(m.branch_mispredict_pct)}%</td>
 <td class="mono" style="color:var(--dim)">of all branch instructions</td></tr>
-<tr><td>LLC miss rate</td><td>{_fmt(m.llc_miss_pct)}%</td>
-<td class="mono" style="color:var(--dim)">DRAM fills / L3 lookups</td></tr>
-<tr><td>LLC misses (DRAM fills)</td><td>{_fmt_count(m.llc_misses)}</td>
-<td class="mono" style="color:var(--dim)">L3 hits {_fmt_count(m.llc_hits)}</td></tr>
-<tr><td>L1 misses (DC fills)</td><td>{_fmt_count(m.l1_misses)}</td>
-<td class="mono" style="color:var(--dim)">L2 misses {_fmt_count(m.l2_misses)}</td></tr>
+{_cache_rows_html(m)}
 <tr><td>L1D miss rate</td><td>{_fmt(m.l1d_miss_rate_pct)}%</td>
 <td class="mono" style="color:var(--dim)">per instruction</td></tr>
 <tr><td>dTLB miss rate</td><td>{_fmt(m.dtlb_miss_rate_pct)}%</td>
@@ -468,11 +495,7 @@ def _overview_content(m: MetricsReport, ncpu: int, scope: str = "all threads",
 <td class="mono" style="color:var(--dim)">CPU migrations/s {_fmt(m.migrations_per_sec)}</td></tr>
 <tr><td>Page faults/s</td><td>{_fmt(m.page_faults_per_sec)}</td>
 <td class="mono" style="color:var(--dim)">soft+hard</td></tr>
-<tr><td>FP ops retired</td><td data-v="{m.fp_ops_total or 0}">{_fmt_count(m.fp_ops_total)}</td>
-<td class="mono" style="color:var(--dim)">{_fmt_count(m.fp_ops_per_sec)}/s</td></tr>
-<tr><td>Vectorization ratio</td><td data-v="{m.vectorization_pct or 0}">{_fmt(m.vectorization_pct)}%</td>
-<td class="mono" style="color:var(--dim)">scalar {_fmt(m.fp_scalar_pct, "%")} ·
- 128b {_fmt(m.fp_128_pct, "%")} · 256b {_fmt(m.fp_256_pct, "%")} · 512b {_fmt(m.fp_512_pct, "%")}</td></tr>
+{fp_rows}
 </tbody></table></div>
 <div class="panel"><h3>Observations</h3>{hints_html}</div>'''
 
@@ -559,9 +582,9 @@ def _tree_html(node: TreeNode, total: int, depth: int = 0) -> str:
             f"<span class='selfpct'>{pct:.1f}% · self {self_pct:.1f}%</span></summary>{inner}</details>")
 
 
-def _memory_content(mem: MemoryProfile | None, backend: str = "ibs",
+def _memory_content(mem: MemoryProfile | None, backend: str | None = "ibs",
                      scope: str = "all threads") -> str:
-    label = "IBS" if backend == "ibs" else "PEBS"
+    label = backend_label(backend)
     if mem is None or mem.total_samples == 0:
         return ('<div class="panel"><h3>Memory access</h3><em>Not collected '
                 '(AMD IBS / Intel PEBS unavailable or not collected).</em></div>')
@@ -616,12 +639,12 @@ def _memory_content(mem: MemoryProfile | None, backend: str = "ibs",
 <div class="panel"><h3>Top functions by memory-stall time</h3>{stall_table}</div>'''
 
 
-def _memory_tab(mem: MemoryProfile | None, backend: str = "ibs") -> str:
+def _memory_tab(mem: MemoryProfile | None, backend: str | None = "ibs") -> str:
     return (f'<div id="mem" class="page"><div id="memory-body">'
             f'{_memory_content(mem, backend)}</div></div>')
 
 
-def _memory_html_map(mem: MemoryProfile | None, backend: str = "ibs",
+def _memory_html_map(mem: MemoryProfile | None, backend: str | None = "ibs",
                      prof: StackProfile | None = None,
                      per_thread_enabled: bool = True) -> dict:
     result = {"all": _memory_content(mem, backend, "all threads")}
@@ -725,7 +748,7 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
                freq_timeline: list | None = None) -> str:
     ncpu = meta.get("ncpus", 1)
     memory_meta = meta.get("memory", {})
-    memory_backend = memory_meta.get("backend") or "ibs"
+    memory_backend = memory_meta.get("backend")
     memory_cojoined = bool(memory_meta.get("cojoined", False))
     thread_metrics = meta.get("_thread_metrics") or {}
 

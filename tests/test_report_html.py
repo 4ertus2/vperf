@@ -2,9 +2,15 @@ import re
 from dataclasses import asdict
 
 from vperf.memory import MemSymbol, MemoryProfile
-from vperf.metrics import MetricsReport
+from vperf.metrics import LLC_SOURCE_AMD, LLC_SOURCE_GENERIC, MetricsReport
 from vperf.parsers import ScriptSample
-from vperf.report_html import _JS, _memory_html_map, _memory_tab, build_html
+from vperf.report_html import (
+    _JS,
+    _memory_html_map,
+    _memory_tab,
+    _overview_content,
+    build_html,
+)
 from vperf.stacks import StackProfile, ThreadInfo, build_profile
 
 
@@ -207,3 +213,72 @@ def test_memory_tab_has_dynamic_body():
     assert "Memory access summary (IBS)" in html
     assert "function renderMemory()" in _JS
     assert "renderMemory();" in _JS
+
+
+def test_memory_tab_labels_pebs():
+    html = _memory_tab(_profile(), "pebs")
+
+    assert "Memory access summary (PEBS)" in html
+    assert "IBS samples collected" not in html
+    assert "PEBS samples collected" in html
+
+
+def test_terminal_and_html_agree_on_a_missing_backend():
+    """A profile without a recorded backend is an AMD IBS capture."""
+    from vperf.report_terminal import render_terminal
+
+    prof = build_profile([
+        ScriptSample("canonical", 42, 42, 1.0, 1, "cycles:P", [("worker", "app")]),
+    ])
+    meta = {
+        "target": {"cmd": ["app"]}, "started": "now", "host": "h",
+        "ncpus": 4, "memory": {"backend": None, "cojoined": False},
+    }
+    m = MetricsReport()
+    m.branch_penalty_cycles = 13.0
+
+    terminal = render_terminal(meta, m, prof, _profile())
+    html = _memory_tab(_profile(), meta["memory"]["backend"])
+
+    assert "-- Memory Access (IBS)" in terminal
+    assert "Memory access summary (IBS)" in html
+
+
+def test_overview_hides_fp_rows_when_there_are_no_fp_counters():
+    """FP/vectorization comes from AMD-only events; Intel rows must not appear."""
+    prof = build_profile([
+        ScriptSample("canonical", 42, 42, 1.0, 1, "cycles:P", [("worker", "app")]),
+    ])
+    intel = MetricsReport(ipc=2.5)
+    intel.branch_penalty_cycles = 15.0
+
+    html = _overview_content(intel, 4, "all threads", prof)
+
+    assert "Vectorization ratio" not in html
+    assert "FP ops retired" not in html
+
+    amd = MetricsReport(ipc=2.5, fp_ops_total=1e10, vectorization_pct=90.0)
+    amd.branch_penalty_cycles = 13.0
+    html_amd = _overview_content(amd, 4, "all threads", prof)
+
+    assert "Vectorization ratio" in html_amd
+    assert "FP ops retired" in html_amd
+
+
+def test_overview_labels_cache_rows_per_event_set():
+    prof = build_profile([
+        ScriptSample("canonical", 42, 42, 1.0, 1, "cycles:P", [("worker", "app")]),
+    ])
+
+    intel = MetricsReport(llc_miss_pct=70.0, llc_misses=700,
+                          llc_hits=300, llc_source=LLC_SOURCE_GENERIC)
+    intel.branch_penalty_cycles = 15.0
+    html = _overview_content(intel, 4, "all threads", prof)
+    assert "DRAM fills" not in html
+    assert "reaching L3" in html
+
+    amd = MetricsReport(llc_miss_pct=70.0, llc_misses=700,
+                        llc_hits=300, llc_source=LLC_SOURCE_AMD)
+    amd.branch_penalty_cycles = 13.0
+    html_amd = _overview_content(amd, 4, "all threads", prof)
+    assert "DRAM/MMIO fills" in html_amd

@@ -2,7 +2,8 @@
 
 import pytest
 
-from vperf.metrics import BAD_SPEC_PENALTY_CYCLES, compute_metrics
+from vperf.doctor import VENDOR_AMD, VENDOR_INTEL
+from vperf.metrics import compute_metrics
 from vperf.parsers import parse_stat_csv
 
 
@@ -22,9 +23,39 @@ def _stat_csv(cycles: float, branch_misses: float, backend: float = "",
 def test_bad_speculation_penalty_model():
     d = parse_stat_csv(_stat_csv(1_000_000_000, 10_000_000), {"cycles", "branch-misses"})
     m = compute_metrics(d, elapsed=1.0, ncpus=8)
-    expected = min(10e6 * BAD_SPEC_PENALTY_CYCLES / 1e9 * 100, 100.0)
+    expected = min(10e6 * m.branch_penalty_cycles / 1e9 * 100, 100.0)
     assert m.bad_speculation_pct == pytest.approx(expected)
     assert 0.0 <= m.bad_speculation_pct <= 100.0
+
+
+def test_penalty_follows_the_profiled_vendor_not_the_reporting_host():
+    """Re-deriving an AMD profile on Intel (or vice versa) must reproduce the
+    Bad Speculation number the AMD machine originally produced."""
+    d = parse_stat_csv(_stat_csv(1_000_000_000, 10_000_000),
+                       {"cycles", "branch-misses"})
+    amd = compute_metrics(d, elapsed=1.0, ncpus=8, vendor=VENDOR_AMD)
+    intel = compute_metrics(d, elapsed=1.0, ncpus=8, vendor=VENDOR_INTEL)
+    assert amd.branch_penalty_cycles == 13.0
+    assert intel.branch_penalty_cycles == 15.0
+    assert amd.bad_speculation_pct == pytest.approx(10e6 * 13 / 1e9 * 100)
+    assert intel.bad_speculation_pct == pytest.approx(10e6 * 15 / 1e9 * 100)
+    assert amd.bad_speculation_pct != intel.bad_speculation_pct
+
+
+def test_penalty_defaults_to_the_current_host(monkeypatch):
+    monkeypatch.setattr("vperf.doctor.cpu_vendor", lambda: VENDOR_AMD)
+    d = parse_stat_csv(_stat_csv(1_000_000_000, 10_000_000),
+                       {"cycles", "branch-misses"})
+    m = compute_metrics(d, elapsed=1.0, ncpus=8)
+    assert m.branch_penalty_cycles == 13.0
+    assert m.cpu_vendor is None
+
+
+def test_unknown_vendor_falls_back_to_the_default_penalty():
+    d = parse_stat_csv(_stat_csv(1_000_000_000, 10_000_000),
+                       {"cycles", "branch-misses"})
+    m = compute_metrics(d, elapsed=1.0, ncpus=8, vendor="unknown")
+    assert m.branch_penalty_cycles == 15.0
 
 
 def test_bad_speculation_clamped_at_100():

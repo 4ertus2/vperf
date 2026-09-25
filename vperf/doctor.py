@@ -22,6 +22,13 @@ CANDIDATE_METRICS = [
     "CPUs_utilized",
 ]
 
+# Intel PEBS load-latency threshold in cycles.  PEBS only reports a load once
+# its latency exceeds this value, so it is the PEBS analogue of the IBS
+# sampling period: it sets the memory-profile sample density.  It must stay a
+# single constant so the probe, the discovered event strings and meta.json all
+# agree.
+INTEL_LDLAT = 30
+
 # Generic events available on both AMD and Intel.
 GENERIC_EVENTS = [
     "task-clock",
@@ -83,10 +90,21 @@ _BRANCH_PENALTY: dict[str, float] = {
     "AuthenticAMD": 13.0,
 }
 
+DEFAULT_BRANCH_PENALTY = 15.0
 
-def branch_mispredict_penalty() -> float:
-    """Return the branch-misprediction penalty in cycles for the current CPU."""
-    return _BRANCH_PENALTY.get(cpu_vendor(), 15.0)
+VENDOR_INTEL = "GenuineIntel"
+VENDOR_AMD = "AuthenticAMD"
+
+
+def branch_mispredict_penalty(vendor: str | None = None) -> float:
+    """Branch-misprediction penalty in cycles.
+
+    *vendor* defaults to the current CPU.  Pass the vendor recorded in a
+    profile's ``meta.json`` to re-derive that profile's metrics on a
+    different machine, so ``vperf report`` stays reproducible.
+    """
+    return _BRANCH_PENALTY.get(vendor if vendor is not None else cpu_vendor(),
+                               DEFAULT_BRANCH_PENALTY)
 
 
 @dataclass
@@ -175,6 +193,16 @@ def run_doctor() -> DoctorReport:
     rep.add("perf binary", "OK", perf_version())
     rep.add("python", "OK", f"{os.sys.version_info.major}.{os.sys.version_info.minor}")
 
+    vendor = cpu_vendor()
+    if vendor in (VENDOR_INTEL, VENDOR_AMD):
+        rep.add("cpu vendor", "OK",
+                f"{vendor} (branch-mispredict penalty "
+                f"{_BRANCH_PENALTY[vendor]:.0f} cyc)")
+    else:
+        rep.add("cpu vendor", "WARN",
+                f"{vendor}: unknown vendor, falling back to the generic "
+                f"event set and a {DEFAULT_BRANCH_PENALTY:.0f} cyc penalty")
+
     lvl = paranoid_level()
     cap = has_cap("cap_perfmon") or os.geteuid() == 0
     if lvl <= 1 or cap:
@@ -212,7 +240,7 @@ def run_doctor() -> DoctorReport:
         rep.add("memory analysis (IBS)", "OK", "ibs_op sampling available")
     elif probe_intel_mem():
         rep.add("memory analysis (PEBS)", "OK",
-                "Intel PEBS mem-loads/stores available (--ldlat 30)")
+                f"Intel PEBS mem-loads/stores available (--ldlat {INTEL_LDLAT})")
     else:
         rep.add("memory analysis", "WARN",
                 "neither AMD IBS nor Intel PEBS memory sampling available")
@@ -262,15 +290,15 @@ def probe_ibs() -> bool:
 def probe_intel_mem() -> bool:
     """Check whether Intel PEBS memory-access sampling works.
 
-    Uses ``perf mem record --ldlat 30`` which employs Precise Event-Based
-    Sampling (PEBS) with a load-latency threshold of 30 cycles.  This is
+    Uses ``perf mem record --ldlat <INTEL_LDLAT>`` which employs Precise
+    Event-Based Sampling (PEBS) with a load-latency threshold.  This is
     the Intel analog of AMD IBS for per-instruction memory profiling.
     """
     if not perf_available():
         return False
     r = run_perf(
-        ["mem", "record", "--ldlat", "30", "-o", "/tmp/vperf-intel-mem-probe.data",
-         "--", "true"],
+        ["mem", "record", "--ldlat", str(INTEL_LDLAT),
+         "-o", "/tmp/vperf-intel-mem-probe.data", "--", "true"],
         timeout=30,
     )
     try:
@@ -323,12 +351,17 @@ __all__ = [
     "AMD_ONLY_EVENTS",
     "CANDIDATE_EVENTS",
     "CANDIDATE_METRICS",
+    "DEFAULT_BRANCH_PENALTY",
     "GENERIC_EVENTS",
+    "INTEL_LDLAT",
     "PERF_ACCESS_HINTS",
+    "VENDOR_AMD",
+    "VENDOR_INTEL",
     "DoctorReport",
     "branch_mispredict_penalty",
     "cpu_vendor",
     "paranoid_level",
+    "probe_ibs",
     "probe_intel_mem",
     "probe_record",
     "probe_stat",

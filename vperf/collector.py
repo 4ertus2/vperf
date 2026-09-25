@@ -90,13 +90,33 @@ class _MemoryPlan:
     data_file: str
 
 
+def _memory_meta(*, enabled: bool, backend: str | None, period: int,
+                 events: list[str], data_file: str | None,
+                 cojoined: bool) -> dict:
+    """Metadata for the memory pass, describing the knob each backend honours.
+
+    IBS is driven by a sampling *period*; PEBS is driven by a load-latency
+    *threshold* and has no period at all, so reporting ``period`` for a PEBS
+    profile would claim a knob that was never applied.
+    """
+    return {
+        "enabled": enabled,
+        "backend": backend,
+        "period": period if enabled and backend == "ibs" else None,
+        "ldlat": doctor.INTEL_LDLAT if enabled and backend == "pebs" else None,
+        "events": events,
+        "data_file": data_file,
+        "cojoined": cojoined,
+    }
+
+
 DEFAULT_CALLGRAPH = "fp"
 
 _MEMORY_SORT = "tgid,pid,comm,local_weight,mem,sym,dso,tlb"
 _MEMORY_SORT_FALLBACK = "pid,comm,local_weight,mem,sym,dso,tlb"
 
 
-def _intel_memory_events(ldlat: int = 30) -> list[str]:
+def _intel_memory_events(ldlat: int = doctor.INTEL_LDLAT) -> list[str]:
     result = run_perf(["mem", "record", "-v", "-e", "list"], timeout=30)
     lines = (result.stdout + "\n" + result.stderr).splitlines()
     if not result.ok:
@@ -141,7 +161,16 @@ def _intel_memory_events(ldlat: int = 30) -> list[str]:
 
 
 def _memory_plan(mem_period: int) -> _MemoryPlan | None:
-    if probe_ibs():
+    """Pick the memory-access backend available on this host.
+
+    AMD exposes IBS, Intel exposes PEBS; the probes are ordered so the
+    vendor-native backend wins.  On a known-Intel host the IBS probe is
+    skipped entirely -- it can only fail, and a failed probe is a wasted perf
+    invocation on every profile.
+    """
+    vendor = doctor.cpu_vendor()
+    ibs_ok = probe_ibs() if vendor != doctor.VENDOR_INTEL else False
+    if ibs_ok:
         return _MemoryPlan("ibs", [f"ibs_op/period={mem_period}/p"], "perf_ibs.data")
     if not probe_intel_mem():
         return None
@@ -780,6 +809,7 @@ def _collect_combined(
         "target": target_meta,
         "started": started,
         "host": socket.gethostname(),
+        "cpu_vendor": doctor.cpu_vendor(),
         "kernel": platform.release(),
         "ncpus": _ncpus(),
         "freq": freq,
@@ -793,17 +823,13 @@ def _collect_combined(
             "cojoined": stat_cojoined,
             "file": os.path.basename(stat_path) if os.path.exists(stat_path) else None,
         },
-        "memory": {
-            "enabled": memory_enabled,
-            "backend": mem_backend,
-            "period": mem_period if memory_enabled else None,
-            "events": memory_events,
-            "data_file": (
-                os.path.basename(data_path)
-                if record_ok and active_memory_plan is not None else None
-            ),
-            "cojoined": memory_cojoined,
-        },
+        "memory": _memory_meta(
+            enabled=memory_enabled, backend=mem_backend, period=mem_period,
+            events=memory_events,
+            data_file=(os.path.basename(data_path)
+                       if record_ok and active_memory_plan is not None else None),
+            cojoined=memory_cojoined,
+        ),
         "wait": {"enabled": wait_path is not None},
         "perf_version": perf_version(),
         "elapsed_wall": elapsed,
@@ -1036,7 +1062,14 @@ def collect(
             args = ["record", "-q", "-d", "-W", "-o", memory_data_path,
                     "-e", "ibs_op//p", "-c", str(mem_period)]
         else:
-            args = ["mem", "record", "--ldlat", "30", "-o", memory_data_path]
+            # `perf mem record` is `perf record -W -d` plus perf's own
+            # mem-loads/mem-stores selection.  Naming the discovered events
+            # explicitly keeps the recorded event names identical to
+            # memory_events, which is what the report parser filters on, and
+            # is the only way to cover every PMU on hybrid Intel parts.
+            args = ["record", "-q", "-d", "-W", "-o", memory_data_path]
+            for event in memory_pass_plan.events:
+                args += ["-e", event]
         args += _callgraph_args(callgraph_mode)
         if pid is not None:
             args += ["-p", str(pid)]
@@ -1069,6 +1102,7 @@ def collect(
         "target": {"cmd": target_cmd, "pid": pid, "duration": duration},
         "started": time.strftime("%Y-%m-%d %H:%M:%S"),
         "host": socket.gethostname(),
+        "cpu_vendor": doctor.cpu_vendor(),
         "kernel": platform.release(),
         "ncpus": _ncpus(),
         "freq": freq,
@@ -1082,14 +1116,12 @@ def collect(
             "cojoined": False,
             "file": None,
         },
-        "memory": {
-            "enabled": memory_enabled,
-            "backend": mem_backend,
-            "period": mem_period if memory_enabled else None,
-            "events": memory_events,
-            "data_file": os.path.basename(memory_data_path) if memory_data_path else None,
-            "cojoined": memory_cojoined,
-        },
+        "memory": _memory_meta(
+            enabled=memory_enabled, backend=mem_backend, period=mem_period,
+            events=memory_events,
+            data_file=os.path.basename(memory_data_path) if memory_data_path else None,
+            cojoined=memory_cojoined,
+        ),
         "wait": {"enabled": wait_enabled},
         "perf_version": perf_version(),
         "elapsed_wall": elapsed,

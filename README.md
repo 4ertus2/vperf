@@ -10,10 +10,15 @@ CPU analyses on amd64 machine (AMD and Intel), with zero Python dependencies:
   context switches & migrations/s
 - **Pipeline bound analysis** — Backend Bound / Frontend Bound
   (VTune's Top-down Microarchitecture Analysis approximated; uses perf's
-  TMA-style metrics where available)
+  TMA-style metrics where available, otherwise `stalled-cycles-*` ratios)
 - **Cache-hierarchy classification** — on AMD Zen, data-source fill events
   (`ls_any_fills_from_sys.*`, `l2_cache_req_stat.*`) attribute every L1 miss
-  to its source: L2 hit, local L3 hit, or DRAM/MMIO (= true LLC misses)
+  to its source: local L3 hit or DRAM/MMIO (= true LLC misses). On Intel the
+  generic `LLC-loads` / `LLC-load-misses` pair is used instead; that pair
+  measures L1 misses that reached L3, not DRAM traffic, and the report labels
+  which definition produced each number
+- **Memory-access profiling** — AMD IBS or Intel PEBS, whichever the host
+  exposes (see `vperf doctor`)
 - **Effective CPU utilization** — average busy cores + utilization timeline
 - **Reports** — terminal summary + a single-file interactive `report.html`
   (metric overview, hotspots table, memory access summary, flame graph,
@@ -22,7 +27,24 @@ CPU analyses on amd64 machine (AMD and Intel), with zero Python dependencies:
 
 Artifacts (`stat.csv` or `stat_threads.csv`, `perf.data`, `script.txt`,
 `meta.json`) are kept in the profile directory so reports can be regenerated
-any time with `vperf report`.
+any time with `vperf report`. `meta.json` records the CPU vendor, so a profile
+collected on AMD and re-reported on Intel (or the reverse) keeps the vendor
+calibrated constants it was collected with.
+
+## CPU vendor support
+
+| Area | AMD (Zen) | Intel |
+|---|---|---|
+| Memory-access sampling | `ibs_op` (sampling *period*, default 100003) | `mem-loads`/`mem-stores` PEBS (load-latency threshold, default `--ldlat 30`) |
+| LLC classification | `ls_any_fills_from_sys.*` — DRAM/MMIO fills per L3 lookup | `LLC-loads`/`LLC-load-misses` — L1 misses that reached L3 |
+| L1 / L2 miss counts | `ls_any_fills_from_sys.all`, `l2_cache_req_stat.ic_dc_miss_in_l2` | not exposed; `L1-dcache-load-misses` drives the L1D miss *rate* only |
+| FP / vectorization | `fp_ret_sse_avx_ops.*`, `fp_ops_retired_by_width.*` | not exposed; Overview omits the FP rows |
+| Branch-mispredict penalty (Bad Speculation model) | 13 cyc | 15 cyc |
+
+Only `AMD_ONLY_EVENTS` are vendor-gated: on Intel and on unrecognised vendors
+they are never requested, so `perf stat` does not emit `<not counted>` noise.
+Everything else is collected and reported identically on both vendors.
+
 
 ## Setup
 
@@ -134,10 +156,10 @@ Open `report.html` in any browser — fully offline, no CDN.
 | **Branches** | |
 | Branch Mispredict % > 5 | unpredictable branches dominate |
 | **Memory hierarchy** | |
-| LLC Miss % > 30% | working set exceeds cache; DRAM-bound |
+| LLC Miss % > 30% | working set exceeds cache. On AMD this is DRAM-bound; on Intel it means L1 misses that reached L3, so cross-check the Memory tab before calling it DRAM |
 | L1D Miss Rate > 5% | data-cache thrashing; blocking/tiling opportunity |
 | dTLB Miss Rate > 1% | page-table walks hurting latency |
-| **HPC / vectorization** | |
+| **HPC / vectorization** (AMD only — the rows are absent on Intel) | |
 | Vectorization Ratio < 50% | scalar or mixed-width code; widen with intrinsics or compiler hints |
 | FP Ops/s ≈ theoretical peak | compute-saturated; check memory won't help |
 | Backend Bound + high FP Ops/s | memory-bound despite vectorization (common with large arrays) |
@@ -196,9 +218,14 @@ Notes & caveats:
   stripped binaries can only provide address-based samples.
 - DWARF unwinding is done offline; `DEBUGINFOD_URLS` is stripped from perf's
   environment to prevent multi-second network hangs.
-- True Intel TMA level-1/2 requires Intel's `slots` PMU. On AMD the backend /
-  frontend bound numbers use AMD dispatch-stall equivalents — directionally
-  comparable, not identical definitions.
+- True Intel TMA level-1/2 needs Intel's `slots` PMU and perf's `tma_*`
+  metrics, which `vperf` does not request. On **both** vendors the
+  Backend/Frontend Bound numbers therefore come from perf's `backend_bound` /
+  `frontend_cycles_idle` metrics when they resolve, and otherwise from
+  `stalled-cycles-backend` / `stalled-cycles-frontend` divided by cycles —
+  i.e. a stall *ratio*, not a slot fraction. Bad Speculation and Retiring are
+  a model, not measurements; the assumed recovery penalty is printed next to
+  the result.
 - Attach mode (`-p`) needs `CAP_PERFMON`/`CAP_SYS_PTRACE`
   (`sudo setcap cap_perfmon,cap_sys_ptrace+ep $(which perf)`) on recent kernels.
 
@@ -232,8 +259,11 @@ vperf run -- examples/bin/membound 268435456 1.5
 
 `tests/test_integration_cpp.py` asserts these signatures: SIMD IPC > 2,
 chase IPC < 0.35 (>5x contrast), L1/L2 misses > 10M with 10x contrast,
-LLC miss rate > 45% for the chase, dTLB misses > 5M, and page faults
-covering every 4 KiB page of the mapping.
+LLC miss rate > 45% for the chase (relaxed to 30% on Intel, whose LLC-load
+counters report a lower rate than AMD fill events), dTLB misses > 5M, and page
+faults covering every 4 KiB page of the mapping. The L1/L2-count and
+AVX-512 tier assertions self-skip on CPUs that lack the AMD events or the
+AVX-512 tier.
 
 `examples/simd_levels.cpp` implements the *same* weighted dot product at
 four widths via `#ifdef` (scalar / SSE / AVX / AVX-512). The tier tests
