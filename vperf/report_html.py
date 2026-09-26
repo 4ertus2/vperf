@@ -915,20 +915,26 @@ def _wait_panels(wp: WaitProfile | None) -> str:
 
 def _thread_options(prof: StackProfile, mem: MemoryProfile | None = None,
                     thread_metrics: dict | None = None) -> str:
-    opts = ['<option value="">All threads</option>']
+    # Collect (comm, pct, tid, label) and sort at the end, so threads sharing a
+    # name land next to each other: hottest thread of a name group first, ties
+    # (same utilization, as displayed) broken by tid.  Memory-only and
+    # counters-only threads have no percent in braces; the -1.0 sentinel sorts
+    # them last inside their own name group.
+    entries: list[tuple[str, float, int, str]] = []
     seen: set[int] = set()
     for t in top_threads(prof, 20):
-        pct = t.cycles / max(prof.total_cycles, 1) * 100
+        pct = round(t.cycles / max(prof.total_cycles, 1) * 100)
         label = f"{esc(t.comm)} (tid {t.tid}, {pct:.0f}%)"
-        opts.append(f'<option value="{t.tid}">{label}</option>')
+        entries.append((t.comm, float(pct), t.tid, label))
         seen.add(t.tid)
     if mem is not None:
         memory_threads = sorted(mem.by_tid.values(), key=lambda p: p.total_samples, reverse=True)
         for profile in memory_threads:
             if profile.tid is None or profile.tid in seen:
                 continue
-            label = f"{esc(profile.comm or 'thread')} (tid {profile.tid}, memory)"
-            opts.append(f'<option value="{profile.tid}">{label}</option>')
+            comm = profile.comm or "thread"
+            label = f"{esc(comm)} (tid {profile.tid}, memory)"
+            entries.append((comm, -1.0, profile.tid, label))
             seen.add(profile.tid)
     for key, payload in sorted((thread_metrics or {}).items(), key=lambda item: str(item[0])):
         try:
@@ -938,8 +944,11 @@ def _thread_options(prof: StackProfile, mem: MemoryProfile | None = None,
         if tid in seen:
             continue
         comm = (payload.get("comm") or "thread") if isinstance(payload, dict) else "thread"
-        opts.append(f'<option value="{tid}">{esc(comm)} (tid {tid}, counters)</option>')
+        entries.append((comm, -1.0, tid, f"{esc(comm)} (tid {tid}, counters)"))
         seen.add(tid)
+    entries.sort(key=lambda e: (e[0], -e[1], e[2]))
+    opts = ['<option value="">All threads</option>']
+    opts += [f'<option value="{e[2]}">{e[3]}</option>' for e in entries]
     return "".join(opts)
 
 
