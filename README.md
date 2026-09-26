@@ -67,6 +67,20 @@ huge C++ targets: a ClickHouse debug build (4.9 GB, 1.5 M symbols) spends
 ~80 s per `perf` invocation expanding inlines versus ~2 s without, and that
 cost is paid twice per profile.
 
+`--startup-grace` (default 0.15 s) is how long the target is left to settle
+before the counting pass freezes it. `perf stat --per-thread` reports counters
+only for the threads alive at the moment it attaches, so a runtime that spawns
+its thread pool during startup needs that window to cover the pool — otherwise
+the per-thread Overview and the per-thread Memory rows come back nearly empty
+while the sampled threads are all there. Measured on `clickhouse-local` against
+a 14 GB ClickBench file, the pool goes 1 thread at 0 ms, 3 at 11 ms, 25 at 42 ms
+and 43 at 93 ms, so 0.15 s covers it. Raise it for a slower startup, lower it
+(0 attaches at once) to shave wall time and accept the loss. Counters only start
+after the target resumes, so a longer grace costs no measurement accuracy — and
+a target that finishes inside the window is reported rather than profiled, so
+keep the value below the shortest run you care about. Threads created after the
+freeze are still never counted, whatever the value.
+
 
 ## Setup
 
@@ -208,6 +222,7 @@ vperf run -f 999 -- ./yourapp input.bin           # higher sampling frequency
 vperf run --callgraph dwarf -- ./yourapp         # higher-quality stacks when DWARF is available
 vperf run --mem-period 1000003 -- ./longjob      # thin the IBS memory samples (AMD)
 vperf run --no-inline -- ./hugebinary            # skip DWARF inline expansion
+vperf run --startup-grace 0.3 -- ./slowstartup  # let the thread pool come up first
 
 # compare two runs
 vperf diff .vperf/baseline .vperf/optimized
@@ -306,12 +321,14 @@ sampler never caught fall back to the coarser memory-report name.
 
 1. **Capability probe** — tiny throwaway runs determine supported events,
    `-M` metrics and the best precise cycles event (`cycles:P` → fallbacks).
-2. **Counting/sampling pass** — when both are enabled, one synchronized
+2. **Counting/sampling pass** — when both are enabled, the target is left to
+   settle for `--startup-grace` seconds and then one synchronized
    `perf stat --per-thread` + `perf record` session collects hardware counters
-   and CPU samples from the same target lifetime. The default callgraph mode
-   is frame pointers, so debug info is not required for stack capture. CPU
-   cycles and AMD IBS or Intel PEBS remain in the same recording; the existing
-   Memory data is post-processed from that `perf.data` rather than collected again.
+   and CPU samples from the same target lifetime, both attached to the frozen
+   target. The default callgraph mode is frame pointers, so debug info is not
+   required for stack capture. CPU cycles and AMD IBS or Intel PEBS remain in the
+   same recording; the existing Memory data is post-processed from that
+   `perf.data` rather than collected again.
 3. **Fallbacks** — the normal CLI keeps CPU sampling when co-joined memory
    sampling is unavailable; memory analysis is then omitted.
 4. **Post-processing** — `perf script` and `perf mem report` are two
@@ -331,8 +348,9 @@ Notes & caveats:
   CPU views, Overview cards, and the Memory tab; the terminal report remains
   whole-run scoped.
 - `perf stat --per-thread` reports independent rows for threads present when
-  collection attaches. TIDs created later may be unavailable rather than
-  estimated, and legacy profiles without `stat_threads.csv` remain
+  collection attaches, which is why the target is settled for `--startup-grace`
+  seconds first (default 0.15 s). TIDs created after that are unavailable
+  rather than estimated, and legacy profiles without `stat_threads.csv` remain
   aggregate-only for Overview.
 - The Memory section reuses the existing per-TID IBS/PEBS report; it is not
   recollected when the Overview hardware counters are enabled.

@@ -1,5 +1,6 @@
 import json
 import signal
+import time
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,9 @@ class _FakeDeferred:
 
     def result(self, timeout=None):
         return self._result
+
+    def join(self, timeout=None):
+        return self.result(timeout)
 
     def close(self):
         self.closed = True
@@ -130,6 +134,45 @@ def test_callgraph_defaults_to_frame_pointers():
     parser = build_parser()
     assert parser.parse_args(["run", "--", "true"]).callgraph == "fp"
     assert parser.parse_args(["attach", "-p", "123"]).callgraph == "fp"
+
+
+def test_startup_grace_is_a_user_option_on_both_modes():
+    # `perf stat --per-thread` only reports the threads alive when it attaches,
+    # so the target has to build its thread pool before the counting pass
+    # freezes it -- hence a knob rather than a fixed sleep
+    parser = build_parser()
+    default = collector.DEFAULT_STARTUP_GRACE
+    assert default >= 0.1, "the default must cover a pool that takes ~90 ms to spawn"
+    for mode in (["run"], ["attach", "-p", "123"]):
+        assert parser.parse_args(mode).startup_grace == default
+        assert parser.parse_args(mode + ["--startup-grace", "0.5"]).startup_grace == 0.5
+        assert parser.parse_args(mode + ["--startup-grace", "0"]).startup_grace == 0.0
+
+
+def test_settle_target_waits_out_the_grace():
+    # a live target holds the window open, so the pool is up when perf attaches
+    class _Live:
+        pid = 1
+
+        def poll(self):
+            return None
+
+    started = time.monotonic()
+    collector._settle_target(_Live(), 0.05)
+    assert time.monotonic() - started >= 0.05
+
+
+def test_settle_target_does_not_hold_a_dead_target():
+    # a target that exits inside the grace is reported, not held for the rest
+    class _Dead:
+        pid = 1
+
+        def poll(self):
+            return 0
+
+    started = time.monotonic()
+    collector._settle_target(_Dead(), 5.0)
+    assert time.monotonic() - started < 1.0
 
 
 def test_callgraph_arguments_are_mode_specific():
@@ -544,6 +587,50 @@ def test_post_target_dumps_overlap(monkeypatch, tmp_path):
     outdir = tmp_path / "overlap"
     assert (outdir / "script.txt").is_file()
     assert (outdir / "mem_report.txt").is_file()
+
+
+def test_collect_settles_the_target_for_the_requested_grace(monkeypatch, tmp_path):
+    """The grace decides how much of the pool `perf stat --per-thread` sees."""
+    _amd_vendor(monkeypatch)
+    graces = []
+
+    def fake_settle(target, grace):
+        graces.append(grace)
+
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
+        if args[:1] == ["script"] and stdout_file:
+            Path(stdout_file).write_text("worker 42 1.0: 100 cycles:P:\n", encoding="utf-8")
+        return _defer(PerfResult(0, "", ""), defer)
+
+    monkeypatch.setattr(collector, "_settle_target", fake_settle)
+    monkeypatch.setattr(collector, "_probe_capabilities",
+                        lambda: (["task-clock", "cycles"], [], "cycles:P"))
+    monkeypatch.setattr(collector, "probe_ibs", lambda: False)
+    monkeypatch.setattr(collector, "probe_intel_mem", lambda: False)
+    monkeypatch.setattr(collector, "probe_wait", lambda: False)
+    monkeypatch.setattr(collector.subprocess, "Popen", lambda *args, **kwargs: _FakeTarget())
+    monkeypatch.setattr(collector.os, "killpg", lambda pid, sig: None)
+    monkeypatch.setattr(collector, "start_perf", lambda args: _FakeCollector(args))
+    monkeypatch.setattr(collector, "run_perf", fake_run_perf)
+    monkeypatch.setattr(collector, "perf_version", lambda: "perf test")
+    monkeypatch.setattr(collector, "_FreqSampler", _FakeSampler)
+
+    profile = collector.collect(
+        target_cmd=["app"], pid=None, outdir=str(tmp_path / "grace"),
+        use_stat=True, use_record=True, use_memory=False,
+        use_wait=False, use_freq=False, startup_grace=0.4,
+    )
+
+    assert graces == [0.4]
+    # recorded, so a profile says how much of the pool its counters could see
+    assert profile.meta["startup_grace"] == 0.4
+
+    collector.collect(
+        target_cmd=["app"], pid=None, outdir=str(tmp_path / "grace-default"),
+        use_stat=True, use_record=True, use_memory=False,
+        use_wait=False, use_freq=False,
+    )
+    assert graces[-1] == collector.DEFAULT_STARTUP_GRACE
 
 
 def test_attach_duration_signals_only_stop_and_continue(monkeypatch, tmp_path):

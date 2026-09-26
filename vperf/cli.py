@@ -10,7 +10,7 @@ import time
 from dataclasses import asdict
 
 from . import __version__
-from .collector import DEFAULT_CALLGRAPH, collect, load_profile
+from .collector import DEFAULT_CALLGRAPH, DEFAULT_STARTUP_GRACE, collect, load_profile
 from .doctor import PERF_ACCESS_HINTS, probe_attach, probe_stat, run_doctor
 from .metrics import MetricsReport, compute_metrics, compute_thread_metrics
 from .memory import event_matches
@@ -154,6 +154,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         mem_period=args.mem_period,
         use_wait=not args.no_wait,
         inline=not args.no_inline,
+        startup_grace=args.startup_grace,
     )
     _finish(outdir, pd.meta, pd.warnings, pd.stat, pd.elapsed, pd.script_path,
             pd.mem_report_path, pd.wait_path, pd.freq_timeline, pd.thread_stats)
@@ -191,6 +192,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
         mem_period=args.mem_period,
         use_wait=not args.no_wait,
         inline=not args.no_inline,
+        startup_grace=args.startup_grace,
     )
     _finish(outdir, pd.meta, pd.warnings, pd.stat, pd.elapsed or args.duration,
             pd.script_path, pd.mem_report_path, pd.wait_path, pd.freq_timeline,
@@ -353,6 +355,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help="dump stacks without DWARF inline expansion; hotspot "
                              "self time then lands on the enclosing function "
                              "(default: expand inlines)")
+        sp.add_argument("--startup-grace", type=float, default=DEFAULT_STARTUP_GRACE,
+                        metavar="SECONDS",
+                        help=f"seconds to let the target settle before the counting "
+                             f"pass freezes it (default: {DEFAULT_STARTUP_GRACE:g}s). "
+                             f"`perf stat --per-thread` reports only the threads "
+                             f"alive when it attaches, so a runtime that builds a "
+                             f"thread pool during startup needs this window to cover "
+                             f"it; raise it for slow startups, lower it (0 attaches "
+                             f"at once) to save wall time, at the cost of per-thread "
+                             f"counters for late threads. Ignored by `attach`, whose "
+                             f"threads are already running")
 
     prun = sub.add_parser("run", help="profile a new process")
     common(prun)
