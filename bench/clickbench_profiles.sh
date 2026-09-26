@@ -47,6 +47,7 @@ INLINE=0
 RESUME=0
 FROM=0
 TO=0
+TO_SET=0
 DRY_RUN=0
 RETIME=0
 
@@ -85,7 +86,7 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         --from) shift; FROM="$1" ;;
-        --to) shift; TO="$1" ;;
+        --to) shift; TO="$1"; TO_SET=1 ;;
         --dry-run) DRY_RUN=1 ;;
         --retime) RETIME=1 ;;
   --inline) INLINE=1 ;;
@@ -136,7 +137,7 @@ fi
 DDL="$(cat "$BENCH_DIR/clickhouse-parquet/create.sql")"
 mapfile -t QUERIES < "$BENCH_DIR/clickhouse-parquet/queries.sql"
 N=${#QUERIES[@]}
-[ "$TO" -gt 0 ] || TO=$((N - 1))
+[ "$TO_SET" = 1 ] || TO=$((N - 1))   # --to 0 is a valid range, not "unset"
 
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 LOG="$OUT_ROOT/clickbench_${RUN_ID}.log"

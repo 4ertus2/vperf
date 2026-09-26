@@ -55,6 +55,7 @@ class PerfProcess:
     args: list[str]
     _stdout: TextIO
     _stderr: TextIO
+    _stdout_is_file: bool = False
 
     def poll(self) -> int | None:
         return self.process.poll()
@@ -64,13 +65,21 @@ class PerfProcess:
 
     def result(self, timeout: float | None = None) -> PerfResult:
         returncode = self.wait(timeout=timeout)
-        self._stdout.seek(0)
+        out = ""
+        if not self._stdout_is_file:
+            # a file-backed stdout is an artifact, not something to read back:
+            # perf script alone writes hundreds of MB
+            self._stdout.seek(0)
+            out = self._stdout.read() or ""
         self._stderr.seek(0)
-        return PerfResult(
-            returncode,
-            self._stdout.read() or "",
-            self._stderr.read() or "",
-        )
+        return PerfResult(returncode, out, self._stderr.read() or "")
+
+    def close(self) -> None:
+        for stream in (self._stdout, self._stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
 
     def stop(self, grace: float = 2.0) -> PerfResult:
         interrupted = False
@@ -101,8 +110,16 @@ class PerfProcess:
         return result
 
 
-def start_perf(args: list[str]) -> PerfProcess:
-    stdout = tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace")
+def start_perf(args: list[str], stdout_file: str | None = None) -> PerfProcess:
+    """Start `perf <args>` in the background.
+
+    With stdout_file the child writes straight to that path, so a large dump
+    never passes through this process; result() then reports stderr only.
+    """
+    if stdout_file:
+        stdout: TextIO = open(stdout_file, "w", encoding="utf-8")
+    else:
+        stdout = tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace")
     stderr = tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace")
     try:
         process = subprocess.Popen(
@@ -116,15 +133,24 @@ def start_perf(args: list[str]) -> PerfProcess:
         stdout.close()
         stderr.close()
         raise
-    return PerfProcess(process, list(args), stdout, stderr)
+    return PerfProcess(process, list(args), stdout, stderr,
+                       _stdout_is_file=stdout_file is not None)
 
 
 def run_perf(
     args: list[str],
     timeout: float | None = None,
     stdout_file: str | None = None,
-) -> PerfResult:
-    """Run `perf <args>` and capture output."""
+    defer: bool = False,
+) -> PerfResult | PerfProcess:
+    """Run `perf <args>` and capture output.
+
+    With defer=True the process is started and a PerfProcess returned instead
+    of a PerfResult: the caller joins it later, so independent perf
+    invocations can overlap.  stdout_file still receives the output either way.
+    """
+    if defer:
+        return start_perf(args, stdout_file=stdout_file)
     env = _perf_env()
     cmd = [PERF, *args]
     fout = open(stdout_file, "w", encoding="utf-8") if stdout_file else subprocess.PIPE

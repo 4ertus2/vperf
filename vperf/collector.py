@@ -286,21 +286,49 @@ def _perf_error_summary(error_lines: list[str]) -> str:
     return meaningful[0][:160]
 
 
+def _memory_report_args(data_path: str, report_path: str, sort_name: str,
+                        inline: bool) -> list[str]:
+    args = ["mem", "report", "-i", data_path, "--stdio", "--field-separator=\t",
+            "--show-total-period"]
+    if sort_name:
+        args += ["--sort", sort_name]
+    if not inline:
+        args.append("--no-inline")
+    return args
+
+
+def _start_memory_report(data_path: str, report_path: str, inline: bool) -> PerfProcess:
+    """Start the first `perf mem report` attempt in the background.
+
+    It reads perf.data and nothing else, so it can run at the same time as
+    `perf script`; the retry loop in _memory_report still owns the result.
+    """
+    return run_perf(
+        _memory_report_args(data_path, report_path, _MEMORY_SORT, inline),
+        timeout=900, stdout_file=report_path, defer=True,
+    )
+
+
 def _memory_report(data_path: str, outdir: str, events: list[str],
                    backend: str, warnings: list[str],
-                   inline: bool = True) -> str | None:
+                   inline: bool = True,
+                   started: PerfProcess | None = None) -> str | None:
     report_path = os.path.join(outdir, "mem_report.txt")
     saw_report = False
     last_error = ""
     last_report_text = None
-    for sort_name in (_MEMORY_SORT, _MEMORY_SORT_FALLBACK, ""):
-        args = ["mem", "report", "-i", data_path, "--stdio", "--field-separator=\t",
-                "--show-total-period"]
-        if sort_name:
-            args += ["--sort", sort_name]
-        if not inline:
-            args.append("--no-inline")
-        result = run_perf(args, timeout=900, stdout_file=report_path)
+    for attempt, sort_name in enumerate((_MEMORY_SORT, _MEMORY_SORT_FALLBACK, "")):
+        try:
+            if attempt == 0 and started is not None:
+                result = started.result(timeout=900)
+            else:
+                result = run_perf(
+                    _memory_report_args(data_path, report_path, sort_name, inline),
+                    timeout=900, stdout_file=report_path,
+                )
+        except (PerfError, subprocess.TimeoutExpired) as exc:
+            # a timed-out first attempt just falls through to the next sort key
+            result = PerfResult(-1, "", str(exc))
         error_lines = (result.stderr or "").strip().splitlines()
         if not result.ok:
             last_error = error_lines[-1][:160] if error_lines else "unknown error"
@@ -790,15 +818,39 @@ def _collect_combined(
     script_path: str | None = None
     wait_path: str | None = None
     record_ok = record_result is not None and record_result.ok
+    mem_backend = active_memory_plan.backend if active_memory_plan else None
+    memory_events = active_memory_plan.events if active_memory_plan else []
+    want_mem_report = (record_ok and active_memory_plan is not None
+                       and os.path.exists(data_path))
+
+    # perf script and perf mem report are two independent reads of perf.data,
+    # and by this point the target is gone and the collectors are stopped, so
+    # nothing is being measured: start both before joining either and the phase
+    # costs max() instead of sum().  Each still writes its own artifact, which
+    # is what `vperf report` replays later.
+    script_candidate = os.path.join(outdir, "script.txt")
+    script_proc: PerfProcess | None = None
+    mem_proc: PerfProcess | None = None
     if record_ok:
-        script_candidate = os.path.join(outdir, "script.txt")
         script_args = ["script", "-i", data_path]
         if not inline:
             # Inline expansion reads the target's DWARF; for a stripped-debug
             # --strip-debug'd or multi-million-symbol binary it dominates the
             # dump time (tens of seconds per invocation on the same perf.data).
             script_args.append("--no-inline")
-        script_result = run_perf(script_args, timeout=600, stdout_file=script_candidate)
+        script_proc = run_perf(script_args, timeout=600, stdout_file=script_candidate,
+                               defer=True)
+    if want_mem_report:
+        mem_proc = _start_memory_report(data_path, os.path.join(outdir, "mem_report.txt"),
+                                        inline)
+
+    if script_proc is not None:
+        try:
+            script_result = script_proc.result(timeout=600)
+        except (PerfError, subprocess.TimeoutExpired) as exc:
+            script_result = PerfResult(-1, "", str(exc))
+        finally:
+            script_proc.close()
         if script_result.ok:
             script_path = script_candidate
             if wait_events:
@@ -812,16 +864,18 @@ def _collect_combined(
                 + (error_lines[-1][:200] if error_lines else "unknown")
             )
 
-    mem_backend = active_memory_plan.backend if active_memory_plan else None
-    memory_events = active_memory_plan.events if active_memory_plan else []
     mem_report_path: str | None = None
     memory_enabled = False
     memory_cojoined = False
-    if record_ok and active_memory_plan is not None and os.path.exists(data_path):
-        mem_report_path = _memory_report(
-            data_path, outdir, memory_events, mem_backend or "memory", warnings,
-            inline=inline,
-        )
+    if want_mem_report:
+        try:
+            mem_report_path = _memory_report(
+                data_path, outdir, memory_events, mem_backend or "memory", warnings,
+                inline=inline, started=mem_proc,
+            )
+        finally:
+            if mem_proc is not None:
+                mem_proc.close()
         memory_enabled = mem_report_path is not None
         memory_cojoined = memory_enabled
 
