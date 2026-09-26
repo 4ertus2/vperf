@@ -1,6 +1,7 @@
 import re
 from dataclasses import asdict
 
+from vperf.flamegraph import MAX_FLAME_DEPTH
 from vperf.memory import MemSymbol, MemoryProfile
 from vperf.metrics import LLC_SOURCE_AMD, LLC_SOURCE_GENERIC, MetricsReport, compute_metrics
 from vperf.parsers import ScriptSample, StatData
@@ -186,6 +187,64 @@ def test_flame_graph_is_click_to_zoom_with_a_reset_link():
     assert "flameInit();" in _JS
     # switching thread starts the new graph un-zoomed
     assert "resetFlameZoom();" in _JS
+
+
+def test_flame_reset_link_is_frame_chrome_at_the_bottom():
+    """One link, not two: the reset belongs to the panel, under the picture,
+    where it is always the same size whatever the graph scales to."""
+    samples = [
+        ScriptSample("worker", 100, 101, 1.0, 10, "cycles:P", [("alpha", "app")]),
+    ]
+    prof = build_profile(samples)
+    html = build_html(
+        {"target": {"cmd": ["app"]}, "mode": "run"},
+        samples,
+        MetricsReport(elapsed=1.0),
+        prof,
+    )
+
+    panel = html[html.index('<div id="flame" class="page">'):html.index('<div id="tree"')]
+    assert panel.count('class="flame-reset"') == 1
+    footer = panel.index('class="flame-foot"')
+    assert footer > panel.index('id="flamewrap"')
+    assert 'class="flame-reset"' in panel[footer:]
+    # nothing reset-shaped is drawn into the picture itself
+    assert "freset" not in panel
+    assert "fhit" not in panel
+    assert "Reset Zoom" not in panel
+    assert "freset" not in _JS and "fhit" not in _JS
+    # the canvas is trimmed to the drawn rows, and one group carries them
+    assert "st.svg.setAttribute('height'" in _JS
+    assert "st.body.setAttribute('transform'" in _JS
+    assert 'class="fbody"' in panel
+    # the row cap is what the panel note promises
+    assert f"anything past {MAX_FLAME_DEPTH} rows" in panel
+
+
+def test_flame_graph_height_follows_the_drawn_rows():
+    """A zoom that only shows the first few rows must not leave the rest of the
+    canvas hanging there empty, so the graph is laid out and sized on load."""
+    prof = build_profile([
+        ScriptSample("worker", 100, 101, 1.0, 10, "cycles:P",
+                     [("leaf", "app"), ("middle", "app"), ("top", "app")]),
+        ScriptSample("worker", 100, 101, 2.0, 20, "cycles:P",
+                     [("leaf", "app"), ("middle", "app"), ("top", "app"),
+                      ("deep", "app"), ("deeper", "app")]),
+    ])
+    html = build_html(
+        {"target": {"cmd": ["app"]}, "mode": "run"},
+        [], MetricsReport(elapsed=1.0), prof,
+    )
+    panel = html[html.index('id="flamewrap"'):html.index('<div id="tree"')]
+    svg = panel[panel.index('<div class="flame" data-thread="all">'):]
+
+    rows = sorted({int(y) for y in re.findall(r'data-y="(\d+)"', svg)})
+    # root, the comm frame, then the 3- and 5-frame chains merged
+    assert len(rows) == 7
+    # every row is reported with the pad above it, so the client can trim the
+    # canvas to the topmost row still on screen
+    assert 'data-pad="22"' in svg
+    assert 'class="fbody"' in svg
 
 
 def test_build_html_handles_empty_user_stack_view():
