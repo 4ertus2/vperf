@@ -320,14 +320,15 @@ def _memory_report(data_path: str, outdir: str, events: list[str],
     for attempt, sort_name in enumerate((_MEMORY_SORT, _MEMORY_SORT_FALLBACK, "")):
         try:
             if attempt == 0 and started is not None:
-                result = started.result(timeout=900)
+                result = started.join(timeout=900)
             else:
                 result = run_perf(
                     _memory_report_args(data_path, report_path, sort_name, inline),
                     timeout=900, stdout_file=report_path,
                 )
         except (PerfError, subprocess.TimeoutExpired) as exc:
-            # a timed-out first attempt just falls through to the next sort key
+            # a timed-out first attempt has already been reaped; fall through to
+            # the next sort key
             result = PerfResult(-1, "", str(exc))
         error_lines = (result.stderr or "").strip().splitlines()
         if not result.ok:
@@ -442,19 +443,23 @@ class _FreqSampler:
             self._stop.wait(self.interval)
 
 
-_COMBINED_STARTUP_GRACE = 0.01
+# `perf stat --per-thread` counts only the threads alive when it attaches, so
+# the target has to build its thread pool before the counting pass freezes it.
+# clickhouse-local needs ~90 ms to get there; 0.15 s covers it with headroom.
+# `--startup-grace` tunes it, 0 to attach as early as possible.
+DEFAULT_STARTUP_GRACE = 0.15
 _COLLECTOR_SETTLE_GRACE = 0.1
 _COLLECTOR_FLUSH_GRACE = 2.0
 
 
-def _wait_for_target_threads(target: subprocess.Popen) -> None:
-    deadline = time.monotonic() + _COMBINED_STARTUP_GRACE
+def _settle_target(target: subprocess.Popen, grace: float) -> None:
+    """Let the target reach its steady thread count before freezing it.
+
+    Returns early once the target is gone, so a workload that finishes inside
+    the grace is not held for the rest of it.
+    """
+    deadline = time.monotonic() + grace
     while target.poll() is None and time.monotonic() < deadline:
-        try:
-            if len(os.listdir(f"/proc/{target.pid}/task")) > 1:
-                return
-        except OSError:
-            pass
         time.sleep(0.002)
 
 
@@ -645,6 +650,7 @@ def _collect_combined(
     precise_ev: str,
     memory_plan: _MemoryPlan | None,
     warnings: list[str],
+    startup_grace: float = DEFAULT_STARTUP_GRACE,
 ) -> ProfileData:
     started = time.strftime("%Y-%m-%d %H:%M:%S")
     stat_path = os.path.abspath(os.path.join(outdir, "stat_threads.csv"))
@@ -674,7 +680,7 @@ def _collect_combined(
             )
         except OSError as exc:
             raise PerfError(f"target failed to start: {exc}") from exc
-        _wait_for_target_threads(target)
+        _settle_target(target, startup_grace)
         if target.poll() is not None:
             target_exit_code = target.wait()
             target_ready = False
@@ -846,8 +852,8 @@ def _collect_combined(
 
     if script_proc is not None:
         try:
-            script_result = script_proc.result(timeout=600)
-        except (PerfError, subprocess.TimeoutExpired) as exc:
+            script_result = script_proc.join(timeout=600)
+        except (OSError, PerfError) as exc:
             script_result = PerfResult(-1, "", str(exc))
         finally:
             script_proc.close()
@@ -923,6 +929,7 @@ def _collect_combined(
             cojoined=memory_cojoined,
         ),
         "wait": {"enabled": wait_path is not None},
+        "startup_grace": startup_grace if pid is None else None,
         "perf_version": perf_version(),
         "elapsed_wall": elapsed,
     }
@@ -957,6 +964,7 @@ def collect(
     callgraph_mode: str = DEFAULT_CALLGRAPH,
     inline: bool = True,
     quiet_stdout: bool = False,
+    startup_grace: float = DEFAULT_STARTUP_GRACE,
 ) -> ProfileData:
     """Profile either a new process (`target_cmd`) or an existing one (`pid`)."""
     os.makedirs(outdir, exist_ok=True)
@@ -992,6 +1000,7 @@ def collect(
             precise_ev=precise_ev,
             memory_plan=memory_plan,
             warnings=warnings,
+            startup_grace=startup_grace,
         )
 
     # ---- freq sampler (background thread) -----------------------------------

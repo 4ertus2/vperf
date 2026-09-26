@@ -81,6 +81,45 @@ class PerfProcess:
             except OSError:
                 pass
 
+    def reap(self, grace: float = 2.0) -> None:
+        """Make sure the child is gone, escalating until it is.
+
+        SIGINT first: perf treats it as "stop and write what you have", so a
+        dump that overran keeps the samples it managed to produce.  Unlike
+        stop() the returncode is left alone -- the caller is reporting a
+        timeout, not a clean finish.
+        """
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+            if self.poll() is not None:
+                return
+            try:
+                self.process.send_signal(sig)
+            except OSError:
+                return
+            try:
+                self.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                continue
+        try:
+            self.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def join(self, timeout: float | None = None) -> PerfResult:
+        """Wait for a deferred child, killing it if it overruns `timeout`.
+
+        The post-target dumps are started before they are waited on, so a
+        timeout has to reap the child: a leaked `perf script` would keep
+        appending to its artifact after the report was built, and a leaked
+        `perf mem report` would race the retry that reopens the same file.
+        """
+        try:
+            return self.result(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.reap()
+            return PerfResult(
+                -1, "", f"perf timed out after {timeout}s: {' '.join(self.args)}")
+
     def stop(self, grace: float = 2.0) -> PerfResult:
         interrupted = False
         if self.poll() is None:
