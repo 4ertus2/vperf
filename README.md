@@ -24,7 +24,13 @@ CPU analyses on amd64 machine (AMD and Intel), with zero Python dependencies:
   (metric overview, hotspots table, memory access summary, click-to-zoom flame
   graph, timelines, call tree, threads). The HTML thread selector scopes CPU
   views, the Overview metrics, and the IBS/PEBS Memory tab to the selected
-  thread. The Threads tab merges the per-thread CPU and wait tables: each row
+  thread. **Group threads by name** (checkbox next to the selector) swaps that
+  list for one entry per thread name, so a pool of workers that run the same
+  logic reads as a single scope: Hotspots, the utilization chart and the flame
+  graph merge across the group, the Overview sums the group's PMU counters
+  before deriving rates (group IPC is `Σinstructions / Σcycles`, not a mean of
+  per-thread IPCs), and the Memory tab adds up the members' IBS/PEBS samples.
+  The Threads tab merges the per-thread CPU and wait tables: each row
   carries sampled cycles next to on/off-CPU seconds, joined on tid, and the
   wait columns read `n/a` when scheduler tracepoints were not collected.
 
@@ -229,6 +235,36 @@ The Flame Graph tab behaves like the SVG `flamegraph.pl` output:
   to the full graph. Switching thread in the header selector also resets the zoom.
 - The graph scales to the panel width, and frames too narrow to show a label get
   one as soon as they are zoomed into.
+
+### Grouping threads by name
+
+Tick **Group threads by name** next to the thread selector and the dropdown
+lists thread names instead of threads — the entry that was `ThreadPool ×54`
+before is one line, not 54:
+
+- the group covers *every* thread of that name the profile knows, not just the
+  hottest 20 the ungrouped list shows
+- Hotspots, the utilization chart and the flame graph merge the members'
+  samples; the utilization curve is the pool's total cores busy, so a 16-thread
+  pipeline reads as up to 16 busy cores
+- Overview counters are summed before anything is derived from them, so the
+  group IPC is `Σinstructions / Σcycles` rather than an average that would weigh
+  a thread which sampled 10 cycles like one that ran the whole window
+- the Memory tab adds up the members' IBS/PEBS samples, and the scope line says
+  how many of them had any (`QueryPipelineEx ×16 threads, memory from 12 of 16`)
+- a group whose threads have no per-thread counters — the usual case, since
+  `perf stat --per-thread` only reports the threads alive when counting
+  attaches — falls back to what the sampler knows: thread count, cycle share of
+  the run, and the CPU time that share works out to
+- the flame graph of a group is precomputed, so a busy profile grows: a
+  ClickBench profile of 62 sampled threads went from 29.8 MB to 39.2 MB of
+  `report.html` with six grouped flame graphs
+- the Call Tree, the Threads tab and the Frequency chart stay run-level, as they
+  were before grouping existed
+
+`perf mem report` labels every thread of a process with the *process* name, so a
+thread is grouped under the name the sampler saw for it; only threads the
+sampler never caught fall back to the coarser memory-report name.
 
 ### Reading the output like a VTune veteran
 
