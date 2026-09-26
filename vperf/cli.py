@@ -18,7 +18,7 @@ from .parsers import StatData, parse_perf_script
 from .perf import perf_available
 from .report_html import build_html
 from .report_terminal import render_terminal
-from .stacks import StackProfile, build_profile, scale_hotspot_times
+from .stacks import StackProfile, build_profile, cap_stacks, scale_hotspot_times
 from .timeline import utilization_from_samples
 
 
@@ -48,6 +48,9 @@ def _analyze(stat_data: StatData, elapsed: float | None, script_path: str | None
     if memory_events:
         samples = [s for s in samples if not event_matches(s.event, memory_events)]
     samples = [s for s in samples if not s.event.startswith("sched:")]
+    # Keep only the leaf end of every stack: see stacks.cap_stacks.  This also
+    # bounds the sample payload that build_html embeds in the report.
+    cap_stacks(samples)
 
     prof = build_profile(samples)
     cpu_ms = stat_data.summary.get("task-clock")
@@ -148,7 +151,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         use_record=True,
         callgraph_mode=args.callgraph,
         use_memory=True,
+        mem_period=args.mem_period,
         use_wait=not args.no_wait,
+        inline=not args.no_inline,
     )
     _finish(outdir, pd.meta, pd.warnings, pd.stat, pd.elapsed, pd.script_path,
             pd.mem_report_path, pd.wait_path, pd.freq_timeline, pd.thread_stats)
@@ -183,7 +188,9 @@ def cmd_attach(args: argparse.Namespace) -> int:
         use_record=True,
         callgraph_mode=args.callgraph,
         use_memory=True,
+        mem_period=args.mem_period,
         use_wait=not args.no_wait,
+        inline=not args.no_inline,
     )
     _finish(outdir, pd.meta, pd.warnings, pd.stat, pd.elapsed or args.duration,
             pd.script_path, pd.mem_report_path, pd.wait_path, pd.freq_timeline,
@@ -338,6 +345,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="call graph unwinding method (default: fp; dwarf for higher-quality stacks)")
         sp.add_argument("--no-wait", action="store_true",
                         help="skip the wait/off-CPU pass (scheduler tracepoints)")
+        sp.add_argument("--mem-period", type=int, default=100003,
+                        help="AMD IBS sampling period in cycles (default 100003; "
+                             "raise it to thin the memory samples when profiling "
+                             "long-running targets)")
+        sp.add_argument("--no-inline", action="store_true",
+                        help="dump stacks without DWARF inline expansion; hotspot "
+                             "self time then lands on the enclosing function "
+                             "(default: expand inlines)")
 
     prun = sub.add_parser("run", help="profile a new process")
     common(prun)

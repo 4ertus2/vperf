@@ -85,19 +85,21 @@ def render_flame_svg(
     root = build_tree(folded)
     total = max(root.value, 1)
 
-    # collect rows top-down for layout, then flip when rendering
+    # Collect rows top-down for layout, then flip when rendering.  Iterative:
+    # a target with a broken frame-pointer chain can produce chains thousands
+    # of frames deep, which would blow the interpreter's recursion limit.
     levels: list[list[tuple[_Node, float]]] = []
-
-    def walk(node: _Node, x0: float, depth: int) -> None:
+    pending: list[tuple[_Node, float, int]] = [(root, 0.0, 0)]
+    while pending:
+        node, x0, depth = pending.pop()
         if len(levels) <= depth:
             levels.append([])
         levels[depth].append((node, x0))
         cx = x0
-        for child in sorted(node.children.values(), key=lambda c: -c.value):
-            walk(child, cx, depth + 1)
+        children = sorted(node.children.values(), key=lambda c: -c.value)
+        for child in reversed(children):
+            pending.append((child, cx, depth + 1))
             cx += child.value / total * width
-
-    walk(root, 0.0, 0)
     height = len(levels) * row_height + (22 if title else 8)
 
     out = [
