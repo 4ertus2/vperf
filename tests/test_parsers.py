@@ -317,6 +317,65 @@ def test_folded_stacks_sum_comm_changes_for_one_tid():
     assert prof.folded_by_tid[101] == {"alpha": 30}
 
 
+IBS_SCRIPT = """worker 42/42 1.0: 1000003 ibs_op/period=1000003/p: 
+\t    ffff9000 kernelish (/home/me/app)
+\t    7f000000 leaf (/home/me/app)
+worker 42/42 2.0: 9999 cycles:P: 
+\t    7f000010 real (/home/me/app)
+\t    7f000020 caller (/home/me/app)
+"""
+
+
+def test_parse_perf_script_streams_a_line_iterable():
+    """The dump can be hundreds of MB, so the parser takes an open file as
+    well as text; both must give the same samples."""
+    import io
+
+    from_text = parse_perf_script(SCRIPT)
+    from_lines = parse_perf_script(io.StringIO(SCRIPT))
+    from_list = parse_perf_script(SCRIPT.splitlines(keepends=True))
+
+    assert [s.frames for s in from_lines] == [s.frames for s in from_text]
+    assert [s.frames for s in from_list] == [s.frames for s in from_text]
+    assert len(from_lines) == len(from_text) == 3
+
+
+def test_parse_perf_script_skips_requested_events_while_reading():
+    """Callers that discard the memory samples should never pay for their
+    frames - on AMD every IBS sample carries a full call chain."""
+    keep = {"ibs_op/period=1000003/p"}
+    all_samples = parse_perf_script(IBS_SCRIPT)
+    skipped = parse_perf_script(IBS_SCRIPT, skip_events=keep)
+    # same result as parsing everything and filtering afterwards
+    filtered = [s for s in all_samples if s.event not in keep]
+
+    assert [s.event for s in all_samples] == [
+        "ibs_op/period=1000003/p", "cycles:P"]
+    assert [s.event for s in skipped] == ["cycles:P"]
+    assert [(s.time, s.frames) for s in skipped] == [
+        (s.time, s.frames) for s in filtered]
+    # and the skipped sample's frames were never built
+    assert len(all_samples[0].frames) == 2
+
+
+def test_parse_perf_script_keeps_indented_headers_and_unmatched_lines():
+    """A comm can start with a space, and perf prints context markers; the
+    first-character dispatch must not turn either into a frame."""
+    dump = (
+        "  spaced-name 7/7 1.5: 100 cycles:P: \n"
+        "\t    7f000030 leaf (/home/me/app)\n"
+        ".....\n"
+        "plain 8/8 2.5: 200 cycles:P: \n"
+        "\t    7f000040 leaf (/home/me/app)\n"
+    )
+    samples = parse_perf_script(dump)
+
+    assert [(s.comm, s.tid, s.period) for s in samples] == [
+        ("spaced-name", 7, 100), ("plain", 8, 200)]
+    assert samples[0].frames == [("leaf", "/home/me/app")]
+    assert samples[1].frames == [("leaf", "/home/me/app")]
+
+
 def test_flamegraph_svg():
     prof = build_profile(_samples())
     svg, h = render_flame_svg(prof.folded)

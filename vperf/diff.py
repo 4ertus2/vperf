@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .collector import load_profile
-from .memory import event_matches
 from .metrics import MetricsReport, compute_metrics
 from .parsers import parse_perf_script
 from .stacks import StackProfile, build_profile, scale_hotspot_times
@@ -30,12 +29,12 @@ def _analyze_dir(dirpath: str) -> tuple[MetricsReport, StackProfile, dict]:
     loaded = load_profile(dirpath)
     meta, stat_data, script_path = loaded[0], loaded[1], loaded[2]
     samples = []
-    if script_path:
-        with open(script_path, encoding="utf-8", errors="replace") as f:
-            samples = parse_perf_script(f.read())
     memory_events = set(meta.get("memory", {}).get("events", []))
-    if memory_events:
-        samples = [s for s in samples if not event_matches(s.event, memory_events)]
+    if script_path:
+        # streamed, and the memory samples are dropped while parsing: they are
+        # not part of the CPU stacks (see parsers.parse_perf_script)
+        with open(script_path, encoding="utf-8", errors="replace") as f:
+            samples = parse_perf_script(f, skip_events=memory_events)
     prof = build_profile(samples)
     cpu_ms = stat_data.summary.get("task-clock")
     scale_hotspot_times(prof, cpu_ms / 1000.0 if cpu_ms else None)
