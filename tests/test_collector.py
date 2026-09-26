@@ -27,6 +27,35 @@ PEBS_REPORT = "\n".join([
 ])
 
 
+class _FakeDeferred:
+    """Stands in for a PerfProcess returned by run_perf(defer=True)."""
+
+    def __init__(self, result: PerfResult):
+        self._result = result
+        self.closed = False
+
+    def result(self, timeout=None):
+        return self._result
+
+    def close(self):
+        self.closed = True
+
+
+class _TimelineDeferred(_FakeDeferred):
+    def __init__(self, result, timeline, label):
+        super().__init__(result)
+        self._timeline = timeline
+        self._label = label
+
+    def result(self, timeout=None):
+        self._timeline.append(f"join:{self._label}")
+        return self._result
+
+
+def _defer(result, defer):
+    return _FakeDeferred(result) if defer else result
+
+
 def _amd_vendor(monkeypatch):
     """Pin the probed vendor so IBS/PEBS selection is machine-independent."""
     monkeypatch.setattr(collector.doctor, "cpu_vendor", lambda: VENDOR_AMD)
@@ -126,13 +155,13 @@ def test_collect_cojoins_cpu_and_memory_events(monkeypatch, tmp_path):
     _amd_vendor(monkeypatch)
     calls = []
 
-    def fake_run_perf(args, timeout=None, stdout_file=None):
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
         calls.append(list(args))
         if args[:1] == ["script"]:
             Path(stdout_file).write_text("worker 42 1.0: 100 cycles:P:\n", encoding="utf-8")
         elif args[:2] == ["mem", "report"]:
             Path(stdout_file).write_text(MEM_REPORT, encoding="utf-8")
-        return PerfResult(0, "", "")
+        return _defer(PerfResult(0, "", ""), defer)
 
     monkeypatch.setattr(collector, "_probe_capabilities", lambda: (["task-clock"], [], "cycles:P"))
     monkeypatch.setattr(collector, "probe_ibs", lambda: True)
@@ -166,7 +195,7 @@ def test_collect_falls_back_when_cojoined_record_fails(monkeypatch, tmp_path):
     _amd_vendor(monkeypatch)
     calls = []
 
-    def fake_run_perf(args, timeout=None, stdout_file=None):
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
         calls.append(list(args))
         if args[:1] == ["record"] and "cycles/freq=399/P" in args:
             return PerfResult(1, "", "memory event unavailable")
@@ -174,7 +203,7 @@ def test_collect_falls_back_when_cojoined_record_fails(monkeypatch, tmp_path):
             Path(stdout_file).write_text("worker 42 1.0: 100 cycles:P:\n", encoding="utf-8")
         elif args[:2] == ["mem", "report"]:
             Path(stdout_file).write_text(MEM_REPORT, encoding="utf-8")
-        return PerfResult(0, "", "")
+        return _defer(PerfResult(0, "", ""), defer)
 
     monkeypatch.setattr(collector, "_probe_capabilities", lambda: (["task-clock"], [], "cycles:P"))
     monkeypatch.setattr(collector, "probe_ibs", lambda: True)
@@ -197,7 +226,7 @@ def test_collect_falls_back_when_cojoined_record_fails(monkeypatch, tmp_path):
 
 
 def test_intel_memory_discovery_keeps_all_pmus(monkeypatch):
-    def fake_run_perf(args, timeout=None, stdout_file=None):
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
         assert args == ["mem", "record", "-v", "-e", "list"]
         return PerfResult(
             0,
@@ -220,7 +249,7 @@ def test_intel_memory_discovery_keeps_all_pmus(monkeypatch):
 
 def test_intel_memory_discovery_uses_the_shared_ldlat(monkeypatch):
     """The probe, the discovered events and meta.json must not drift apart."""
-    def fake_run_perf(args, timeout=None, stdout_file=None):
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
         return PerfResult(0, "", "ldlat-loads cpu/mem-loads/P : available\n")
 
     monkeypatch.setattr(collector, "run_perf", fake_run_perf)
@@ -283,14 +312,14 @@ def test_standalone_pebs_pass_records_the_discovered_event_names(monkeypatch, tm
     calls = []
     events = ["cpu/mem-loads,ldlat=30/P", "cpu/mem-stores/P"]
 
-    def fake_run_perf(args, timeout=None, stdout_file=None):
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
         calls.append(list(args))
         if args[:2] == ["mem", "report"]:
             Path(stdout_file).write_text(PEBS_REPORT, encoding="utf-8")
         elif args[:1] == ["script"]:
             Path(stdout_file).write_text("worker 42/42 1.0: 100 cycles:P:\n",
                                          encoding="utf-8")
-        return PerfResult(0, "", "")
+        return _defer(PerfResult(0, "", ""), defer)
 
     monkeypatch.setattr(collector, "_probe_capabilities",
                         lambda: (["task-clock"], [], "cycles:P"))
@@ -408,7 +437,7 @@ def test_collect_combines_attached_stat_and_record(monkeypatch, tmp_path):
         collector_calls.append(list(args))
         return _FakeCollector(args)
 
-    def fake_run_perf(args, timeout=None, stdout_file=None):
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
         postprocess_calls.append(list(args))
         if args[:1] == ["script"]:
             Path(stdout_file).write_text(
@@ -416,7 +445,8 @@ def test_collect_combines_attached_stat_and_record(monkeypatch, tmp_path):
             )
         elif args[:2] == ["mem", "report"]:
             Path(stdout_file).write_text(MEM_REPORT, encoding="utf-8")
-        return PerfResult(0, "", "")
+        result = PerfResult(0, "", "")
+        return _FakeDeferred(result) if defer else result
 
     monkeypatch.setattr(collector, "_probe_capabilities",
                         lambda: (["task-clock", "cycles", "instructions"], [], "cycles:P"))
@@ -463,6 +493,59 @@ def test_collect_combines_attached_stat_and_record(monkeypatch, tmp_path):
     assert profile.meta["target"]["exit_code"] == 0
 
 
+def test_post_target_dumps_overlap(monkeypatch, tmp_path):
+    """perf script and perf mem report both only read perf.data, and by the
+    time they run the target is gone, so they must be started before either is
+    joined - that is what makes the phase cost max() instead of sum()."""
+    _amd_vendor(monkeypatch)
+    timeline = []
+
+    def fake_start_perf(args):
+        return _FakeCollector(args)
+
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
+        label = "script" if args[:1] == ["script"] else (
+            "mem" if args[:2] == ["mem", "report"] else "other")
+        timeline.append(f"start:{label}")
+        if args[:1] == ["script"]:
+            Path(stdout_file).write_text(
+                "worker 42/42 1.0: 100 cycles:P:\n", encoding="utf-8")
+        elif args[:2] == ["mem", "report"]:
+            Path(stdout_file).write_text(MEM_REPORT, encoding="utf-8")
+        if defer:
+            return _TimelineDeferred(PerfResult(0, "", ""), timeline, label)
+        timeline.append(f"join:{label}")
+        return PerfResult(0, "", "")
+
+    monkeypatch.setattr(collector, "_probe_capabilities",
+                        lambda: (["task-clock", "cycles", "instructions"], [], "cycles:P"))
+    monkeypatch.setattr(collector, "probe_ibs", lambda: True)
+    monkeypatch.setattr(collector, "probe_intel_mem", lambda: False)
+    monkeypatch.setattr(collector, "probe_wait", lambda: False)
+    monkeypatch.setattr(collector.subprocess, "Popen", lambda *args, **kwargs: _FakeTarget())
+    monkeypatch.setattr(collector.os, "killpg", lambda pid, sig: None)
+    monkeypatch.setattr(collector, "start_perf", fake_start_perf)
+    monkeypatch.setattr(collector, "run_perf", fake_run_perf)
+    monkeypatch.setattr(collector, "perf_version", lambda: "perf test")
+
+    profile = collector.collect(
+        target_cmd=["app"], pid=None, outdir=str(tmp_path / "overlap"),
+        use_stat=True, use_record=True, use_memory=True,
+        use_wait=False, use_freq=False,
+    )
+
+    # both dumps are started before either one is joined
+    dumps = [step for step in timeline if step.split(":")[1] in ("script", "mem")]
+    assert dumps.index("start:mem") < dumps.index("join:script")
+    assert dumps.index("start:script") < dumps.index("join:mem")
+    assert dumps[0] == "start:script"
+    assert profile.meta["memory"]["cojoined"] is True
+    # the artifacts are still written, so `vperf report` can replay them
+    outdir = tmp_path / "overlap"
+    assert (outdir / "script.txt").is_file()
+    assert (outdir / "mem_report.txt").is_file()
+
+
 def test_attach_duration_signals_only_stop_and_continue(monkeypatch, tmp_path):
     signals = []
 
@@ -475,7 +558,8 @@ def test_attach_duration_signals_only_stop_and_continue(monkeypatch, tmp_path):
     monkeypatch.setattr(collector, "start_perf",
                         lambda args: _FakeCollector(args))
     monkeypatch.setattr(collector, "run_perf",
-                        lambda args, timeout=None, stdout_file=None: PerfResult(0, "", ""))
+                        lambda args, timeout=None, stdout_file=None, defer=False:
+                        _defer(PerfResult(0, "", ""), defer))
     monkeypatch.setattr(collector, "perf_version", lambda: "perf test")
 
     profile = collector.collect(
@@ -623,7 +707,7 @@ def test_memory_report_retries_when_perf_exits_zero_with_no_output(monkeypatch, 
     """An argument perf rejects yields rc=0 and an empty file, not a failure."""
     sorts_tried = []
 
-    def fake_run_perf(args, timeout=None, stdout_file=None):
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
         sorts_tried.append(args[args.index("--sort") + 1]
                            if "--sort" in args else "<none>")
         if len(sorts_tried) == 1:
@@ -649,7 +733,7 @@ def test_memory_report_retries_when_perf_exits_zero_with_no_output(monkeypatch, 
 
 
 def test_memory_report_names_the_cause_when_every_sort_fails(monkeypatch, tmp_path):
-    def fake_run_perf(args, timeout=None, stdout_file=None):
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
         Path(stdout_file).write_text("", encoding="utf-8")
         return PerfResult(0, "", "Error:\nUnknown --sort key: `bogus'\n")
 

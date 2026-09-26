@@ -278,11 +278,16 @@ The Flame Graph tab behaves like the SVG `flamegraph.pl` output:
    Memory data is post-processed from that `perf.data` rather than collected again.
 3. **Fallbacks** — the normal CLI keeps CPU sampling when co-joined memory
    sampling is unavailable; memory analysis is then omitted.
-4. **Post-processing** — `perf stat`, `perf script`, and `perf mem report`
-   dumps are parsed in pure Python; memory events are kept out of CPU
-   hotspots, full stacks are folded for hotspot analysis, and a user-only
-   stack view is built for the Flame Graph and Call Tree. Metrics are derived
-   and HTML/SVG rendered.
+4. **Post-processing** — `perf script` and `perf mem report` are two
+   independent reads of `perf.data`, so they run at the same time (by then the
+   target is gone and the counters are stopped, so nothing is being measured)
+   and the phase costs the slower of the two rather than their sum. Both keep
+   writing their dump to the profile directory, which is what `vperf report`
+   replays. `perf stat`, `perf script`, and `perf mem report` dumps are then
+   parsed in pure Python; memory events are kept out of CPU hotspots, full
+   stacks are folded for hotspot analysis, and a user-only stack view is built
+   for the Flame Graph and Call Tree. Metrics are derived and HTML/SVG
+   rendered.
 
 Notes & caveats:
 - The normal combined run uses one workload lifetime for per-thread counters,
