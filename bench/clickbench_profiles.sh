@@ -39,6 +39,15 @@ FREQ="${FREQ:-499}"
 # perf dumps stay cheap: at 1e6 a 30 s-CPU query yields ~60k IBS samples for a
 # few seconds of extra post-processing.  Raise it for a very long target.
 MEM_PERIOD="${MEM_PERIOD:-1000003}"
+# Seconds to let clickhouse-local settle before vperf freezes it and attaches.
+# `perf stat --per-thread` only counts the threads alive at attach time, and
+# clickhouse-local needs ~90 ms to build its pool, so this has to outlast that
+# or the Threads tab collapses to a single thread. It also has to stay *under*
+# the runtime of the cheapest query, or that query finishes before anything is
+# collected. Measured on this box: 0.15 s loses 9 of the 43 queries entirely,
+# 0.10 s keeps 48-54 threads with counters (the same pool 0.15 s sees) and
+# collects the short queries; 0 collects every query but leaves 1 thread.
+STARTUP_GRACE="${STARTUP_GRACE:-0.10}"
 VPERF="${VPERF:-}"
 INLINE=0
 RESUME=0
@@ -71,6 +80,10 @@ Environment:
   OUT_ROOT        profile output root                 (default: <repo>/.vperf)
   FREQ            vperf sampling frequency in Hz       (default: 499)
   MEM_PERIOD      vperf --mem-period, IBS cycles       (default: 1000003)
+  STARTUP_GRACE   seconds to let the target settle before the collectors
+                  attach; 0.15 s (vperf's own default) leaves 9 of the 43
+                  queries too short to profile at all
+                                                       (default: 0.10)
   VPERF           vperf command to use                (default: repo venv,
                                                            else python3 -m vperf)
 EOF
@@ -153,7 +166,7 @@ INLINE_FLAG="--no-inline"
 if [ "$INLINE" = 1 ]; then
     INLINE_FLAG=""
 fi
-say "queries=$((TO - FROM + 1))/$N freq=${FREQ}Hz mem_period=$MEM_PERIOD ${INLINE_FLAG:-inlined}"
+say "queries=$((TO - FROM + 1))/$N freq=${FREQ}Hz mem_period=$MEM_PERIOD grace=${STARTUP_GRACE}s ${INLINE_FLAG:-inlined}"
 say "data=$DATA_DIR/hits.parquet ($(du -h "$DATA_DIR/hits.parquet" | cut -f1))"
 say "vperf=$VPERF"
 say "index=$TSV"
@@ -177,7 +190,7 @@ for ((i = FROM; i <= TO; i++)); do
 
     if [ "$DRY_RUN" = 1 ]; then
         echo "== $label -> $dir"
-        echo "   (cd $DATA_DIR && $VPERF run -f $FREQ --mem-period $MEM_PERIOD $INLINE_FLAG -o $dir -- clickhouse-local --time --format=Null --query=\"\$DDL <query>\") </dev/null"
+        echo "   (cd $DATA_DIR && $VPERF run -f $FREQ --mem-period $MEM_PERIOD $INLINE_FLAG --startup-grace $STARTUP_GRACE -o $dir -- clickhouse-local --time --format=Null --query=\"\$DDL <query>\") </dev/null"
         continue
     fi
 
@@ -192,7 +205,8 @@ for ((i = FROM; i <= TO; i++)); do
     set +e
     (
         cd "$DATA_DIR"
-        $VPERF run -f "$FREQ" --mem-period "$MEM_PERIOD" $INLINE_FLAG -o "$dir" -- \
+        $VPERF run -f "$FREQ" --mem-period "$MEM_PERIOD" $INLINE_FLAG \
+            --startup-grace "$STARTUP_GRACE" -o "$dir" -- \
             clickhouse-local --time --format=Null --query="$DDL $q"
     ) </dev/null >"$dir/vperf.log" 2>&1
     rc=$?
@@ -239,9 +253,13 @@ reports=0
 degraded=0
 for d in "${DONE_DIRS[@]}"; do
     [ -f "$d/report.html" ] && reports=$((reports + 1))
-    if grep -qE 'startup grace|perf stat failed|retrying' "$d/vperf.log" 2>/dev/null; then
+    # any of these leaves a report with no samples in it; a target that
+    # finished inside the grace and one whose perf record never opened are the
+    # same outcome for the reader of the summary
+    if grep -qE 'startup grace|perf record failed|perf stat failed|retrying' \
+            "$d/vperf.log" 2>/dev/null; then
         degraded=$((degraded + 1))
-        say "  no samples: ${d##*/} ($(grep -oE 'Target exited during collector startup grace.*' "$d/vperf.log" | head -1))"
+        say "  no samples: ${d##*/} ($(grep -oE 'Target exited during collector startup grace.*|perf record failed.*' "$d/vperf.log" | head -1))"
     fi
 done
 
