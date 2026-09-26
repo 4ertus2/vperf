@@ -281,7 +281,12 @@ function renderFreqChart(W,H,pad_l,pad_b,pad_t,pw,ph,nbuckets){
  var pts_min_l='';envelope.forEach(function(e){pts_min_l+=X(e[0]).toFixed(1)+','+Y(e[1]).toFixed(1)+' ';});
  svg+='<polyline points="'+pts_min_l+'" fill="none" stroke="#409cff" stroke-width="1" stroke-dasharray="2,3" opacity="0.4"/>';
  svg+='<text x="'+(pad_l-44)+'" y="'+(pad_t+10)+'" fill="#bbb">GHz</text>';
- var lw=118,lh=44,lx=W-10-lw,ly=pad_t+14;
+ /* The legend sits in the bottom-right corner: a CPU that is busy runs at its
+    top frequency, so the envelope hugs the ceiling and the space under it is
+    the part of the plot with nothing to cover. It hangs below the zero line
+    into the bottom band, which this chart leaves empty - unlike the utilization
+    one, the frequency view draws no time labels. */
+  var lw=118,lh=44,lx=W-10-lw,ly=H-lh-4;
  svg+='<rect x="'+lx+'" y="'+ly+'" width="'+lw+'" height="'+lh+'" rx="4" fill="rgba(20,24,33,0.85)" stroke="#2a3247"/>';
  svg+='<line x1="'+(lx+8)+'" y1="'+(ly+12)+'" x2="'+(lx+28)+'" y2="'+(ly+12)+'" stroke="#409cff" stroke-width="1.5"/>';
  svg+='<text x="'+(lx+34)+'" y="'+(ly+15)+'" fill="#bbb" font-size="11">median</text>';

@@ -491,6 +491,15 @@ def test_build_html_embeds_group_scopes_and_the_checkbox():
     assert "threadFilter" not in html
 
 
+def test_frequency_legend_sits_in_the_bottom_right_of_the_plot():
+    """A busy CPU runs at its top frequency, so the envelope hugs the ceiling
+    and the space under it is the part of the plot with nothing to cover. The
+    legend has to stay in that corner, hanging below the zero line into the
+    band the frequency view leaves empty - and out of the top of the plot."""
+    assert "var lw=118,lh=44,lx=W-10-lw,ly=H-lh-4;" in _JS
+    assert "ly=pad_t+14" not in _JS
+
+
 def test_memory_tab_has_dynamic_body():
     html = _memory_tab(_profile(), "ibs")
 
