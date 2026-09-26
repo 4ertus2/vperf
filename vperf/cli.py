@@ -13,7 +13,6 @@ from . import __version__
 from .collector import DEFAULT_CALLGRAPH, DEFAULT_STARTUP_GRACE, collect, load_profile
 from .doctor import PERF_ACCESS_HINTS, probe_attach, probe_stat, run_doctor
 from .metrics import MetricsReport, compute_metrics, compute_thread_metrics
-from .memory import event_matches
 from .parsers import StatData, parse_perf_script
 from .perf import perf_available
 from .report_html import build_html
@@ -43,10 +42,12 @@ def _analyze(stat_data: StatData, elapsed: float | None, script_path: str | None
              vendor: str | None = None) -> tuple[list, StackProfile, MetricsReport]:
     samples = []
     if script_path:
+        # stream the dump and let the parser drop the memory samples: they are
+        # reported from the separate `perf mem report` pass, and on AMD each
+        # one carries a full call chain that would otherwise be parsed for
+        # nothing.  See parsers.parse_perf_script.
         with open(script_path, encoding="utf-8", errors="replace") as f:
-            samples = parse_perf_script(f.read())
-    if memory_events:
-        samples = [s for s in samples if not event_matches(s.event, memory_events)]
+            samples = parse_perf_script(f, skip_events=memory_events)
     samples = [s for s in samples if not s.event.startswith("sched:")]
     # Keep only the leaf end of every stack: see stacks.cap_stacks.  This also
     # bounds the sample payload that build_html embeds in the report.

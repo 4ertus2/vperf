@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
+
+from .memory import event_matches
 
 # ---------------------------------------------------------------- stat CSV
 
@@ -399,21 +402,62 @@ def _split_ids(mid: str) -> tuple[int, int]:
     return nums[0], nums[-1]
 
 
-def parse_perf_script(text: str) -> list[ScriptSample]:
+def _frame(fm: re.Match[str]) -> tuple[str, str]:
+    sym = fm.group("sym")
+    dso = fm.group("dso")
+    if sym == "[unknown]" and dso == "[unknown]":
+        # classify unresolved frames by address space
+        addr = fm.group("addr") or ""
+        sym = "[kernel]" if addr.startswith("ff") else "[unresolved]"
+        dso = sym
+    return sym, dso
+
+
+def parse_perf_script(
+    source: str | Iterable[str],
+    skip_events: Collection[str] | None = None,
+) -> list[ScriptSample]:
+    """Parse `perf script` output into samples.
+
+    `source` is the dump text or any iterable of lines; pass an open file to
+    stream it, since a dump can be hundreds of MB and this parser sees one line
+    per stack frame.  Samples whose event is in `skip_events` are dropped as
+    they are read, for callers that discard them anyway - on AMD every IBS
+    sample drags a full call chain through the dump, and those samples are
+    reported from the separate `perf mem report` pass instead.
+    """
+    lines = source.splitlines() if isinstance(source, str) else source
     samples: list[ScriptSample] = []
     cur: dict | None = None
+    drop = False
 
     def commit() -> None:
         nonlocal cur
-        if cur is not None:
+        if cur is not None and not drop:
             samples.append(ScriptSample(**cur))
-            cur = None
+        cur = None
 
-    for raw in text.splitlines():
-        m = _HEADER_RE.match(raw)
+    for raw in lines:
+        raw = raw.rstrip("\n")
+        # A frame line ends with "(dso)" where a header ends with ":", so an
+        # indented line matching the frame pattern is never a header - and
+        # running the header pattern against every frame line is the single
+        # most expensive thing this loop can do.  Anything that does not match
+        # the frame pattern still gets the header treatment, so an indented
+        # header (a thread name starting with a space) parses as before.
+        m = None if raw[:1] in ("\t", " ") else _HEADER_RE.match(raw)
+        if m is None and cur is not None and not drop:
+            fm = _FRAME_RE.match(raw)
+            if fm is not None:
+                cur["frames"].append(_frame(fm))
+                continue
+        if m is None:
+            m = _HEADER_RE.match(raw)
         if m and ":" in m.group("rest"):
             commit()
             pm = _PERIOD_RE.match(m.group("rest").strip())
+            event = pm.group("event") if pm else "?"
+            drop = bool(skip_events) and event_matches(event, skip_events)
             pid, tid = _split_ids(m.group("mid"))
             cur = {
                 "comm": m.group("comm"),
@@ -421,23 +465,18 @@ def parse_perf_script(text: str) -> list[ScriptSample]:
                 "tid": tid,
                 "time": float(m.group("time")),
                 "period": int(pm.group("period")) if pm and pm.group("period") else 1,
-                "event": pm.group("event") if pm else "?",
+                "event": event,
                 "frames": [],
             }
             continue
+        if cur is None or drop:
+            continue
         fm = _FRAME_RE.match(raw)
-        if fm and cur is not None:
-            sym = fm.group("sym")
-            dso = fm.group("dso")
-            addr = fm.group("addr") or ""
-            if sym == "[unknown]" and dso == "[unknown]":
-                # classify unresolved frames by address space
-                sym = "[kernel]" if addr.startswith("ff") else "[unresolved]"
-                dso = sym
-            cur["frames"].append((sym, dso))
+        if fm:
+            cur["frames"].append(_frame(fm))
             continue
         hm = _HEX_RE.match(raw)
-        if hm and cur is not None and not cur["frames"]:
+        if hm and not cur["frames"]:
             cur["frames"].append(("[unknown]", "[unknown]"))
     commit()
     return samples
