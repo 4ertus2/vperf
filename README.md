@@ -246,10 +246,17 @@ The Flame Graph tab behaves like the SVG `flamegraph.pl` output:
   focused frame.
 - **Click the focused frame again** to go back up one level, or click any greyed
   ancestor band to jump straight to it.
-- **Reset Zoom** (top-right of the graph) or **Reset zoom** (panel header) returns
-  to the full graph. Switching thread in the header selector also resets the zoom.
+- **Reset zoom** in the bar under the graph returns to the full graph. Switching
+  thread in the header selector also resets the zoom.
 - The graph scales to the panel width, and frames too narrow to show a label get
   one as soon as they are zoomed into.
+- The graph is exactly as tall as the rows it draws, and never shows a row of
+  hairlines over the flame: it ends at the last row with a frame at least 2px
+  wide and at 48 rows, whichever comes first. A target with broken frame
+  pointers records one stack thousands of frames deep, and the cut rows fold
+  into the frame they hang off — which keeps the width they gave it and says in
+  its tooltip how many rows it stands for. Zooming into a shallow branch brings
+  the bottom edge up with it instead of leaving empty space above.
 
 ### Grouping threads by name
 

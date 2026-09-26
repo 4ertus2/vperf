@@ -6,7 +6,7 @@ import html
 import json
 from dataclasses import dataclass
 
-from .flamegraph import render_flame_svg
+from .flamegraph import MAX_FLAME_DEPTH, render_flame_svg
 from .memory import LATENCY_BANDS, MemSymbol, MemoryProfile, backend_label
 from .wait import WAIT_BANDS_MS, WaitProfile
 from .metrics import (
@@ -72,10 +72,9 @@ select{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-
 .flame g.fg{cursor:pointer}
 .flame g.fg:hover rect{stroke:#fff;stroke-width:.8}
 .flame g.fg.ffocus rect{stroke:#ffd24f;stroke-width:1.4}
-.flame .fhit{pointer-events:all}
-.flame .freset{cursor:pointer}
-.flame .freset:hover{text-decoration:underline}
-.flame-head{display:flex;align-items:baseline;gap:12px;margin-bottom:12px}
+.flame-head,.flame-foot{display:flex;align-items:baseline;gap:12px}
+.flame-head{margin-bottom:12px}
+.flame-foot{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
 .flame-head h3{margin:0}
 .note{color:var(--dim);font-size:12px}
 .flame-reset{color:var(--accent);cursor:pointer;font-size:12px;text-decoration:none}
@@ -358,14 +357,15 @@ function flameInitOne(div){
  var ds=svg.dataset;
  var st={svg:svg,frames:[],focus:null,anc:[],byEl:new Map(),
   row:+ds.row,font:+ds.font,gap:+ds.gap,lmin:+ds.lmin,cw:+ds.cw,total:1,
-  ovl:svg.querySelector('.fovl'),ctx:svg.querySelector('.fctx'),
-  head:svg.querySelector('.ftitle'),reset:svg.querySelector('.freset')};
+  w:+svg.getAttribute('width'),h0:+svg.getAttribute('height'),pad:+ds.pad,
+  body:svg.querySelector('.fbody'),ovl:svg.querySelector('.fovl'),ctx:svg.querySelector('.fctx'),
+  head:svg.querySelector('.ftitle')};
  var gs=svg.querySelectorAll('g.fg');
  for(var i=0;i<gs.length;i++){
   var g=gs[i];
   var fr={g:g,rect:g.querySelector('rect'),txt:g.querySelector('text'),
    n:g.dataset.n,v:+g.dataset.v,d:+g.dataset.d,
-   x:+g.dataset.x,w:+g.dataset.w,y:+g.dataset.y};
+   x:+g.dataset.x,w:+g.dataset.w,y:+g.dataset.y,folds:g.dataset.foldNote||''};
   st.frames.push(fr);st.byEl.set(g,fr);
   if(fr.d===0) st.total=fr.v;}  /* the depth-0 root spans the whole graph */
  if(st.head) st.orig=st.head.textContent;
@@ -379,9 +379,8 @@ function flameInitOne(div){
   var hit=e.target.closest?e.target.closest('g.fg,g.fcx'):null;
   if(!hit) return;
   focusFrame(hit.classList.contains('fcx')?st.anc[+hit.dataset.i]:st.byEl.get(hit));});
- [st.reset,svg.querySelector('.fhit')].forEach(function(el){
-  if(el) el.addEventListener('click',function(e){e.stopPropagation();flameRender(st,null);});});
- flameStates.push(st);}
+ flameStates.push(st);
+ flameRender(st,null);}  /* lays out, and sizes the canvas to what is drawn */
 
 function flameInit(){
  var divs=document.querySelectorAll('#flamewrap .flame');
@@ -396,9 +395,9 @@ function flameParent(st,f){
  return p;}
 
 function flameRender(st,f){
- var W=+st.svg.getAttribute('width'),ep=FLAME_EPS,gap=st.gap;
+ var W=st.w,ep=FLAME_EPS,gap=st.gap;
  st.focus=f;
- var tot=f?f.v:st.total,anc=[],s='';
+ var tot=f?f.v:st.total,anc=[],s='',top=st.h0;
  st.frames.forEach(function(fr){
   var show=true,x=fr.x,w=fr.w;
   if(f){
@@ -413,12 +412,13 @@ function flameRender(st,f){
     if(fr.x<=f.x+ep&&fr.x+fr.w>=f.x+f.w-ep) anc.push(fr);}}  /* greyed call path */
   fr.g.style.display=show?'':'none';
   if(!show) return;
+  if(fr.y<top) top=fr.y;
   var dw=Math.max(w-gap,gap);
   fr.rect.setAttribute('x',x.toFixed(2));
   fr.rect.setAttribute('width',dw.toFixed(2));
   fr.g.classList.toggle('ffocus',fr===f);
   fr.g.querySelector('title').textContent=
-   fr.n+' ('+(fr.v/tot*100).toFixed(1)+'%, '+fr.v.toLocaleString()+')';
+   fr.n+' ('+(fr.v/tot*100).toFixed(1)+'%, '+fr.v.toLocaleString()+')'+fr.folds;
   var t=flameLabel(st,fr.n,dw);
   if(t){
    if(!fr.txt){
@@ -441,6 +441,12 @@ function flameRender(st,f){
    +'" rx="1" fill="#3c4459"/><text x="2" y="'+(a.y+st.row-5)
    +'" fill="#c3cbe0">'+escHtml(flameLabel(st,a.n,W))+'</text></g>';}
  st.ctx.innerHTML=s;
+ /* the flame stays on the bottom edge; the canvas only comes down to the
+    topmost row still drawn, so a shallow zoom shows no empty space above it */
+ var shift=Math.max(0,top-st.pad);
+ st.svg.setAttribute('height',st.h0-shift);
+ st.svg.setAttribute('viewBox','0 0 '+W+' '+(st.h0-shift));
+ st.body.setAttribute('transform',shift?'translate(0,'+(-shift)+')':'');
  st.ovl.style.display=f?'':'none';
  if(st.head) st.head.textContent=st.orig+(f?' ▸ '+f.n:'');}
 
@@ -1324,10 +1330,12 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 
 <div id="flame" class="page">
 <div class="panel"><div class="flame-head"><h3>Flame graph</h3>
-<span class="note">click a frame to zoom into that branch — click it again to go back up</span>
+<span class="note">click a frame to zoom into that branch — click it again to go back up;
+rows too thin to read, and anything past {MAX_FLAME_DEPTH} rows, fold into the last row</span></div>
+<div id="flamewrap">{''.join(flame_divs)}</div>
+<div class="flame-foot"><span class="note">the graph is as tall as its deepest visible row</span>
 <span style="flex:1"></span>
-<a href="#" class="flame-reset" onclick="resetFlameZoom(event)">Reset zoom</a></div>
-<div id="flamewrap">{''.join(flame_divs)}</div></div>
+<a href="#" class="flame-reset" onclick="resetFlameZoom(event)">Reset zoom</a></div></div>
 </div>
 
 <div id="tree" class="page">

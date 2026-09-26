@@ -1,5 +1,7 @@
 """Unit tests for parsers and metric derivation using captured perf output."""
 
+import re
+
 from vperf.parsers import (
     ScriptSample,
     parse_perf_script,
@@ -9,7 +11,7 @@ from vperf.parsers import (
 )
 from vperf.metrics import compute_metrics, compute_thread_metrics, all_hints
 from vperf.stacks import build_profile
-from vperf.flamegraph import render_flame_svg, build_tree
+from vperf.flamegraph import MAX_FLAME_DEPTH, render_flame_svg, build_tree
 
 
 # --------------------------------------------------------------- stat CSV
@@ -399,11 +401,63 @@ def test_flamegraph_svg_carries_zoom_geometry():
     assert svg.count('data-y="') == svg.count('class="fg"')
     assert svg.count('data-d="') == svg.count('class="fg"')
     assert svg.count('data-x="') == svg.count('class="fg"')
-    # the overlay the zoom reveals: context bands plus the way back out
+    # the canvas is trimmed to the topmost drawn row, so the client needs the
+    # height of the band above it
+    assert 'data-pad="22"' in svg
+    # the frames share one group, which is what the client shifts up when a
+    # zoom leaves the rows above it empty
+    assert svg.count('class="fbody"') == 1
+    # the overlay the zoom reveals is the greyed call path only - the way out of
+    # a zoom is a link in the panel footer, not a control in the picture
     assert 'class="fovl"' in svg
     assert 'class="fctx"' in svg
-    assert 'class="freset"' in svg
-    assert "Reset Zoom" in svg
+    assert "freset" not in svg
+    assert "Reset Zoom" not in svg
+
+
+def test_flamegraph_svg_folds_stacks_deeper_than_the_row_cap():
+    """A broken frame-pointer chain records thousands of frames per sample, and
+    drawing them all turns the graph into a wall taller than the window. Past
+    the cap the tail folds into the last row, which keeps its width and says
+    how many rows it stands for."""
+    depth = 200
+    svg, h = render_flame_svg({";".join(f"f{i}" for i in range(depth)): 100},
+                              max_depth=10)
+
+    assert h == 10 * 17 + 8            # ten rows, not two hundred
+    assert svg.count('class="fg"') == 10
+    # the deepest drawn frame is the one the cap cuts, and it holds the weight
+    deepest = re.findall(r'<g class="fg"[^>]*data-d="9"[^>]*>', svg)[0]
+    assert 'data-v="100"' in deepest
+    assert 'data-folds="191"' in deepest   # 200 frames, 9 of them drawn
+    assert "191 deeper rows folded in" in svg
+    # a graph that fits is not cut, and says nothing about folding
+    shallow, _ = render_flame_svg({";".join(f"f{i}" for i in range(5)): 100},
+                                  max_depth=10)
+    assert "data-folds" not in shallow
+    assert "folded in" not in shallow
+
+
+def test_flamegraph_svg_stops_where_the_frames_stop_being_readable():
+    """One stack a hundredth of the width, a hundred frames deeper than the
+    rest, is a hairline tower over the flame - the graph ends at the last row
+    with something in it wide enough to read, and the row it ends on says how
+    many rows it stands for."""
+    thin = ";".join(f"t{i}" for i in range(20))
+    folded = {"wide;a;b": 900, "wide;c": 100, f"wide;c;{thin}": 1}
+    svg, h = render_flame_svg(folded, title="t")
+
+    assert len({int(y) for y in re.findall(r'data-y="(\d+)"', svg)}) == 4
+    assert h == 4 * 17 + 22
+    assert "+19 deeper rows folded in" in svg
+    # the frames on the last row keep the width the cut rows gave them
+    last_row = re.findall(r'<g class="fg"[^>]*data-d="3"[^>]*>', svg)
+    assert {re.search(r'data-n="([^"]+)"', g).group(1) for g in last_row} == {"b", "t0"}
+    assert {re.search(r'data-w="([\d.]+)"', g).group(1) for g in last_row} == {
+        f"{900 / 1001 * 1160:.4f}", f"{1 / 1001 * 1160:.4f}"}
+    # only the frame the thin stack hangs off has anything folded into it
+    assert [re.search(r'data-n="([^"]+)"', g).group(1) for g in last_row
+            if "data-folds" in g] == ["t0"]
 
 
 # ---------------------------------------------------------------- metrics
@@ -434,14 +488,18 @@ def test_flamegraph_handles_deeply_nested_stacks():
     """A target with a broken frame-pointer chain yields chains thousands of
     frames deep (a ClickHouse debug build records 6000+ frames per sample).
     The flame graph layout must not recurse per level, or the whole report
-    dies with RecursionError."""
+    dies with RecursionError - and it stops at the row cap either way."""
     depth = 6000
     folded = {";".join(f"f{i}" for i in range(depth)): 100}
     svg, h = render_flame_svg(folded)
 
     assert svg.startswith("<svg")
-    assert h == (depth + 1) * 17 + 8   # one row per level, root included
-    assert svg.count('class="fg"') == depth + 1
+    assert h == MAX_FLAME_DEPTH * 17 + 8   # capped, root row included
+    assert svg.count('class="fg"') == MAX_FLAME_DEPTH
+    # nothing is lost but the rows: the deepest drawn frame still spans the
+    # whole width and says how many rows it stands for
+    assert f'data-folds="{depth - MAX_FLAME_DEPTH + 1}"' in svg
+    assert 'data-w="1160.0000"' in svg
 
 
 def test_call_tree_html_handles_deeply_nested_stacks():
