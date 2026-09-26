@@ -367,3 +367,38 @@ def test_hints():
     hs = all_hints(m)
     assert any("IPC" in h for h in hs)      # ipc 4.9 -> high
     assert any("LLC" in h for h in hs)      # ~13.6% -> high
+
+
+# ------------------------------------------------------- deep stack chains
+
+def test_flamegraph_handles_deeply_nested_stacks():
+    """A target with a broken frame-pointer chain yields chains thousands of
+    frames deep (a ClickHouse debug build records 6000+ frames per sample).
+    The flame graph layout must not recurse per level, or the whole report
+    dies with RecursionError."""
+    depth = 6000
+    folded = {";".join(f"f{i}" for i in range(depth)): 100}
+    svg, h = render_flame_svg(folded)
+
+    assert svg.startswith("<svg")
+    assert h == (depth + 1) * 17 + 8   # one row per level, root included
+    assert svg.count('class="fg"') == depth + 1
+
+
+def test_call_tree_html_handles_deeply_nested_stacks():
+    from vperf.report_html import _tree_html
+    from vperf.stacks import TreeNode
+
+    depth = 6000
+    root = TreeNode("root", value=100)
+    node = root
+    for i in range(depth):
+        # same value everywhere: the tree prunes children below 0.1% of total
+        child = TreeNode(f"n{i}", value=100)
+        node.children[child.name] = child
+        node = child
+
+    html = _tree_html(root, 100)
+
+    assert html.count("<summary>") == depth
+    assert html.count("</details>") == depth

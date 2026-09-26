@@ -58,6 +58,26 @@ class StackProfile:
 
 _TRANSIENT_COMM = {"perf-exec", "perf", "?", "", "[unknown]"}
 _KERNEL_BOUNDARY = "[kernel boundary]"
+# perf's own default call-graph depth; see cap_stacks for why the recorded
+# stacks are not trusted to come back sane.
+MAX_STACK_FRAMES = 128
+
+
+def cap_stacks(samples: list[ScriptSample], limit: int = MAX_STACK_FRAMES) -> list[ScriptSample]:
+    """Drop the caller-side tail of every sample, keeping the leaf end.
+
+    A target that does not preserve frame pointers leaves the unwinder walking
+    stale stack memory, and an attached record can come back with thousands of
+    frames per sample - all of them past the real outermost frame.  The leaf
+    side is what self-time attribution, the folded keys and the flame graph
+    need, so the tail is what goes.
+    """
+    out: list[ScriptSample] = []
+    for s in samples:
+        if len(s.frames) > limit:
+            s.frames = s.frames[:limit]
+        out.append(s)
+    return out
 
 
 def _is_transient(comm: str) -> bool:
@@ -171,9 +191,12 @@ def build_profile(samples: list[ScriptSample]) -> StackProfile:
             ti.comm = s.comm
         ti.cycles += w
 
-        # perf prints leaf-first; normalize to caller->leaf
-        callers = [sanitize_symbol(sym) for sym, _dso in reversed(s.frames)]
-        leaf_dso = s.frames[0][1] if s.frames else "[unknown]"
+        # perf prints leaf-first; normalize to caller->leaf.  The same cap as
+        # cap_stacks(), which the CLI applies up front - repeated here so a
+        # direct caller of build_profile() cannot build an unbounded tree.
+        frames = s.frames[:MAX_STACK_FRAMES]
+        callers = [sanitize_symbol(sym) for sym, _dso in reversed(frames)]
+        leaf_dso = frames[0][1] if frames else "[unknown]"
 
         if not callers:
             callers = ["[unknown]"]
@@ -199,7 +222,7 @@ def build_profile(samples: list[ScriptSample]) -> StackProfile:
         chains[chain] += w
         prof.folded[";".join(chain)] = prof.folded.get(";".join(chain), 0) + w
 
-        user_frames, has_kernel = _user_stack_frames(s.frames)
+        user_frames, has_kernel = _user_stack_frames(frames)
         if user_frames or has_kernel:
             user_callers = [sanitize_symbol(sym) for sym in reversed(user_frames)]
             if has_kernel or not user_callers:

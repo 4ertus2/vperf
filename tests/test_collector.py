@@ -104,19 +104,21 @@ def test_callgraph_defaults_to_frame_pointers():
 
 
 def test_callgraph_arguments_are_mode_specific():
-    assert collector._callgraph_args("fp") == ["--call-graph", "fp"]
+    # the frame-pointer depth is stated explicitly (perf's default is 127);
+    # dwarf keeps a much deeper budget for real DWARF call chains
+    assert collector._callgraph_args("fp") == ["--call-graph", "fp,127"]
     assert collector._callgraph_args("dwarf") == ["--call-graph", "dwarf,16384"]
     assert collector._callgraph_args("none") == []
 
     record = collector._cpu_record_args("perf.data", "cycles:P", 199, "fp")
-    assert record[record.index("--call-graph") + 1] == "fp"
+    assert record[record.index("--call-graph") + 1] == "fp,127"
     assert "fp,16384" not in record
 
     assert collector._frame_pointer_args(
         ["record", "--call-graph", "dwarf,16384", "-e", "cycles"],
-    ) == ["record", "--call-graph", "fp", "-e", "cycles"]
+    ) == ["record", "--call-graph", "fp,127", "-e", "cycles"]
     assert collector._frame_pointer_args(["record", "-e", "cycles"]) == [
-        "record", "--call-graph", "fp", "-e", "cycles",
+        "record", "--call-graph", "fp,127", "-e", "cycles",
     ]
 
 
@@ -155,7 +157,7 @@ def test_collect_cojoins_cpu_and_memory_events(monkeypatch, tmp_path):
     assert profile.meta["memory"]["cojoined"] is True
     assert profile.meta["memory"]["data_file"] == "perf.data"
     assert profile.mem_report_path is not None
-    assert record[record.index("--call-graph") + 1] == "fp"
+    assert record[record.index("--call-graph") + 1] == "fp,127"
     assert "fp,16384" not in record
     assert profile.meta["callgraph"] == "fp"
 
@@ -445,7 +447,7 @@ def test_collect_combines_attached_stat_and_record(monkeypatch, tmp_path):
     assert "app" not in stat_call + record_call
     assert "cycles/freq=399/P" in record_call
     assert "ibs_op/period=100003/p" in record_call
-    assert record_call[record_call.index("--call-graph") + 1] == "fp"
+    assert record_call[record_call.index("--call-graph") + 1] == "fp,127"
     assert "fp,16384" not in record_call
     assert len(record_calls) == 1
     assert len([call for call in postprocess_calls if call[:1] == ["script"]]) == 1

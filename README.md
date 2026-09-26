@@ -48,6 +48,19 @@ Only `AMD_ONLY_EVENTS` are vendor-gated: on Intel and on unrecognised vendors
 they are never requested, so `perf stat` does not emit `<not counted>` noise.
 Everything else is collected and reported identically on both vendors.
 
+`vperf run` / `vperf attach` expose `--mem-period` to set the AMD IBS sampling
+period (default 100003 cycles). Memory samples scale linearly with the run
+length divided by the period, so raise it for long-running targets: at
+100003 a 60 s multi-threaded target produces millions of IBS samples, which
+also makes `perf script` / `perf mem report` proportionally slower.
+
+`--no-inline` drops DWARF inline expansion from both `perf script` and
+`perf mem report`. Self time then lands on the enclosing (non-inlined)
+function instead of the innermost inlined callee. The trade is worth it on
+huge C++ targets: a ClickHouse debug build (4.9 GB, 1.5 M symbols) spends
+~80 s per `perf` invocation expanding inlines versus ~2 s without, and that
+cost is paid twice per profile.
+
 
 ## Setup
 
@@ -187,6 +200,8 @@ vperf run -- ./yourapp                            # profile with defaults
 vperf run -o baseline -- ./yourapp input.bin      # save to a named directory
 vperf run -f 999 -- ./yourapp input.bin           # higher sampling frequency
 vperf run --callgraph dwarf -- ./yourapp         # higher-quality stacks when DWARF is available
+vperf run --mem-period 1000003 -- ./longjob      # thin the IBS memory samples (AMD)
+vperf run --no-inline -- ./hugebinary            # skip DWARF inline expansion
 
 # compare two runs
 vperf diff .vperf/baseline .vperf/optimized
@@ -290,7 +305,12 @@ Notes & caveats:
   but the target must preserve frame pointers. Missing frame pointers can
   produce short, unresolved, or incorrect stacks and may reduce hotspot and
   call-tree quality. Use `--callgraph dwarf` for optimized binaries with good
-  DWARF/CFI unwind data. Symbol names still require a symbol table; fully
+  DWARF/CFI unwind data.
+- Stacks are capped at 128 frames from the caller end, which is perf's own
+  call-graph depth. A broken frame-pointer chain otherwise keeps resolving into
+  stale stack memory and can emit thousands of frames per sample, all of them
+  past the real outermost frame: the leaf side that self-time attribution needs
+  is kept, the rest is dropped. Symbol names still require a symbol table; fully
   stripped binaries can only provide address-based samples.
 - DWARF unwinding is done offline; `DEBUGINFOD_URLS` is stripped from perf's
   environment to prevent multi-second network hangs.
@@ -358,6 +378,25 @@ instructions, not work.
 
 Other workloads: `sleeper` (100 ms spin + 200 ms usleep — wait-analysis
 signature: ~2/3 of the window asleep).
+
+## Profiling a whole ClickBench sweep
+
+`bench/clickbench_profiles.sh` profiles every ClickBench query with
+`clickhouse-local` and keeps one profile directory per query:
+
+```bash
+bench/clickbench_profiles.sh --dry-run          # show the commands first
+bench/clickbench_profiles.sh --from 18 --to 22  # a subset
+bench/clickbench_profiles.sh --resume           # skip queries already profiled
+```
+
+The schema and the queries come from the ClickBench checkout
+(`$CLICKBENCH_DIR/clickhouse-parquet/`), and the run is strictly sequential —
+concurrent profiling sessions multiplex the hardware counters. Queries are timed
+once and repeated in-process only while they are too short to sample, with the
+repetition count recorded in the run's TSV index. Each profile keeps the exact
+statement list in `queries.sql` next to the usual artifacts, so
+`vperf report <dir>` can regenerate the HTML at any time.
 
 ## Cycle mode: before/after comparisons with ministat
 

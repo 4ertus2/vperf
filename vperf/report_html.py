@@ -765,18 +765,40 @@ def _threads_table(prof: StackProfile, wp: WaitProfile | None = None) -> str:
 
 
 def _tree_html(node: TreeNode, total: int, depth: int = 0) -> str:
-    if node.value / max(total, 1) < 0.001 and depth > 1:
-        return ""
-    children = sorted(node.children.values(), key=lambda c: -c.value)
-    pct = node.value / max(total, 1) * 100
-    self_pct = max(node.value - sum(c.value for c in children), 0) / max(total, 1) * 100
-    if not children:
-        return (f"<div style='padding-left:18px'><span class='mono'>{esc(node.name)}</span>"
-                f"<span class='selfpct'>{pct:.1f}% · self {self_pct:.1f}%</span></div>")
-    inner = "".join(_tree_html(c, total, depth + 1) for c in children[:40])
-    return (f"<details{' open' if depth < 2 else ''}><summary>"
-            f"<span class='mono'>{esc(node.name)}</span>"
-            f"<span class='selfpct'>{pct:.1f}% · self {self_pct:.1f}%</span></summary>{inner}</details>")
+    """Render the call tree as nested <details>.
+
+    Iterative on purpose: deep frame-pointer chains (thousands of frames on
+    some targets) would exceed the interpreter's recursion limit.
+    """
+    out: list[str] = []
+    # (node, depth, closer) with closer appended when the node is popped.
+    pending: list[tuple[TreeNode, int, str | None]] = [(node, depth, None)]
+    while pending:
+        current, current_depth, closer = pending.pop()
+        if closer is not None:
+            out.append(closer)
+            continue
+        if current.value / max(total, 1) < 0.001 and current_depth > 1:
+            continue
+        children = sorted(current.children.values(), key=lambda c: -c.value)
+        pct = current.value / max(total, 1) * 100
+        self_pct = (max(current.value - sum(c.value for c in children), 0)
+                    / max(total, 1) * 100)
+        if not children:
+            out.append(
+                f"<div style='padding-left:18px'><span class='mono'>{esc(current.name)}</span>"
+                f"<span class='selfpct'>{pct:.1f}% · self {self_pct:.1f}%</span></div>"
+            )
+            continue
+        out.append(
+            f"<details{' open' if current_depth < 2 else ''}><summary>"
+            f"<span class='mono'>{esc(current.name)}</span>"
+            f"<span class='selfpct'>{pct:.1f}% · self {self_pct:.1f}%</span></summary>"
+        )
+        pending.append((current, current_depth, "</details>"))
+        for child in reversed(children[:40]):
+            pending.append((child, current_depth + 1, None))
+    return "".join(out)
 
 
 def _memory_content(mem: MemoryProfile | None, backend: str | None = "ibs",

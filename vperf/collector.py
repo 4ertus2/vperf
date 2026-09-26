@@ -111,6 +111,7 @@ def _memory_meta(*, enabled: bool, backend: str | None, period: int,
 
 
 DEFAULT_CALLGRAPH = "fp"
+DEFAULT_STACK_DEPTH = 127      # perf's own default; kept explicit, see _callgraph_args
 
 # `perf report -s` accepts: pid, comm, dso, symbol, parent, cpu, socket, srcline,
 # weight, local_weight, cgroup_id, addr.  There is no `tgid` key, and a rejected
@@ -193,7 +194,12 @@ def _callgraph_args(callgraph_mode: str) -> list[str]:
     if callgraph_mode == "none":
         return []
     if callgraph_mode == "fp":
-        return ["--call-graph", "fp"]
+        # The depth is stated explicitly: perf's own default is 127, but an
+        # attached record can come back with far deeper chains (a broken
+        # frame-pointer chain keeps resolving into stale stack memory), which
+        # bloats perf.data, script.txt and the report for no benefit - the
+        # extra frames are past the real outermost frame either way.
+        return ["--call-graph", f"fp,{DEFAULT_STACK_DEPTH}"]
     return ["--call-graph", "dwarf,16384"]
 
 
@@ -281,7 +287,8 @@ def _perf_error_summary(error_lines: list[str]) -> str:
 
 
 def _memory_report(data_path: str, outdir: str, events: list[str],
-                   backend: str, warnings: list[str]) -> str | None:
+                   backend: str, warnings: list[str],
+                   inline: bool = True) -> str | None:
     report_path = os.path.join(outdir, "mem_report.txt")
     saw_report = False
     last_error = ""
@@ -291,6 +298,8 @@ def _memory_report(data_path: str, outdir: str, events: list[str],
                 "--show-total-period"]
         if sort_name:
             args += ["--sort", sort_name]
+        if not inline:
+            args.append("--no-inline")
         result = run_perf(args, timeout=900, stdout_file=report_path)
         error_lines = (result.stderr or "").strip().splitlines()
         if not result.ok:
@@ -601,6 +610,7 @@ def _collect_combined(
     use_wait: bool,
     use_freq: bool,
     callgraph_mode: str,
+    inline: bool,
     quiet_stdout: bool,
     ev_list: list[str],
     metric_list: list[str],
@@ -782,9 +792,13 @@ def _collect_combined(
     record_ok = record_result is not None and record_result.ok
     if record_ok:
         script_candidate = os.path.join(outdir, "script.txt")
-        script_result = run_perf(
-            ["script", "-i", data_path], timeout=600, stdout_file=script_candidate,
-        )
+        script_args = ["script", "-i", data_path]
+        if not inline:
+            # Inline expansion reads the target's DWARF; for a stripped-debug
+            # --strip-debug'd or multi-million-symbol binary it dominates the
+            # dump time (tens of seconds per invocation on the same perf.data).
+            script_args.append("--no-inline")
+        script_result = run_perf(script_args, timeout=600, stdout_file=script_candidate)
         if script_result.ok:
             script_path = script_candidate
             if wait_events:
@@ -806,6 +820,7 @@ def _collect_combined(
     if record_ok and active_memory_plan is not None and os.path.exists(data_path):
         mem_report_path = _memory_report(
             data_path, outdir, memory_events, mem_backend or "memory", warnings,
+            inline=inline,
         )
         memory_enabled = mem_report_path is not None
         memory_cojoined = memory_enabled
@@ -840,6 +855,7 @@ def _collect_combined(
         "metrics": metric_list,
         "precise_event": precise_ev,
         "callgraph": callgraph_mode,
+        "inline": inline,
         "thread_stats": {
             "enabled": thread_stats is not None,
             "cojoined": stat_cojoined,
@@ -885,6 +901,7 @@ def collect(
     use_wait: bool = True,
     use_freq: bool = True,
     callgraph_mode: str = DEFAULT_CALLGRAPH,
+    inline: bool = True,
     quiet_stdout: bool = False,
 ) -> ProfileData:
     """Profile either a new process (`target_cmd`) or an existing one (`pid`)."""
@@ -914,6 +931,7 @@ def collect(
             use_wait=use_wait,
             use_freq=use_freq,
             callgraph_mode=callgraph_mode,
+            inline=inline,
             quiet_stdout=quiet_stdout,
             ev_list=ev_list,
             metric_list=metric_list,
@@ -1101,7 +1119,8 @@ def collect(
         r = run_perf(args + ["--", *placeholder], timeout=(duration or 0) + 3600)
         if r.ok:
             mem_report_path = _memory_report(
-                memory_data_path, outdir, memory_events, mem_backend or "memory", warnings)
+                memory_data_path, outdir, memory_events, mem_backend or "memory",
+                warnings, inline=inline)
             memory_enabled = mem_report_path is not None
         else:
             memory_error = (r.stderr or "").strip().splitlines()
@@ -1133,6 +1152,7 @@ def collect(
         "metrics": metric_list,
         "precise_event": precise_ev,
         "callgraph": callgraph_mode,
+        "inline": inline,
         "thread_stats": {
             "enabled": False,
             "cojoined": False,
