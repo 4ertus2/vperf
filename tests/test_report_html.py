@@ -2,13 +2,18 @@ import re
 from dataclasses import asdict
 
 from vperf.memory import MemSymbol, MemoryProfile
-from vperf.metrics import LLC_SOURCE_AMD, LLC_SOURCE_GENERIC, MetricsReport
-from vperf.parsers import ScriptSample
+from vperf.metrics import LLC_SOURCE_AMD, LLC_SOURCE_GENERIC, MetricsReport, compute_metrics
+from vperf.parsers import ScriptSample, StatData
 from vperf.report_html import (
     _JS,
+    _group_options,
     _memory_html_map,
     _memory_tab,
+    _merge_memory_profiles,
     _overview_content,
+    _overview_html_map,
+    _thread_groups,
+    _ThreadGroup,
     _threads_table,
     build_html,
 )
@@ -232,6 +237,167 @@ def test_build_html_embeds_thread_overview_metrics():
     assert "7.50%" in html
     assert "12.50%" in html
     assert 'value="42"' in html
+
+
+def _thread_payload(tid: int, comm: str, **counters) -> dict:
+    """A `_thread_metrics` entry as cli.py writes it: the whole MetricsReport of
+    one thread, raw counters included."""
+    return {"tid": tid, "comm": comm,
+            "metrics": asdict(compute_metrics(StatData(summary=counters), 1.0, 1))}
+
+
+def test_thread_groups_unions_every_per_thread_source():
+    prof = build_profile([
+        ScriptSample("worker", 100, 101, 1.0, 10, "cycles:P", [("alpha", "app")]),
+        ScriptSample("worker", 100, 102, 1.1, 20, "cycles:P", [("beta", "app")]),
+    ])
+    mem = MemoryProfile()
+    mem.by_tid[101] = MemoryProfile(tid=101, comm="worker")
+    mem.by_tid[103] = MemoryProfile(tid=103, comm="solo")
+
+    groups = _thread_groups(prof, mem, {"104": _thread_payload(104, "worker")})
+
+    # sampled 101/102, memory-only 103, counters-only 104
+    assert groups == [("solo", [103]), ("worker", [101, 102, 104])]
+
+
+def test_thread_groups_file_a_thread_under_its_sampled_name():
+    """`perf mem report` labels every thread of a process with the process
+    name, so believing it over the sampler would put one thread in two groups
+    and count its cycles twice."""
+    prof = build_profile([
+        ScriptSample("ParquetDecoder", 100, 101, 1.0, 300, "cycles:P", [("a", "app")]),
+        ScriptSample("QueryPipelineEx", 100, 102, 1.1, 100, "cycles:P", [("b", "app")]),
+    ])
+    mem = MemoryProfile()
+    mem.by_tid[101] = MemoryProfile(tid=101, comm="ThreadPool")
+    mem.by_tid[102] = MemoryProfile(tid=102, comm="ThreadPool")
+    mem.by_tid[103] = MemoryProfile(tid=103, comm="ThreadPool")
+
+    groups = _thread_groups(prof, mem, {})
+
+    assert groups == [("ParquetDecoder", [101]), ("QueryPipelineEx", [102]),
+                      ("ThreadPool", [103])]
+    assert sum(1 for _, tids in groups for tid in tids) == len(prof.by_thread) + 1
+    shares = sum(t.cycles for t in prof.by_thread.values())
+    assert shares == prof.total_cycles          # no thread counted twice
+
+
+def test_group_overview_sums_counters_before_deriving_rates():
+    prof = build_profile([
+        ScriptSample("worker", 100, 101, 1.0, 100, "cycles:P", [("alpha", "app")]),
+        ScriptSample("worker", 100, 102, 1.1, 900, "cycles:P", [("beta", "app")]),
+    ])
+    m = compute_metrics(StatData(summary={"cycles": 1000, "instructions": 1400}), 1.0, 4)
+    group = _ThreadGroup("worker", "g0", [101, 102])
+    meta = {
+        "target": {"cmd": ["app"]},
+        "ncpus": 4,
+        "_thread_metrics": {
+            "101": _thread_payload(101, "worker", cycles=100, instructions=400,
+                                   **{"task-clock": 100}),
+            "102": _thread_payload(102, "worker", cycles=900, instructions=1000,
+                                   **{"task-clock": 900}),
+        },
+    }
+
+    html = build_html(meta, [], m, prof)
+    page = _overview_html_map(m, 4, prof, meta["_thread_metrics"], [group])["g0"]
+
+    # 1400 / 1000 summed, not the mean of 4.00 and 1.11
+    assert "1.40 / 0.71" in page
+    assert "4.00" not in page
+    assert "Scope: worker ×2 threads" in page
+    # the per-thread views are untouched by the group entry
+    assert 'value="101"' in html
+
+
+def test_group_overview_falls_back_to_samples_without_counters():
+    prof = build_profile([
+        ScriptSample("pool", 100, 101, 1.0, 250, "cycles:P", [("alpha", "app")]),
+        ScriptSample("pool", 100, 102, 1.1, 250, "cycles:P", [("alpha", "app")]),
+        ScriptSample("solo", 100, 103, 1.2, 500, "cycles:P", [("beta", "app")]),
+    ])
+    m = compute_metrics(StatData(summary={"task-clock": 1000}), 1.0, 4)
+    group = _ThreadGroup("pool", "g0", [101, 102])
+
+    page = _overview_html_map(m, 4, prof, {}, [group])["g0"]
+
+    assert "Scope: pool ×2 threads" in page
+    assert "Threads in group" in page
+    assert "50.0" in page                      # half the run's cycles
+    assert "Not collected for these threads" in page
+
+
+def test_group_memory_merges_member_samples():
+    def profile(tid: int, samples: int) -> MemoryProfile:
+        p = MemoryProfile(tid=tid, comm="pool")
+        p.total_samples = p.classified_samples = samples
+        p.level_samples = {"DRAM": samples}
+        p.level_weight = {"DRAM": samples * 100}
+        p.by_symbol["decode"] = MemSymbol("decode", "app", samples, samples * 100, samples)
+        return p
+
+    mem = MemoryProfile()
+    mem.by_tid[101] = profile(101, 30)
+    mem.by_tid[102] = profile(102, 10)
+    mem.by_tid[103] = profile(103, 5)
+
+    merged = _merge_memory_profiles([mem.by_tid[101], mem.by_tid[102]])
+
+    assert merged.total_samples == 40
+    assert merged.classified_samples == 40
+    assert merged.level_samples == {"DRAM": 40}
+    assert merged.level_weight == {"DRAM": 4000}
+    assert merged.by_symbol["decode"].samples == 40
+
+    pages = _memory_html_map(mem, "ibs", None, True, [_ThreadGroup("pool", "g0", [101, 102])])
+
+    # tid 103 is not in the group, so only the two members are added up
+    assert "g0" in pages
+    assert "pool ×2 threads" in pages["g0"]
+
+
+def test_group_options_list_one_entry_per_name():
+    prof = StackProfile(
+        total_cycles=1000,
+        by_thread={
+            101: ThreadInfo(101, 100, "worker", 400),
+            102: ThreadInfo(102, 100, "worker", 300),
+            103: ThreadInfo(103, 100, "solo", 300),
+        },
+    )
+    groups = [_ThreadGroup("solo", "103", [103]),
+              _ThreadGroup("worker", "g1", [101, 102])]
+
+    opts = _group_options(groups, prof)
+
+    assert opts.startswith('<option value="">All threads</option>')
+    assert '<option value="103">solo (tid 103, 30%)</option>' in opts
+    assert '<option value="g1">worker ×2 (70%, tids 101, 102)</option>' in opts
+
+
+def test_build_html_embeds_group_scopes_and_the_checkbox():
+    prof = build_profile([
+        ScriptSample("worker", 100, 101, 1.0, 10, "cycles:P", [("alpha", "app")]),
+        ScriptSample("worker", 100, 102, 1.1, 20, "cycles:P", [("beta", "app")]),
+    ])
+    meta = {"target": {"cmd": ["app"]}, "ncpus": 4}
+
+    html = build_html(meta, [], MetricsReport(), prof)
+
+    assert 'id="group-threads"' in html
+    assert "Group threads by name" in html
+    assert "function toggleGrouped()" in html
+    assert "THREAD_GROUPS=" in html
+    assert 'THREAD_GROUPS={"g0": [101, 102]}' in html
+    assert 'data-thread="g0"' in html
+    # a group the browser can select, and the two per-thread views it replaces
+    assert "worker ×2" in html
+    assert 'data-thread="101"' in html and 'data-thread="102"' in html
+    # the group scope filters samples by tid set, not by a single tid
+    assert "scopeTids.indexOf(s[0])" in html
+    assert "threadFilter" not in html
 
 
 def test_memory_tab_has_dynamic_body():

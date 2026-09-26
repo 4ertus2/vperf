@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import html
 import json
+from dataclasses import dataclass
 
 from .flamegraph import render_flame_svg
-from .memory import LATENCY_BANDS, MemoryProfile, backend_label
+from .memory import LATENCY_BANDS, MemSymbol, MemoryProfile, backend_label
 from .wait import WAIT_BANDS_MS, WaitProfile
 from .metrics import (
     MetricsReport,
     all_hints,
     branch_penalty_note,
     cache_hierarchy_rows,
+    compute_metrics,
 )
+from .parsers import StatData
 from .stacks import StackProfile, TreeNode, top_threads
 
 
@@ -86,6 +89,9 @@ footer{color:var(--dim);padding:16px 24px;font-size:12px}
 #chart-header{padding:12px 24px;border-bottom:1px solid var(--line);background:var(--panel)}
 #chart-header .row{display:flex;align-items:center;gap:16px;margin-bottom:8px}
 #chart-header label{color:var(--dim);font-size:12px;text-transform:uppercase}
+#chart-header label.check{display:flex;align-items:center;gap:6px;cursor:pointer;
+ text-transform:none;color:var(--fg)}
+#chart-header label.check input{margin:0;accent-color:var(--accent)}
 #chart-header select{margin:0}
 .mode-btn{background:var(--bg);color:var(--dim);border:1px solid var(--line);border-radius:4px;padding:4px 12px;cursor:pointer;
 font-size:12px}
@@ -100,7 +106,11 @@ font-size:12px}
 """
 
 _JS = r"""
-var threadFilter=null,timeStart=0,timeEnd=1,chartMode='util';
+/* scope is either every thread (scopeTids null) or a set of tids: one thread,
+   or every thread sharing a name when "Group threads by name" is on.  scopeKey
+   is what the server-rendered per-scope maps are keyed by: 'all', a tid, or
+   'gN' for a name group. */
+var scopeTids=null,scopeKey='all',timeStart=0,timeEnd=1,chartMode='util';
 
 function showTab(btn,id){
  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
@@ -119,7 +129,7 @@ function sortTable(th,numeric){
 
 function filteredSamples(){
  return SAMPLES.filter(function(s){
-  if(threadFilter!==null && s[0]!==threadFilter) return false;
+  if(scopeTids!==null && scopeTids.indexOf(s[0])<0) return false;
   var t=(s[1]-T0)/TSPAN;
   return t>=timeStart && t<=timeEnd;
  });}
@@ -303,31 +313,29 @@ function setChartMode(mode){
 }
 
 function renderMemory(){
-  var body=document.getElementById('memory-body');
-  if(!body) return;
-  var key=threadFilter===null?'all':String(threadFilter);
-  if(Object.prototype.hasOwnProperty.call(MEMORY_HTML,key)){
-   body.innerHTML=MEMORY_HTML[key];
-  }else if(threadFilter===null){
-   body.innerHTML=MEMORY_HTML.all||'';
-  }else{
-   body.innerHTML='<div class="panel"><h3>Memory access</h3><em>No IBS / PEBS samples are available for the selected '
-   +'thread in this profile.</em></div>';
-  }
+ var body=document.getElementById('memory-body');
+ if(!body) return;
+ if(Object.prototype.hasOwnProperty.call(MEMORY_HTML,scopeKey)){
+  body.innerHTML=MEMORY_HTML[scopeKey];
+ }else if(scopeKey==='all'){
+  body.innerHTML=MEMORY_HTML.all||'';
+ }else{
+  body.innerHTML='<div class="panel"><h3>Memory access</h3><em>No IBS / PEBS samples are available for the selected '
+  +'thread or thread group in this profile.</em></div>';
+ }
 }
 
 function renderOverview(){
-  var body=document.getElementById('overview-body');
-  if(!body) return;
-  var key=threadFilter===null?'all':String(threadFilter);
-  if(Object.prototype.hasOwnProperty.call(OVERVIEW_HTML,key)){
-   body.innerHTML=OVERVIEW_HTML[key];
-  }else if(threadFilter===null){
-   body.innerHTML=OVERVIEW_HTML.all||'';
-  }else{
-   body.innerHTML='<div class="panel"><h3>Overview</h3><em>Per-thread hardware counters are unavailable '
-   +'for the selected thread in this profile.</em></div>';
-  }
+ var body=document.getElementById('overview-body');
+ if(!body) return;
+ if(Object.prototype.hasOwnProperty.call(OVERVIEW_HTML,scopeKey)){
+  body.innerHTML=OVERVIEW_HTML[scopeKey];
+ }else if(scopeKey==='all'){
+  body.innerHTML=OVERVIEW_HTML.all||'';
+ }else{
+  body.innerHTML='<div class="panel"><h3>Overview</h3><em>Per-thread hardware counters are unavailable '
+  +'for the selected thread or thread group in this profile.</em></div>';
+ }
 }
 
 var flameStates=[];
@@ -440,18 +448,29 @@ function resetFlameZoom(e){
  if(e) e.preventDefault();
  for(var i=0;i<flameStates.length;i++) flameRender(flameStates[i],null);}
 
-function setThread(tid){
-  threadFilter=tid;
-  var sel=document.getElementById('thread-sel');
-  document.getElementById('thread-label').textContent=sel.options[sel.selectedIndex].text;
-  renderHotspots();
-  renderChart();
-  renderMemory();
-  renderOverview();
-  var flameId=tid!==null?String(tid):'all';
-  document.querySelectorAll('#flamewrap .flame').forEach(d=>{
-   d.style.display=(d.dataset.thread===flameId)?'block':'none';});
-  resetFlameZoom();
+/* value: '' for every thread, 'gN' for a name group (THREAD_GROUPS holds its
+   tids), anything else a single tid. */
+function setThread(value){
+ if(value===null||value===undefined||value===''){scopeTids=null;scopeKey='all';}
+ else if(value.charAt(0)==='g'){scopeTids=THREAD_GROUPS[value]||null;scopeKey=value;}
+ else{scopeTids=[parseInt(value)];scopeKey=String(parseInt(value));}
+ var sel=document.getElementById('thread-sel');
+ document.getElementById('thread-label').textContent=sel.options[sel.selectedIndex].text;
+ renderHotspots();
+ renderChart();
+ renderMemory();
+ renderOverview();
+ document.querySelectorAll('#flamewrap .flame').forEach(d=>{
+  d.style.display=(d.dataset.thread===scopeKey)?'block':'none';});
+ resetFlameZoom();
+}
+
+/* Swaps the selector between the per-thread list and the by-name list; both
+   are server-rendered, so this only has to pick one and reselect. */
+function toggleGrouped(){
+ var sel=document.getElementById('thread-sel');
+ sel.innerHTML=document.getElementById('group-threads').checked?GROUP_OPTS:THREAD_OPTS;
+ setThread('');
 }
 
 
@@ -624,8 +643,59 @@ def _overview_content(m: MetricsReport, ncpu: int, scope: str = "all threads",
 <div class="panel"><h3>Observations</h3>{hints_html}</div>'''
 
 
+def _group_sampled_content(m: MetricsReport, prof: StackProfile, name: str,
+                           tids: list[int], scope: str) -> str:
+    """Overview for a group whose threads have no per-thread PMU counters.
+
+    ``perf stat --per-thread`` only reports the threads alive when counting
+    attached, so a pool of short-lived workers usually has no counters at all
+    (a ClickBench profile collects them for 3 of 241 threads). The sampler did
+    see them, so report what it knows instead of an empty panel: cycle share of
+    the run, and the CPU time that share of task-clock works out to.
+    """
+    cycles = sum(t.cycles for t in (prof.by_thread.get(tid) for tid in tids) if t)
+    total = max(prof.total_cycles, 1)
+    share = cycles / total * 100
+    est = (m.cpu_time or 0.0) * share / 100
+    tids_txt = ", ".join(str(tid) for tid in tids[:8])
+    if len(tids) > 8:
+        tids_txt += f", +{len(tids) - 8}"
+    return f'''<div style="color:var(--dim);font-size:12px;margin-bottom:12px">Scope: {esc(scope)}</div>
+<div class="cards">
+<div class="card"><div class="k">Threads in group</div><div class="v">{len(tids)}</div></div>
+<div class="card"><div class="k">Sampled cycles</div><div class="v">{_fmt_count(cycles)}</div></div>
+<div class="card"><div class="k">Share of run cycles</div><div class="v">{share:.1f}<small>%</small></div></div>
+<div class="card"><div class="k">Est. CPU time</div><div class="v">{_fmt(est)}<small> s</small></div></div>
+</div>
+<div class="panel"><h3>Per-thread counters</h3>
+<em>Not collected for these threads (tids {esc(tids_txt)}), so this group has no
+IPC, cache or pipeline numbers. <span class="mono">perf stat --per-thread</span>
+reports only the threads that exist when counting attaches; re-profile with the
+pool already running to get them.</em></div>'''
+
+
+def _sum_thread_counters(payloads: list[dict]) -> StatData:
+    """Add up the raw PMU counters of several threads into one StatData.
+
+    Counters are summed before anything is derived from them, so the group's
+    IPC is sum(instructions) / sum(cycles) instead of a mean of per-thread IPCs
+    - a mean would weight a thread that sampled 10 cycles like one that ran the
+    whole window. `raw_events` is what `compute_metrics` reads, so the merged
+    report goes through exactly the same code path as a single thread's.
+    """
+    total: dict[str, float] = {}
+    for payload in payloads:
+        for event, value in (payload.get("metrics", {}).get("raw_events") or {}).items():
+            if value is None:
+                continue
+            total[event] = total.get(event, 0.0) + value
+    return StatData(summary=total)
+
+
 def _overview_html_map(m: MetricsReport, ncpu: int, prof: StackProfile,
-                       thread_metrics: dict | None = None) -> dict[str, str]:
+                       thread_metrics: dict | None = None,
+                       groups: list["_ThreadGroup"] | None = None,
+                       vendor: str | None = None) -> dict[str, str]:
     result = {"all": _overview_content(m, ncpu, "all threads", prof)}
     for key, payload in (thread_metrics or {}).items():
         if key == "all" or not isinstance(payload, dict):
@@ -645,7 +715,34 @@ def _overview_html_map(m: MetricsReport, ncpu: int, prof: StackProfile,
         result[str(tid)] = _overview_content(
             thread_report, 1, f"{comm} (tid {tid})", prof,
         )
+    for group in groups or []:
+        # a name only one thread answers to reuses that thread's own key, and
+        # the entry under it is already the per-thread view
+        if not group.key.startswith("g"):
+            continue
+        counters = _sum_thread_counters(_counter_payloads(group, thread_metrics))
+        if not counters.summary:
+            result[group.key] = _group_sampled_content(
+                m, prof, group.name, group.tids, group.scope)
+            continue
+        merged = compute_metrics(counters, m.elapsed, ncpu, vendor=vendor)
+        merged.ncpus = ncpu
+        result[group.key] = _overview_content(merged, ncpu, group.scope, prof)
     return result
+
+
+def _counter_payloads(group: "_ThreadGroup",
+                      thread_metrics: dict | None) -> list[dict]:
+    """The counter payloads of the threads in *group*, in tid order."""
+    by_tid: dict[int, dict] = {}
+    for key, payload in (thread_metrics or {}).items():
+        if key == "all" or not isinstance(payload, dict):
+            continue
+        try:
+            by_tid[int(payload.get("tid", key))] = payload
+        except (TypeError, ValueError):
+            continue
+    return [by_tid[tid] for tid in group.tids if tid in by_tid]
 
 
 def _hotspots_table(prof: StackProfile) -> str:
@@ -863,16 +960,133 @@ def _memory_tab(mem: MemoryProfile | None, backend: str | None = "ibs") -> str:
             f'{_memory_content(mem, backend)}</div></div>')
 
 
+@dataclass
+class _ThreadGroup:
+    """Every thread the profile knows under one name, and the key its
+    server-rendered views are stored under.
+
+    *key* is ``gN`` for a group the report precomputes, or a plain tid when one
+    name turns out to be a single thread that already has a per-thread view -
+    so a name nobody shares never costs a second copy of the same content.
+    """
+    name: str
+    key: str
+    tids: list[int]
+
+    @property
+    def scope(self) -> str:
+        if len(self.tids) == 1:
+            return f"{self.name} (tid {self.tids[0]})"
+        return f"{self.name} ×{len(self.tids)} threads"
+
+
+def _thread_groups(prof: StackProfile, mem: MemoryProfile | None = None,
+                   thread_metrics: dict | None = None) -> list[tuple[str, list[int]]]:
+    """Threads that share a name, over the union of every per-thread source.
+
+    Each tid lands in exactly one group, named after the finest source that saw
+    it: the sampler's own thread name first, then `perf stat --per-thread`,
+    then the memory report. That order is not cosmetic - `perf mem report`
+    attributes every thread of a process to the *process* name, so believing it
+    over the sampler files a `ParquetDecoder` under `ThreadPool` as well, and
+    the thread's cycles get counted in two groups at once.
+
+    Built from every thread, never from the top-N cut the per-thread selector
+    lists: a 54-thread pool would otherwise be a 20-thread "group".
+    """
+    names: dict[int, str] = {}
+    for tid, thread in prof.by_thread.items():
+        names[tid] = thread.comm or "thread"
+    for key, payload in (thread_metrics or {}).items():
+        if key == "all" or not isinstance(payload, dict):
+            continue
+        try:
+            tid = int(payload.get("tid", key))
+        except (TypeError, ValueError):
+            continue
+        names.setdefault(tid, payload.get("comm") or "thread")
+    if mem is not None:
+        for tid, profile in mem.by_tid.items():
+            if tid is not None:
+                names.setdefault(tid, profile.comm or "thread")
+    by_name: dict[str, list[int]] = {}
+    for tid, name in names.items():
+        by_name.setdefault(name, []).append(tid)
+    return [(name, sorted(tids)) for name, tids in sorted(by_name.items())]
+
+
+def _group_options(groups: list[_ThreadGroup], prof: StackProfile) -> str:
+    """The selector list used while "Group threads by name" is on: one entry
+    per name instead of one per thread."""
+    opts = ['<option value="">All threads</option>']
+    total = max(prof.total_cycles, 1)
+    for group in groups:
+        cycles = sum(t.cycles for t in (prof.by_thread.get(tid) for tid in group.tids) if t)
+        share = f"{cycles / total * 100:.0f}%" if cycles else ""
+        if group.key.startswith("g"):
+            tids_txt = ", ".join(str(tid) for tid in group.tids[:2])
+            if len(group.tids) > 2:
+                tids_txt += f", +{len(group.tids) - 2}"
+            label = (f"{esc(group.name)} ×{len(group.tids)} "
+                     f"({share + ', ' if share else ''}tids {tids_txt})")
+        else:
+            label = (f"{esc(group.name)} (tid {group.key}"
+                     f"{', ' + share if share else ''})")
+        opts.append(f'<option value="{group.key}">{label}</option>')
+    return "".join(opts)
+
+
+def _merge_memory_profiles(profiles: list[MemoryProfile]) -> MemoryProfile:
+    """Add up several threads' IBS/PEBS samples into one profile.
+
+    Sample counts add; the latency weight and every per-key map add per key, so
+    the merged view reports the pool's combined access mix, latency
+    distribution and stall symbols rather than the mean of its members.
+    """
+    merged = MemoryProfile()
+    for profile in profiles:
+        merged.total_samples += profile.total_samples
+        merged.classified_samples += profile.classified_samples
+        for field_name in ("level_samples", "level_weight", "bands", "tlb_samples"):
+            target = getattr(merged, field_name)
+            for key, value in getattr(profile, field_name).items():
+                target[key] = target.get(key, 0) + value
+        for sym in profile.by_symbol.values():
+            slot = merged.by_symbol.get(sym.symbol)
+            if slot is None:
+                slot = merged.by_symbol[sym.symbol] = MemSymbol(
+                    sym.symbol, sym.dso)
+            slot.samples += sym.samples
+            slot.weight += sym.weight
+            slot.dram_samples += sym.dram_samples
+    return merged
+
+
 def _memory_html_map(mem: MemoryProfile | None, backend: str | None = "ibs",
                      prof: StackProfile | None = None,
-                     per_thread_enabled: bool = True) -> dict:
+                     per_thread_enabled: bool = True,
+                     groups: list[_ThreadGroup] | None = None) -> dict:
     result = {"all": _memory_content(mem, backend, "all threads")}
-    if per_thread_enabled and mem is not None:
-        for tid, profile in mem.by_tid.items():
-            cpu_thread = prof.by_thread.get(tid) if prof is not None else None
-            comm = cpu_thread.comm if cpu_thread is not None else profile.comm
-            scope = f"{comm or 'thread'} (tid {tid})"
-            result[str(tid)] = _memory_content(profile, backend, scope)
+    if not per_thread_enabled or mem is None:
+        return result
+    for tid, profile in mem.by_tid.items():
+        cpu_thread = prof.by_thread.get(tid) if prof is not None else None
+        comm = cpu_thread.comm if cpu_thread is not None else profile.comm
+        scope = f"{comm or 'thread'} (tid {tid})"
+        result[str(tid)] = _memory_content(profile, backend, scope)
+    for group in groups or []:
+        # a name only one thread answers to reuses that thread's own key, and
+        # the entry under it is already the per-thread view
+        if not group.key.startswith("g"):
+            continue
+        members = [mem.by_tid[tid] for tid in group.tids if tid in mem.by_tid]
+        if not members:
+            continue
+        scope = group.scope
+        if len(members) < len(group.tids):
+            scope += f", memory from {len(members)} of {len(group.tids)}"
+        result[group.key] = _memory_content(
+            _merge_memory_profiles(members), backend, scope)
     return result
 
 
@@ -1004,6 +1218,31 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
             f'<div class="flame" data-thread="{tid}" style="display:none">'
             '<em>No classifiable user-space samples for this thread.</em></div>')
 
+    # ---- flame graph + scope keys per thread-name group ----------------------
+    # A name only one thread answers to reuses that thread's own views; every
+    # other name gets one merged flame graph, so selecting a group in the
+    # browser always has something to show. The merged SVG costs about what its
+    # members cost separately, which is the price of a precomputed group.
+    group_mem = mem if memory_cojoined else None
+    groups: list[_ThreadGroup] = []
+    for idx, (name, tids) in enumerate(
+            _thread_groups(prof, group_mem, thread_metrics)):
+        if len(tids) == 1 and tids[0] in flame_thread_ids:
+            groups.append(_ThreadGroup(name, str(tids[0]), tids))
+            continue
+        merged_folded: dict[str, int] = {}
+        for tid in tids:
+            for stack, weight in user.folded_by_tid.get(tid, {}).items():
+                merged_folded[stack] = merged_folded.get(stack, 0) + weight
+        if merged_folded:
+            svg, _ = render_flame_svg(
+                merged_folded, title=f"{name} ×{len(tids)} — user space")
+        else:
+            svg = '<em>No classifiable user-space samples for this thread group.</em>'
+        flame_divs.append(
+            f'<div class="flame" data-thread="g{idx}" style="display:none">{svg}</div>')
+        groups.append(_ThreadGroup(name, f"g{idx}", tids))
+
     # ---- time range ---------------------------------------------------------
     t0, t1 = prof.time_range if prof.time_range else (0.0, 1.0)
     tspan = max(t1 - t0, 1e-9)
@@ -1013,13 +1252,19 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
                                 [f[0] for f in s.frames]] for s in samples]).replace("</", "<\\/")
     freq_json = json.dumps(freq_timeline or []).replace("</", "<\\/")
     memory_json = json.dumps(_memory_html_map(
-        mem, memory_backend, prof, memory_cojoined)).replace("</", "<\\/")
+        mem, memory_backend, prof, memory_cojoined,
+        groups)).replace("</", "<\\/")
     overview_json = json.dumps(_overview_html_map(
-        m, ncpu, prof, thread_metrics)).replace("</", "<\\/")
+        m, ncpu, prof, thread_metrics, groups,
+        meta.get("cpu_vendor"))).replace("</", "<\\/")
 
     # ---- thread list for selector -------------------------------------------
-    thread_opts = _thread_options(
-        prof, mem if memory_cojoined else None, thread_metrics)
+    thread_opts = _thread_options(prof, group_mem, thread_metrics)
+    group_opts = _group_options(groups, prof)
+    groups_json = json.dumps({g.key: g.tids for g in groups
+                              if g.key.startswith("g")}).replace("</", "<\\/")
+    thread_opts_js = json.dumps(thread_opts).replace("</", "<\\/")
+    group_opts_js = json.dumps(group_opts).replace("</", "<\\/")
 
     # ---- initial hotspots table (server-rendered, replaced by JS) -----------
     initial_hotspots = _hotspots_table(prof)
@@ -1041,8 +1286,9 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 <div id="chart-header">
 <div class="row">
 <label>Thread</label>
-<select id="thread-sel" onchange="setThread(this.value?parseInt(this.value):null)">{thread_opts}</select>
+<select id="thread-sel" onchange="setThread(this.value)">{thread_opts}</select>
 <span id="thread-label" class="mono" style="font-size:12px;color:var(--dim)"></span>
+<label class="check"><input type="checkbox" id="group-threads" onchange="toggleGrouped()"> Group threads by name</label>
 <span style="flex:1"></span>
 <label>Chart</label>
 <button class="mode-btn active" data-mode="util" onclick="setChartMode('util')">Utilization</button>
@@ -1099,6 +1345,7 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 <footer>Generated by vperf — artifacts: {esc(meta.get('_outdir', ''))}</footer>
 <script>
 SAMPLES={samples_json};FREQ={freq_json};MEMORY_HTML={memory_json};OVERVIEW_HTML={overview_json};
+THREAD_GROUPS={groups_json};THREAD_OPTS={thread_opts_js};GROUP_OPTS={group_opts_js};
 T0={t0};TSPAN={tspan};NCPU={ncpu};TOTAL_CYCLES={prof.total_cycles};CPU_TIME={m.cpu_time or 0};
 </script>
 <script>{_JS}</script>
