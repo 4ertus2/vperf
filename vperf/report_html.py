@@ -999,6 +999,10 @@ def _thread_groups(prof: StackProfile, mem: MemoryProfile | None = None,
 
     Built from every thread, never from the top-N cut the per-thread selector
     lists: a 54-thread pool would otherwise be a 20-thread "group".
+
+    Ordered by the group's share of the run's sampled cycles, hottest first, so
+    the grouped list reads like the per-thread one; the name breaks ties and
+    orders the groups that sampled nothing at all.
     """
     names: dict[int, str] = {}
     for tid, thread in prof.by_thread.items():
@@ -1018,12 +1022,19 @@ def _thread_groups(prof: StackProfile, mem: MemoryProfile | None = None,
     by_name: dict[str, list[int]] = {}
     for tid, name in names.items():
         by_name.setdefault(name, []).append(tid)
-    return [(name, sorted(tids)) for name, tids in sorted(by_name.items())]
+
+    def weight(item: tuple[str, list[int]]) -> tuple[int, str]:
+        name, tids = item
+        cycles = sum(t.cycles for t in (prof.by_thread.get(tid) for tid in tids) if t)
+        return (-cycles, name)
+
+    return sorted(((name, sorted(tids)) for name, tids in by_name.items()), key=weight)
 
 
 def _group_options(groups: list[_ThreadGroup], prof: StackProfile) -> str:
     """The selector list used while "Group threads by name" is on: one entry
-    per name instead of one per thread."""
+    per name instead of one per thread, hottest group first (the order
+    `_thread_groups` hands them over in)."""
     opts = ['<option value="">All threads</option>']
     total = max(prof.total_cycles, 1)
     for group in groups:

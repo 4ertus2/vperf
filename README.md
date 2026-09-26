@@ -266,6 +266,9 @@ before is one line, not 54:
 
 - the group covers *every* thread of that name the profile knows, not just the
   hottest 20 the ungrouped list shows
+- the list is ordered like the ungrouped one: the group holding most of the
+  run's sampled cycles first (its share is in the label), the name breaking
+  ties, and groups that sampled nothing last
 - Hotspots, the utilization chart and the flame graph merge the members'
   samples; the utilization curve is the pool's total cores busy, so a 16-thread
   pipeline reads as up to 16 busy cores
