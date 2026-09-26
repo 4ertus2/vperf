@@ -316,8 +316,8 @@ def test_thread_groups_unions_every_per_thread_source():
 
     groups = _thread_groups(prof, mem, {"104": _thread_payload(104, "worker")})
 
-    # sampled 101/102, memory-only 103, counters-only 104
-    assert groups == [("solo", [103]), ("worker", [101, 102, 104])]
+    # sampled 101/102, memory-only 103, counters-only 104; worker sampled more
+    assert groups == [("worker", [101, 102, 104]), ("solo", [103])]
 
 
 def test_thread_groups_file_a_thread_under_its_sampled_name():
@@ -434,6 +434,38 @@ def test_group_options_list_one_entry_per_name():
     assert opts.startswith('<option value="">All threads</option>')
     assert '<option value="103">solo (tid 103, 30%)</option>' in opts
     assert '<option value="g1">worker ×2 (70%, tids 101, 102)</option>' in opts
+
+
+def test_thread_groups_are_ordered_hottest_first():
+    """The grouped list reads like the per-thread one: the group holding most
+    of the run's cycles first, the name breaking ties."""
+    prof = build_profile([
+        ScriptSample("QueryPipelineEx", 100, 101, 1.0, 500, "cycles:P", [("a", "app")]),
+        ScriptSample("UniqExactMerger", 100, 102, 1.1, 300, "cycles:P", [("b", "app")]),
+        ScriptSample("ParquetPrefetch", 100, 103, 1.2, 300, "cycles:P", [("c", "app")]),
+        ScriptSample("ThreadPool", 100, 104, 1.3, 100, "cycles:P", [("d", "app")]),
+    ])
+
+    names = [name for name, _tids in _thread_groups(prof, None, {})]
+
+    # 500, then the two tied at 300 alphabetically, then 100
+    assert names == ["QueryPipelineEx", "ParquetPrefetch", "UniqExactMerger", "ThreadPool"]
+
+
+def test_build_html_grouped_list_follows_the_group_order():
+    prof = build_profile([
+        ScriptSample("hot", 100, 101, 1.0, 500, "cycles:P", [("a", "app")]),
+        ScriptSample("hot", 100, 102, 1.1, 500, "cycles:P", [("a", "app")]),
+        ScriptSample("cold", 100, 103, 1.2, 10, "cycles:P", [("b", "app")]),
+    ])
+
+    html = build_html({"target": {"cmd": ["app"]}, "ncpus": 4}, [], MetricsReport(), prof)
+    grouped = re.search(r'GROUP_OPTS=(".*?");\s*\n', html, re.S).group(1)
+
+    assert grouped.index("hot") < grouped.index("cold")
+    # "cold" is a name only one thread answers to, so it reuses that thread's
+    # own views and needs no group entry of its own
+    assert 'THREAD_GROUPS={"g0": [101, 102]}' in html
 
 
 def test_build_html_embeds_group_scopes_and_the_checkbox():
