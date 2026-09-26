@@ -461,11 +461,14 @@ bench/clickbench_profiles.sh --resume           # skip queries already profiled
 
 The schema and the queries come from the ClickBench checkout
 (`$CLICKBENCH_DIR/clickhouse-parquet/`), and the run is strictly sequential —
-concurrent profiling sessions multiplex the hardware counters. Queries are timed
-once and repeated in-process only while they are too short to sample, with the
-repetition count recorded in the run's TSV index. Each profile keeps the exact
-statement list in `queries.sql` next to the usual artifacts, so
-`vperf report <dir>` can regenerate the HTML at any time.
+concurrent profiling sessions multiplex the hardware counters. Every query is
+executed exactly once: nothing is repeated, retimed or retried, so a report
+describes the query as ClickBench defines it — where its CPU time goes and what
+its threads were doing over the query's timeline. Each profile keeps the exact
+statement it ran in `queries.sql` next to the usual artifacts, so
+`vperf report <dir>` can regenerate the HTML at any time. A query that finishes
+before the collectors can attach still gets a report, just without samples, and
+the run log names it.
 
 ## Cycle mode: before/after comparisons with ministat
 
