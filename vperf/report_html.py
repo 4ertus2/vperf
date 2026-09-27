@@ -16,8 +16,8 @@ from .metrics import (
     cache_hierarchy_rows,
     compute_metrics,
 )
-from .parsers import StatData
-from .stacks import StackProfile, TreeNode, top_threads
+from .parsers import StatData, sanitize_symbol
+from .stacks import MAX_STACK_FRAMES, StackProfile, TreeNode, top_threads
 
 
 def esc(s) -> str:
@@ -98,23 +98,56 @@ font-size:12px}
 #chart-wrap{position:relative;height:160px;cursor:crosshair;overflow:visible}
 #chart-wrap svg{width:100%;height:100%}
 .drag-handle{position:absolute;top:0;width:12px;height:100%;cursor:ew-resize;z-index:10}
+#chart-header input[type=number]{width:96px;background:var(--bg);color:var(--fg);
+ border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:12px}
+#scope-line{color:var(--dim);font-size:11px;margin-top:6px}
+.memchart svg{width:100%;height:auto;display:block}
+/* a panel that cannot follow the time selection says so only while one is
+   active: a whole-run report is not a misleading one, it is just not scoped */
+.whole-run-note{display:none}
+body.sel-active .whole-run-note{display:inline-block;margin-top:6px;
+ border-left:3px solid var(--warn);padding:4px 10px;color:var(--dim);font-size:12px}
 .drag-handle::after{content:'';position:absolute;top:0;left:4px;width:4px;height:100%;background:var(--accent);border-radius:2px;opacity:0.7}
 .drag-handle:hover::after{opacity:1}
 .drag-overlay{position:absolute;top:0;height:100%;background:rgba(64,156,255,0.08);pointer-events:none;z-index:5}
-#time-label{color:var(--dim);font-size:11px;margin-top:4px;text-align:center}
 """
 
 _JS = r"""
-/* scope is either every thread (scopeTids null) or a set of tids: one thread,
-   or every thread sharing a name when "Group threads by name" is on.  scopeKey
-   is what the server-rendered per-scope maps are keyed by: 'all', a tid, or
-   'gN' for a name group. */
+/* =============================================================================
+   Scope and time selection
+   scopeTids/scopeKey: every thread (null / 'all'), one tid, or a name group
+   'gN' (THREAD_GROUPS holds its tids).  timeStart/timeEnd: the selection as
+   fractions of the run's sample timeline.  The borders on the utilization
+   chart and the Time fields own that pair; every tab reads it.
+   ========================================================================== */
 var scopeTids=null,scopeKey='all',timeStart=0,timeEnd=1,chartMode='util';
+var scopeSet=null;                 /* Set of scopeTids, for the hot loops */
+var SAMPLES=S[0],SYMS=S[1],DSOS=S[2],ROOTS=S[3];
+var NBUCKETS=120;                  /* buckets of the utilization curve */
+var keyCache=null,uniqCache=null;  /* per-sample folded key / deduped stack */
+var chartCache=null,chartCacheKey='';
+
+/* ---- one time<->pixel mapping, shared by the curve, the shade and the
+   borders.  The borders used to be placed against the container width while
+   the plot started after the axis gutter, so they never lined up with the
+   curve they filter. ---- */
+function plotGeom(elm,pad_l){
+ var el=elm||document.getElementById('chart-wrap');
+ var W=(el&&el.clientWidth)||1160;
+ if(!pad_l) pad_l=56;
+ return {el:el,W:W,pad_l:pad_l,pad_b:20,pad_t:8,
+         pw:Math.max(10,W-pad_l-10),ph:160-20-8};}
+function timeToX(t,g){g=g||plotGeom();return g.pad_l+(t-T0)/TSPAN*g.pw;}
+function xToTime(x,g){g=g||plotGeom();return T0+Math.min(1,Math.max(0,(x-g.pad_l)/g.pw))*TSPAN;}
+function selStart(){return T0+timeStart*TSPAN;}
+function selEnd(){return T0+timeEnd*TSPAN;}
+function selectionActive(){return timeStart>0.0005||timeEnd<0.9995;}
 
 function showTab(btn,id){
  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
- btn.classList.add('active');document.getElementById(id).classList.add('active');}
+ btn.classList.add('active');document.getElementById(id).classList.add('active');
+ if(id==='mem') renderMemChart();}
 
 function sortTable(th,numeric){
  var tb=th.closest('table'),idx=Array.prototype.indexOf.call(th.parentNode.children,th);
@@ -126,209 +159,511 @@ function sortTable(th,numeric){
   return dir*(x-y);});
  rows.forEach(r=>tb.tBodies[0].appendChild(r));}
 
-function filteredSamples(){
- return SAMPLES.filter(function(s){
-  if(scopeTids!==null && scopeTids.indexOf(s[0])<0) return false;
-  var t=(s[1]-T0)/TSPAN;
-  return t>=timeStart && t<=timeEnd;
- });}
-
-function buildFolded(samples){
- var fold={};
- samples.forEach(function(s){
-  var key=s[3]+';'+(s[4]||'').join(';');
-  fold[key]=(fold[key]||0)+s[2];
- });
- return fold;}
-
-function renderHotspots(){
- var samples=filteredSamples();
- var fold=buildFolded(samples);
- var total=0;for(var k in fold) total+=fold[k];if(!total) total=1;
- var funcs={};
- for(var k in fold){
-  var parts=k.split(';');
-  var fn=parts[parts.length-1]||'[unknown]';
-  var dso=parts.length>2?'[inlined]':'';
-  if(!funcs[fn]) funcs[fn]={self:0,dso:dso};
-  funcs[fn].self+=fold[k];
- }
- var rows=[];
- for(var fn in funcs) rows.push({fn:fn,dso:funcs[fn].dso,self:funcs[fn].self});
- rows.sort(function(a,b){return b.self-a.self;});
- var est_per_sec=total/(TSPAN*(timeEnd-timeStart)||1);
- var html='<table><thead><tr>';
- html+='<th onclick="sortTable(this,0)">Function</th>';
- html+='<th onclick="sortTable(this,0)">Module</th>';
- html+='<th onclick="sortTable(this,1)">Self cycles</th>';
- html+='<th onclick="sortTable(this,1)">Self %</th>';
- html+='</tr></thead><tbody>';
- rows.slice(0,60).forEach(function(r){
-  var pct=r.self/total*100;
-  var w=Math.min(pct*2.2,100);
-  html+='<tr><td class="mono">'+escHtml(r.fn)+'</td>';
-  html+='<td class="mono">'+escHtml(r.dso)+'</td>';
-  html+='<td data-v="'+r.self+'" class="mono">'+fmtCount(r.self)+'</td>';
-  html+='<td data-v="'+pct.toFixed(4)+'"><span class="bar" style="width:'+w+'px"></span> '+pct.toFixed(2)+'%</td>';
-  html+='</tr>';
- });
- html+='</tbody></table>';
- document.getElementById('hotspots-body').innerHTML=html;
-}
-
 function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
 function fmtCount(v){
  if(v===null||v===undefined) return'n/a';
  var divs=[[1e9,'G'],[1e6,'M'],[1e3,'K']];
  for(var i=0;i<divs.length;i++){if(Math.abs(v)>=divs[i][0]) return(v/divs[i][0]).toFixed(2)+divs[i][1];}
- return Math.round(v).toLocaleString();
+ return Math.round(v).toLocaleString();}
+
+/* ---- the samples in the current scope, and in the current selection ---- */
+function scopeRows(){
+ var out=[],i,r;
+ for(i=0;i<SAMPLES.length;i++){
+  r=SAMPLES[i];
+  if(scopeSet!==null&&!scopeSet.has(r[0])) continue;
+  out.push(i);}
+ return out;}
+
+function windowRows(){
+ var out=[],i,r,a=selStart(),b=selEnd();
+ for(i=0;i<SAMPLES.length;i++){
+  r=SAMPLES[i];
+  if(scopeSet!==null&&!scopeSet.has(r[0])) continue;
+  if(r[1]<a||r[1]>b) continue;
+  out.push(i);}
+ return out;}
+
+/* the stack without its recursion repeats: inclusive time counts a frame once
+   per sample, exactly as the server-side table does */
+function sampleUniq(i){
+ if(!uniqCache) uniqCache=new Array(SAMPLES.length);
+ var u=uniqCache[i];
+ if(u===undefined){
+  var seen={},out=[],stack=SAMPLES[i][3];
+  for(var k=0;k<stack.length;k++) if(!seen[stack[k]]){seen[stack[k]]=1;out.push(stack[k]);}
+  u=uniqCache[i]=out;}
+ return u;}
+
+/* the folded key the flame graph and the call tree hang off: the sample's
+   root label, then its user-space frames (already kernel-filtered in Python) */
+function sampleKey(i){
+ if(!keyCache) keyCache=new Array(SAMPLES.length);
+ var k=keyCache[i];
+ if(k===undefined){
+  var r=SAMPLES[i],f=r[6];
+  k=f===null?null:ROOTS[r[5]]+';'+f.map(function(x){return SYMS[x];}).join(';');
+  keyCache[i]=k;}
+ return k;}
+
+function foldWindow(){
+ var fold={},rows=windowRows(),n=0;
+ for(var i=0;i<rows.length;i++){
+  var k=sampleKey(rows[i]);
+  if(k===null) continue;
+  fold[k]=(fold[k]||0)+SAMPLES[rows[i]][2];
+  n++;}
+ return {fold:fold,samples:n};}
+
+/* ---- Hotspots: the same columns as the server-rendered table, over the
+   scope and the selection ---- */
+function renderHotspots(){
+ var body=document.getElementById('hotspots-body');
+ if(!body) return;
+ var rows=windowRows(),self={},incl={},mod={},total=0;
+ for(var i=0;i<rows.length;i++){
+  var r=SAMPLES[rows[i]],stack=r[3],leaf=stack[stack.length-1],w=r[2];
+  total+=w;
+  self[leaf]=(self[leaf]||0)+w;
+  if(mod[leaf]===undefined) mod[leaf]=DSOS[r[4]];
+  var uniq=sampleUniq(rows[i]);
+  for(var k=0;k<uniq.length;k++) incl[uniq[k]]=(incl[uniq[k]]||0)+w;
+ }
+ var out=[],name;
+ for(name in self) out.push({sym:name,self:self[name],incl:incl[name]||0,mod:mod[name]});
+ out.sort(function(a,b){return b.self-a.self;});
+ if(!total) total=1;
+ var html='<table><thead><tr>';
+ html+='<th onclick="sortTable(this,0)">Function</th>';
+ html+='<th onclick="sortTable(this,0)">Module</th>';
+ html+='<th onclick="sortTable(this,1)">Self cycles</th>';
+ html+='<th onclick="sortTable(this,1)">Self %</th>';
+ html+='<th onclick="sortTable(this,1)">Inclusive %</th>';
+ html+='<th onclick="sortTable(this,1)">Est. CPU time</th>';
+ html+='</tr></thead><tbody>';
+ out.slice(0,60).forEach(function(r){
+  var pct=r.self/total*100,inc=r.incl/total*100,w=Math.min(pct*2.2,100);
+  var est=CPU_TIME>0?CPU_TIME*r.self/total*1000:0;
+  html+='<tr><td class="mono">'+escHtml(SYMS[r.sym])+'</td>';
+  html+='<td class="mono">'+escHtml(r.mod)+'</td>';
+  html+='<td data-v="'+r.self+'" class="mono">'+fmtCount(r.self)+'</td>';
+  html+='<td data-v="'+pct.toFixed(4)+'"><span class="bar" style="width:'+w.toFixed(1)+'px"></span> '+pct.toFixed(2)+'%</td>';
+  html+='<td data-v="'+inc.toFixed(4)+'">'+inc.toFixed(1)+'%</td>';
+  html+='<td data-v="'+est.toFixed(4)+'" class="mono">'+(est?est.toFixed(1)+' ms':'—')+'</td>';
+  html+='</tr>';
+ });
+ html+='</tbody></table>';
+ body.innerHTML=html;
 }
+
+/* ---- the utilization curve: always the whole run, so the selection keeps its
+   context; the parts outside it are dimmed rather than dropped ---- */
+function utilBuckets(){
+ var g=plotGeom(),key=scopeKey+'|'+g.W+'|'+NBUCKETS;
+ if(chartCacheKey===key) return chartCache;
+ var buckets=new Float64Array(NBUCKETS),rows=scopeRows();
+ for(var i=0;i<rows.length;i++){
+  var r=SAMPLES[rows[i]],idx=Math.min(Math.floor((r[1]-T0)/TSPAN*NBUCKETS),NBUCKETS-1);
+  if(idx<0) idx=0;
+  buckets[idx]+=r[2];
+ }
+ chartCacheKey=key;chartCache=buckets;
+ return buckets;}
 
 function renderChart(){
  var wrap=document.getElementById('chart-wrap');
- if(!wrap) return;
- var samples=filteredSamples();
- var W=wrap.clientWidth||1160,H=160;
- var pad_l=56,pad_b=20,pad_t=8;
- var pw=W-pad_l-10,ph=H-pad_b-pad_t;
- var nbuckets=120;
+ var host=document.getElementById('chart-svg');
+ if(!wrap||!host) return;
+ var g=plotGeom(),H=160,pad_l=g.pad_l,pad_b=g.pad_b,pad_t=g.pad_t,pw=g.pw,ph=g.ph,W=g.W;
+ host.innerHTML=chartMode==='freq'?freqSvg(g,H,pad_t,ph)
+                           :utilSvg(g,H,pad_t,ph);
+ updateSelectionChrome();}
 
- if(chartMode==='freq'){
-  renderFreqChart(W,H,pad_l,pad_b,pad_t,pw,ph,nbuckets);
- } else {
-  renderUtilChart(samples,W,H,pad_l,pad_b,pad_t,pw,ph,nbuckets);
- }
-}
+function shadeSvg(g,H,pad_t,ph){
+ /* the two bands outside the selection, drawn over the grid and under the
+    curve: the run stays readable while a window is active */
+ if(!selectionActive()) return '';
+ var a=timeToX(selStart(),g),b=timeToX(selEnd(),g);
+ var out='',bot=(pad_t+ph).toFixed(1);
+ if(a>g.pad_l) out+='<rect x="'+g.pad_l+'" y="'+pad_t+'" width="'+(a-g.pad_l).toFixed(1)
+   +'" height="'+ph+'" fill="rgba(14,17,23,0.62)"/>';
+ if(b<g.W-10) out+='<rect x="'+b.toFixed(1)+'" y="'+pad_t+'" width="'+(g.W-10-b).toFixed(1)
+   +'" height="'+ph+'" fill="rgba(14,17,23,0.62)"/>';
+ return out;}
 
-function renderUtilChart(samples,W,H,pad_l,pad_b,pad_t,pw,ph,nbuckets){
- if(!samples.length){document.getElementById('chart-svg').innerHTML='';return;}
- var buckets=new Float64Array(nbuckets);
- samples.forEach(function(s){
-  var idx=Math.min(Math.floor((s[1]-T0)/TSPAN*nbuckets),nbuckets-1);
-  buckets[idx]+=s[2];
- });
+function timeLabels(g,H){
+ var out='';
+ for(var f=0;f<=1.0001;f+=0.25){
+  var t=T0+f*TSPAN,x=timeToX(t,g);
+  if(x<g.pad_l-2||x>g.W-8) continue;
+  out+='<text x="'+x.toFixed(1)+'" y="'+(H-4)+'" text-anchor="middle" fill="#999">'
+      +t.toFixed(2)+'s</text>';}
+ return out;}
+
+function utilSvg(g,H,pad_t,ph){
+ var buckets=utilBuckets();
  var hz=CPU_TIME>0?TOTAL_CYCLES/CPU_TIME:1;
- var dur=TSPAN/nbuckets;
- var maxv=0;for(var i=0;i<nbuckets;i++){var v=buckets[i]/(dur*hz);if(v>maxv) maxv=v;}
+ var dur=TSPAN/NBUCKETS;
+ var maxv=0,i,v;
+ for(i=0;i<NBUCKETS;i++){v=buckets[i]/(dur*hz);if(v>maxv) maxv=v;}
  var ymax=Math.max(Math.ceil(maxv),NCPU);
- function X(t){return pad_l+(t-T0)/TSPAN*pw;}
  function Y(v){return pad_t+ph-Math.min(v/ymax,1)*ph;}
-
- var svg='<svg xmlns="http://www.w3.org/2000/svg" width="'+W+'" height="'+H+'" font-family="Verdana,sans-serif" font-size="11">';
+ var svg='<svg xmlns="http://www.w3.org/2000/svg" width="'+g.W+'" height="'+H
+   +'" font-family="Verdana,sans-serif" font-size="11">';
  var step=niceAxes(ymax);
- for(var g=0;g<=ymax+1e-9;g+=step){
-  var y=Y(g);
-  svg+='<line x1="'+pad_l+'" y1="'+y.toFixed(1)+'" x2="'+(W-10)+'" y2="'+y.toFixed(1)+'" stroke="#333" stroke-width="1"/>';
-  svg+='<text x="'+(pad_l-6)+'" y="'+(y+4).toFixed(1)+'" text-anchor="end" fill="#999">'+g+'</text>';
+ for(var gr=0;gr<=ymax+1e-9;gr+=step){
+  var y=Y(gr);
+  svg+='<line x1="'+g.pad_l+'" y1="'+y.toFixed(1)+'" x2="'+(g.W-10)+'" y2="'+y.toFixed(1)
+    +'" stroke="#333" stroke-width="1"/>';
+  svg+='<text x="'+(g.pad_l-6)+'" y="'+(y+4).toFixed(1)+'" text-anchor="end" fill="#999">'+gr+'</text>';
  }
+ svg+=shadeSvg(g,H,pad_t,ph);
  var pts='';
- for(var i=0;i<nbuckets;i++){
-  var x=pad_l+i/Math.max(nbuckets-1,1)*pw;
-   var v=buckets[i]/(dur*hz);
-  pts+=x.toFixed(1)+','+Y(v).toFixed(1)+' ';
- }
-  svg+='<polygon points="'+X(T0).toFixed(1)+','+(pad_t+ph)+' '+pts
-   +X(T0+TSPAN).toFixed(1)+','+(pad_t+ph)+'" fill="rgba(64,156,255,0.35)" '
+ for(i=0;i<NBUCKETS;i++){
+  var x=g.pad_l+i/Math.max(NBUCKETS-1,1)*g.pw;
+  pts+=x.toFixed(1)+','+Y(buckets[i]/(dur*hz)).toFixed(1)+' ';}
+ svg+='<polygon points="'+g.pad_l+','+(pad_t+ph)+' '+pts
+   +timeToX(T0+TSPAN,g).toFixed(1)+','+(pad_t+ph)+'" fill="rgba(64,156,255,0.35)" '
    +'stroke="#409cff" stroke-width="1.5"/>';
- for(var f=0;f<=1;f+=0.25){
-  var t=T0+f*TSPAN;
-  svg+='<text x="'+X(t).toFixed(1)+'" y="'+(H-4)+'" text-anchor="middle" fill="#999">'+(f*(timeEnd-timeStart)*TSPAN).toFixed(2)+'s</text>';
- }
- svg+='<text x="'+(pad_l-34)+'" y="'+(pad_t+10)+'" fill="#bbb">cores</text>';
+ svg+=timeLabels(g,H);
+ svg+='<text x="'+(g.pad_l-34)+'" y="'+(pad_t+10)+'" fill="#bbb">cores</text>';
  svg+='</svg>';
- document.getElementById('chart-svg').innerHTML=svg;
-}
+ return svg;}
 
-function renderFreqChart(W,H,pad_l,pad_b,pad_t,pw,ph,nbuckets){
- if(!FREQ.length){document.getElementById('chart-svg').innerHTML='';return;}
- var envelope=[];
- FREQ.forEach(function(f){
-  if(!f[1]) return;
-  var vals=Object.values(f[1]).sort(function(a,b){return a-b;});
-  var n=vals.length;
-  function pct(p){var k=p*(n-1);var lo=Math.floor(k);var hi=Math.min(lo+1,n-1);return vals[lo]+(vals[hi]-vals[lo])*(k-lo);}
-   envelope.push([f[0],vals[0]/1e3,pct(0.25)/1e3,pct(0.5)/1e3,pct(0.75)/1e3,vals[n-1]/1e3]);
- });
- if(!envelope.length){document.getElementById('chart-svg').innerHTML='';return;}
- var fT0=envelope[0][0],fT1=envelope[envelope.length-1][0];
- var fSpan=Math.max(fT1-fT0,1e-9);
- var ymax=0;envelope.forEach(function(e){if(e[5]>ymax) ymax=e[5];});
- ymax*=1.05;if(ymax<=0) ymax=5;
- function X(t){return pad_l+(t-fT0)/fSpan*pw;}
- function Y(v){return pad_t+ph-Math.min(v/ymax,1)*ph;}
-
- var svg='<svg xmlns="http://www.w3.org/2000/svg" width="'+W+'" height="'+H+'" font-family="Verdana,sans-serif" font-size="11">';
- var step=niceAxes(ymax);
- for(var g=0;g<=ymax+1e-9;g+=step){
-  var y=Y(g);
-  svg+='<line x1="'+pad_l+'" y1="'+y.toFixed(1)+'" x2="'+(W-10)+'" y2="'+y.toFixed(1)+'" stroke="#333" stroke-width="1"/>';
-  svg+='<text x="'+(pad_l-6)+'" y="'+(y+4).toFixed(1)+'" text-anchor="end" fill="#999">'+g.toFixed(1)+'</text>';
+function freqEnvelope(){
+ /* the frequency sampler counts from its own origin, but it reads the same
+    CLOCK_MONOTONIC perf timestamps do, so FREQ_T0 puts the curve on the sample
+    timeline.  A profile without it keeps its own span. */
+ var out=[],i,f,vals,n;
+ for(i=0;i<FREQ.length;i++){
+  f=FREQ[i];
+  if(!f[1]) continue;
+  vals=Object.keys(f[1]).map(function(k){return f[1][k];}).sort(function(a,b){return a-b;});
+  n=vals.length;
+  if(!n) continue;
+  function pct(p){var kk=p*(n-1),lo=Math.floor(kk),hi=Math.min(lo+1,n-1);
+   return vals[lo]+(vals[hi]-vals[lo])*(kk-lo);}
+  out.push([FREQ_T0!==null?FREQ_T0+f[0]:f[0],vals[0]/1e3,pct(0.25)/1e3,pct(0.5)/1e3,pct(0.75)/1e3,vals[n-1]/1e3]);
  }
- var pts_max='',pts_min='';
- envelope.forEach(function(e){
-  pts_max+=X(e[0]).toFixed(1)+','+Y(e[5]).toFixed(1)+' ';
-  pts_min=X(e[0]).toFixed(1)+','+Y(e[1]).toFixed(1)+' '+pts_min;
- });
-  svg+='<polygon points="'+X(fT0).toFixed(1)+','+(pad_t+ph)+' '+pts_max+pts_min
-   +X(fT0).toFixed(1)+','+(pad_t+ph)+'" fill="rgba(64,156,255,0.20)" stroke="none"/>';
- var pts_med='';envelope.forEach(function(e){pts_med+=X(e[0]).toFixed(1)+','+Y(e[3]).toFixed(1)+' ';});
- svg+='<polyline points="'+pts_med+'" fill="none" stroke="#409cff" stroke-width="1.5"/>';
- var pts_p75='';envelope.forEach(function(e){pts_p75+=X(e[0]).toFixed(1)+','+Y(e[4]).toFixed(1)+' ';});
- svg+='<polyline points="'+pts_p75+'" fill="none" stroke="#409cff" stroke-width="1" stroke-dasharray="6,3" opacity="0.6"/>';
- var pts_p25='';envelope.forEach(function(e){pts_p25+=X(e[0]).toFixed(1)+','+Y(e[2]).toFixed(1)+' ';});
- svg+='<polyline points="'+pts_p25+'" fill="none" stroke="#409cff" stroke-width="1" stroke-dasharray="6,3" opacity="0.6"/>';
- var pts_min_l='';envelope.forEach(function(e){pts_min_l+=X(e[0]).toFixed(1)+','+Y(e[1]).toFixed(1)+' ';});
- svg+='<polyline points="'+pts_min_l+'" fill="none" stroke="#409cff" stroke-width="1" stroke-dasharray="2,3" opacity="0.4"/>';
- svg+='<text x="'+(pad_l-44)+'" y="'+(pad_t+10)+'" fill="#bbb">GHz</text>';
+ return out;}
+
+function freqSvg(g,H,pad_t,ph){
+ if(!FREQ.length) return '<svg xmlns="http://www.w3.org/2000/svg" width="'+g.W+'" height="'+H+'"></svg>';
+ var env=freqEnvelope();
+ if(!env.length) return '<svg xmlns="http://www.w3.org/2000/svg" width="'+g.W+'" height="'+H+'"></svg>';
+ var span=TSPAN,lo=env[0][0],hi=env[env.length-1][0];
+ if(FREQ_T0===null){span=Math.max(hi-lo,1e-9);lo=env[0][0];hi=env[env.length-1][0];}
+ var ymax=0,i,e;
+ for(i=0;i<env.length;i++) if(env[i][5]>ymax) ymax=env[i][5];
+ ymax*=1.05;if(ymax<=0) ymax=5;
+ function X(t){return FREQ_T0===null
+   ? g.pad_l+(t-lo)/span*g.pw : timeToX(t,g);}
+ function Y(v){return pad_t+ph-Math.min(v/ymax,1)*ph;}
+ var svg='<svg xmlns="http://www.w3.org/2000/svg" width="'+g.W+'" height="'+H
+   +'" font-family="Verdana,sans-serif" font-size="11">';
+ var step=niceAxes(ymax);
+ for(var gr=0;gr<=ymax+1e-9;gr+=step){
+  var y=Y(gr);
+  svg+='<line x1="'+g.pad_l+'" y1="'+y.toFixed(1)+'" x2="'+(g.W-10)+'" y2="'+y.toFixed(1)
+    +'" stroke="#333" stroke-width="1"/>';
+  svg+='<text x="'+(g.pad_l-6)+'" y="'+(y+4).toFixed(1)+'" text-anchor="end" fill="#999">'+gr.toFixed(1)+'</text>';
+ }
+ svg+=shadeSvg(g,H,pad_t,ph);
+ var mx='',mn='';
+ for(i=0;i<env.length;i++){
+  e=env[i];
+  if(e[0]<T0||e[0]>T0+TSPAN) continue;
+  mx+=X(e[0]).toFixed(1)+','+Y(e[5]).toFixed(1)+' ';
+  mn=X(e[0]).toFixed(1)+','+Y(e[1]).toFixed(1)+' '+mn;}
+ if(mx) svg+='<polygon points="'+X(Math.max(T0,lo)).toFixed(1)+','+(pad_t+ph)+' '+mx
+   +X(Math.max(T0,lo)).toFixed(1)+','+(pad_t+ph)+'" fill="rgba(64,156,255,0.20)" stroke="none"/>';
+ svg+=polyFreq(env,X,Y,3,'1.5','');
+ svg+=polyFreq(env,X,Y,4,'1','6,3',0.6);
+ svg+=polyFreq(env,X,Y,2,'1','6,3',0.6);
+ svg+=polyFreq(env,X,Y,1,'1','2,3',0.4);
+ if(FREQ_T0!==null) svg+=timeLabels(g,H);
+ svg+='<text x="'+(g.pad_l-44)+'" y="'+(pad_t+10)+'" fill="#bbb">GHz</text>';
+ svg+=freqLegend(g,H);
+ svg+='</svg>';
+ return svg;}
+
+function polyFreq(env,X,Y,col,sw,dash,op){
+ var pts='',i;
+ for(i=0;i<env.length;i++){
+  if(env[i][0]<T0||env[i][0]>T0+TSPAN) continue;
+  pts+=X(env[i][0]).toFixed(1)+','+Y(env[i][col]).toFixed(1)+' ';}
+ if(!pts) return '';
+ return '<polyline points="'+pts+'" fill="none" stroke="#409cff" stroke-width="'+sw+'" '
+   +(dash?'stroke-dasharray="'+dash+'" ':'')+(op?'opacity="'+op+'"':'')+'/>';}
+
+function freqLegend(g,H){
  /* The legend sits in the bottom-right corner: a CPU that is busy runs at its
     top frequency, so the envelope hugs the ceiling and the space under it is
-    the part of the plot with nothing to cover. It hangs below the zero line
-    into the bottom band, which this chart leaves empty - unlike the utilization
-    one, the frequency view draws no time labels. */
-  var lw=118,lh=44,lx=W-10-lw,ly=H-lh-4;
- svg+='<rect x="'+lx+'" y="'+ly+'" width="'+lw+'" height="'+lh+'" rx="4" fill="rgba(20,24,33,0.85)" stroke="#2a3247"/>';
- svg+='<line x1="'+(lx+8)+'" y1="'+(ly+12)+'" x2="'+(lx+28)+'" y2="'+(ly+12)+'" stroke="#409cff" stroke-width="1.5"/>';
- svg+='<text x="'+(lx+34)+'" y="'+(ly+15)+'" fill="#bbb" font-size="11">median</text>';
-  svg+='<line x1="'+(lx+8)+'" y1="'+(ly+24)+'" x2="'+(lx+28)+'" y2="'+(ly+24)+'" stroke="#409cff" stroke-width="1" '
-   +'stroke-dasharray="6,3" opacity="0.6"/>';
- svg+='<text x="'+(lx+34)+'" y="'+(ly+27)+'" fill="#bbb" font-size="11">p25 / p75</text>';
-  svg+='<line x1="'+(lx+8)+'" y1="'+(ly+36)+'" x2="'+(lx+28)+'" y2="'+(ly+36)+'" stroke="#409cff" stroke-width="1" '
-   +'stroke-dasharray="2,3" opacity="0.4"/>';
- svg+='<text x="'+(lx+34)+'" y="'+(ly+39)+'" fill="#bbb" font-size="11">min / max</text>';
- svg+='</svg>';
- document.getElementById('chart-svg').innerHTML=svg;
-}
+    the part of the plot with nothing to cover. */
+ var lw=118,lh=44,lx=g.W-10-lw,ly=H-lh-4,out='';
+ out+='<rect x="'+lx+'" y="'+ly+'" width="'+lw+'" height="'+lh+'" rx="4" fill="rgba(20,24,33,0.85)" stroke="#2a3247"/>';
+ out+='<line x1="'+(lx+8)+'" y1="'+(ly+12)+'" x2="'+(lx+28)+'" y2="'+(ly+12)
+  +'" stroke="#409cff" stroke-width="1.5"/>';
+ out+='<text x="'+(lx+34)+'" y="'+(ly+15)+'" fill="#bbb" font-size="11">median</text>';
+ out+='<line x1="'+(lx+8)+'" y1="'+(ly+24)+'" x2="'+(lx+28)+'" y2="'+(ly+24)
+  +'" stroke="#409cff" stroke-width="1" stroke-dasharray="6,3" opacity="0.6"/>';
+ out+='<text x="'+(lx+34)+'" y="'+(ly+27)+'" fill="#bbb" font-size="11">p25 / p75</text>';
+ out+='<line x1="'+(lx+8)+'" y1="'+(ly+36)+'" x2="'+(lx+28)+'" y2="'+(ly+36)
+  +'" stroke="#409cff" stroke-width="1" stroke-dasharray="2,3" opacity="0.4"/>';
+ out+='<text x="'+(lx+34)+'" y="'+(ly+39)+'" fill="#bbb" font-size="11">min / max</text>';
+ return out;}
 
 function niceAxes(maxv){
  if(maxv<=0) return 1;
- var raw=maxv/4;var mag=Math.pow(10,Math.floor(Math.log10(raw)));
- var mults=[1,2,2.5,5,10];
+ var raw=maxv/4,mag=Math.pow(10,Math.floor(Math.log10(raw))),mults=[1,2,2.5,5,10];
  for(var i=0;i<mults.length;i++){if(raw<=mag*mults[i]) return mag*mults[i];}
- return mag*10;
-}
+ return mag*10;}
 
 function setChartMode(mode){
  chartMode=mode;
- document.querySelectorAll('.mode-btn').forEach(function(b){
+ document.querySelectorAll('.mode-btn[data-mode]').forEach(function(b){
   b.classList.toggle('active',b.dataset.mode===mode);
  });
- renderChart();
-}
+ renderChart();}
+
+/* ---- Memory: per-slice IBS/PEBS rows re-added over the selection ---- */
+function memSliceRange(i){
+ /* MEM_SLICES are slice starts relative to the first sample and a slice covers
+    [start, start + quantum) - the quantum perf bucketed the report by, with a
+    single-slice report falling back to a hundredth of the run.  It is clipped
+    to the profile's own sample window: perf floors a sample to its slice, so
+    the first slice of a capture starts up to a quantum before the first sample
+    (and the last one ends after the last), while every sample it holds is
+    inside the run. */
+ var start=T0+MEM_SLICES[i],q=MEM_Q||Math.max(TSPAN/100,1e-6);
+ return [Math.max(start,T0),Math.min(start+q,T0+TSPAN)];}
+
+function memOverlap(a,b,lo,hi){
+ var w=b-a;
+ if(w<=0||b<=lo||a>=hi) return 0;
+ return (Math.min(b,hi)-Math.max(a,lo))/w;}
+
+function memAggregate(){
+ var lo=selStart(),hi=selEnd();
+ var out={total:0,classified:0,weight:0,levels:{},bands:{},tlb:{},syms:new Map()};
+ for(var i=0;i<MEM_ROWS.length;i++){
+  var r=MEM_ROWS[i],range=memSliceRange(r[0]),f=memOverlap(range[0],range[1],lo,hi);
+  if(f<=0) continue;
+  if(scopeSet!==null&&!scopeSet.has(r[1])) continue;
+  var n=r[6]*f,w=r[7]*f,name,slot;
+  out.total+=n;
+  if(r[2]<MEM_LEVELS.length-1){
+   out.classified+=n;out.weight+=w;
+   name=MEM_LEVELS[r[2]];
+   out.levels[name]=(out.levels[name]||0)+n;}
+  if(r[3]>=0){
+   name=MEM_BANDS[r[3]];
+   out.bands[name]=(out.bands[name]||0)+n;}
+  name=MEM_TLB[r[4]];
+  out.tlb[name]=(out.tlb[name]||0)+n;
+  var pair=MEM_SYM[r[5]];
+  slot=out.syms.get(pair[0]);
+  if(!slot){slot={sym:pair[0],dso:pair[1],samples:0,weight:0,dram:0};out.syms.set(pair[0],slot);}
+  slot.samples+=n;slot.weight+=w;
+  if(r[2]===0) slot.dram+=n;
+ }
+ return out;}
+
+function memBars(items,total,countLabel){
+ var peak=0,i;
+ for(i=0;i<items.length;i++) if(items[i][1]>peak) peak=items[i][1];
+ peak=peak||1;
+ var rows='';
+ for(i=0;i<items.length;i++){
+  var v=items[i][1];
+  if(!v) continue;
+  rows+='<tr><td class="mono">'+escHtml(items[i][0])+'</td>'
+   +'<td data-v="'+v.toFixed(2)+'"><span class="bar" style="width:'+(v/peak*120).toFixed(0)
+   +'px"></span> '+Math.round(v).toLocaleString()+'</td>'
+   +'<td data-v="'+(total?v/total:0).toFixed(4)+'">'+((total?v/total*100:0)).toFixed(1)+'%</td></tr>';}
+ return '<table><thead><tr><th></th><th>'+countLabel+'</th>'
+   +'<th>% of classified</th></tr></thead><tbody>'+rows+'</tbody></table>';}
 
 function renderMemory(){
  var body=document.getElementById('memory-body');
  if(!body) return;
- if(Object.prototype.hasOwnProperty.call(MEMORY_HTML,scopeKey)){
-  body.innerHTML=MEMORY_HTML[scopeKey];
- }else if(scopeKey==='all'){
-  body.innerHTML=MEMORY_HTML.all||'';
- }else{
-  body.innerHTML='<div class="panel"><h3>Memory access</h3><em>No IBS / PEBS samples are available for the selected '
-  +'thread or thread group in this profile.</em></div>';
+ if(!MEM_ROWS.length){
+  /* no per-slice rows: this profile's memory data cannot answer a time
+     selection, so keep whatever the server rendered for the scope */
+  if(Object.prototype.hasOwnProperty.call(MEMORY_HTML,scopeKey)){
+   body.innerHTML=MEMORY_HTML[scopeKey];
+  }else if(scopeKey==='all'){
+   body.innerHTML=MEMORY_HTML.all||'';
+  }else{
+   body.innerHTML='<div class="panel"><h3>Memory access</h3><em>No IBS / PEBS samples are available for the selected '
+    +'thread or thread group in this profile.</em></div>';
+  }
+  renderMemChart();
+  return;
+ }
+ var a=memAggregate(),label=MEM_BACKEND;
+ var total=a.classified||1;
+ var mix=[],bands=[],i;
+ for(i=0;i<MEM_LEVELS.length-1;i++) mix.push([MEM_LEVELS[i],a.levels[MEM_LEVELS[i]]||0]);
+ for(i=0;i<MEM_BANDS.length;i++) bands.push([MEM_BANDS[i],a.bands[MEM_BANDS[i]]||0]);
+ var tlb=Object.keys(a.tlb).map(function(k){return [k,a.tlb[k]];})
+  .sort(function(x,y){return y[1]-x[1];}).slice(0,6);
+ var avg=a.classified?a.weight/a.classified:0;
+ var syms=[...a.syms.values()].sort(function(x,y){return y.weight-x.weight;}).slice(0,20);
+ var stall='<table><thead><tr><th onclick="sortTable(this,0)">Function</th>'
+  +'<th onclick="sortTable(this,0)">Module</th><th onclick="sortTable(this,1)">Accesses</th>'
+  +'<th onclick="sortTable(this,1)">Stall cycles (Σ latency)</th>'
+  +'<th onclick="sortTable(this,1)">Avg latency</th>'
+  +'<th onclick="sortTable(this,1)">DRAM accesses</th></tr></thead><tbody>';
+ syms.forEach(function(s){
+  var sAvg=s.samples?s.weight/s.samples:0;
+  stall+='<tr><td class="mono">'+escHtml(s.sym)+'</td><td class="mono">'+escHtml(s.dso)
+   +'</td><td data-v="'+s.samples.toFixed(2)+'">'+Math.round(s.samples).toLocaleString()
+   +'</td><td data-v="'+s.weight.toFixed(2)+'" class="mono">'+Math.round(s.weight).toLocaleString()
+   +'</td><td data-v="'+sAvg.toFixed(2)+'" class="mono">'+Math.round(sAvg).toLocaleString()
+   +'</td><td data-v="'+s.dram.toFixed(2)+'">'+Math.round(s.dram).toLocaleString()+'</td></tr>';});
+ stall+='</tbody></table>';
+ var truncNote=MEM_TRUNC
+  ?'<div class="note" style="margin-bottom:8px">This profile carries more memory rows than a browser '
+   +'report can hold: the heaviest '+MEM_ROWS.length+' rows are shown.</div>':'';
+ var body0='<div style="color:var(--dim);font-size:12px;margin-bottom:12px">Scope: '
+  +escHtml(scopeLabel())+(selectionActive()?' · '+selStart().toFixed(3)+'s — '+selEnd().toFixed(3)+'s':'')
+  +'</div>';
+ body.innerHTML=truncNote
+  +body0
+  +'<div class="panel"><h3>Memory access summary ('+label+')</h3><table><tbody>'
+  +'<tr><td>'+label+' samples collected</td><td>'+Math.round(a.total).toLocaleString()+'</td>'
+  +'<td class="mono" style="color:var(--dim)">tagged micro-ops</td></tr>'
+  +'<tr><td>Classified data accesses</td><td>'+Math.round(a.classified).toLocaleString()+'</td>'
+  +'<td class="mono" style="color:var(--dim)">with cache-level attribution</td></tr>'
+  +'<tr><td>Average access latency</td><td>'+Math.round(avg).toLocaleString()+' cycles</td>'
+  +'<td class="mono" style="color:var(--dim)">weighted by samples</td></tr>'
+  +'</tbody></table></div>'
+  +'<div class="panel"><h3>Where the data came from</h3>'+memBars(mix,total,'Accesses')+'</div>'
+  +'<div class="panel"><h3>Latency distribution (VTune-style bands)</h3>'+memBars(bands,total,'Accesses')+'</div>'
+  +'<div class="panel"><h3>dTLB outcomes</h3>'+memBars(tlb,a.total||1,'Accesses')+'</div>'
+  +'<div class="panel"><h3>Top functions by memory-stall time</h3>'+stall+'</div>';
+ renderMemChart();}
+
+/* the memory timeline, in the Memory tab: where the accesses landed over the
+   run, with the selection shaded like the utilization chart above it */
+function renderMemChart(){
+ var host=document.getElementById('mem-chart');
+ if(!host||!MEM_ROWS.length) return;
+ var g=plotGeom(host,34),H=110,pad_t=6,ph=76,W=g.W;
+ var n=MEM_SLICES.length,levels=MEM_LEVELS.length-1;
+ var series=[],li;
+ for(li=0;li<levels;li++) series.push(new Float64Array(n));
+ for(var i=0;i<MEM_ROWS.length;i++){
+  var r=MEM_ROWS[i];
+  if(r[2]>=levels) continue;
+  if(scopeSet!==null&&!scopeSet.has(r[1])) continue;
+  series[r[2]][r[0]]+=r[6];
+ }
+ var peak=0,bi;
+ for(bi=0;bi<n;bi++){var sum=0;for(li=0;li<levels;li++) sum+=series[li][bi];
+  if(sum>peak) peak=sum;}
+ peak=peak||1;
+ var svg='<svg xmlns="http://www.w3.org/2000/svg" width="'+W+'" height="'+H
+  +'" font-family="Verdana,sans-serif" font-size="11">';
+ var colors=['#ff6f7d','#ffb340','#409cff','#59d499','#a1887f'];
+ var acc=new Float64Array(n);
+ for(li=0;li<levels;li++){
+  var top='',bot='';
+  for(bi=0;bi<n;bi++){
+   var x=MEM_SLICES[bi]!==undefined?timeToX(T0+MEM_SLICES[bi],g):g.pad_l;
+   var yTop=pad_t+ph-Math.min((acc[bi]+series[li][bi])/peak,1)*ph;
+   var yBot=pad_t+ph-Math.min(acc[bi]/peak,1)*ph;
+   top+=(bi?' ':'')+x.toFixed(1)+','+yTop.toFixed(1);
+   bot=(bi?' ':'')+x.toFixed(1)+','+yBot.toFixed(1)+' '+bot;
+   acc[bi]+=series[li][bi];
+  }
+  svg+='<polygon points="'+top+' '+bot+'" fill="'+colors[li%colors.length]
+   +'" fill-opacity="0.8" stroke="none"><title>'+escHtml(MEM_LEVELS[li])+'</title></polygon>';
+ }
+ svg+=shadeSvg(g,H,pad_t,ph);
+ svg+=timeLabels(g,H);
+ var lx=g.pad_l+2,ly=H-6;
+ for(li=0;li<levels;li++){
+  svg+='<rect x="'+lx+'" y="'+(ly-8)+'" width="9" height="9" fill="'+colors[li%colors.length]+'"/>';
+  svg+='<text x="'+(lx+13)+'" y="'+ly+'" fill="#bbb">'+escHtml(MEM_LEVELS[li])+'</text>';
+  lx+=22+7*MEM_LEVELS[li].length;
+  if(lx>W-90){lx=g.pad_l+2;ly+=12;}
+ }
+ svg+='</svg>';
+ host.innerHTML=svg;}
+
+/* ---- Call Tree: the same fold, laid out as nested details ---- */
+function renderTree(){
+ var body=document.getElementById('tree-body');
+ if(!body) return;
+ var res=foldWindow(),fold=res.fold,total=0,k;
+ for(k in fold) total+=fold[k];
+ if(!total){
+  body.innerHTML='<em>No classifiable user-space samples in the selection.</em>';return;}
+ var root={name:'all',value:0,children:{}};
+ for(k in fold){
+  var parts=k.split(';'),node=root;
+  node.value+=fold[k];
+  for(var p=0;p<parts.length;p++){
+   var child=node.children[parts[p]];
+   if(!child) child=node.children[parts[p]]={name:parts[p],value:0,children:{}};
+   child.value+=fold[k];
+   node=child;
+  }
+ }
+ var out=[],stack=[{node:root,depth:0,close:null}];
+ while(stack.length){
+  var item=stack.pop();
+  if(item.close!==null){out.push(item.close);continue;}
+  var cur=item.node,depth=item.depth;
+  if(cur.value/total<0.001&&depth>1) continue;
+  var kids=Object.keys(cur.children).map(function(name){return cur.children[name];})
+   .sort(function(a,b){return b.value-a.value;});
+  var pct=cur.value/total*100,self=0,ci;
+  for(ci=0;ci<kids.length;ci++) self+=kids[ci].value;
+  self=Math.max(cur.value-self,0)/total*100;
+  if(!kids.length){
+   out.push('<div style="padding-left:18px"><span class="mono">'+escHtml(cur.name)+'</span>'
+    +'<span class="selfpct">'+pct.toFixed(1)+'% · self '+self.toFixed(1)+'%</span></div>');
+   continue;
+  }
+  out.push('<details'+(depth<2?' open':'')+'><summary><span class="mono">'
+   +escHtml(cur.name)+'</span><span class="selfpct">'+pct.toFixed(1)+'% · self '
+   +self.toFixed(1)+'%</span></summary>');
+  stack.push({node:null,depth:depth,close:'</details>'});
+  for(ci=Math.min(kids.length,40)-1;ci>=0;ci--)
+   stack.push({node:kids[ci],depth:depth+1,close:null});
+ }
+ body.innerHTML=out.join('');}
+
+/* ---- Threads: the CPU columns follow the selection, the scheduler's do not
+   (its tracepoints are counted once, over the whole window) ---- */
+function renderThreads(){
+ var body=document.getElementById('threads-body');
+ if(!body) return;
+ var byTid={},total=0,rows=windowRows(),i;
+ for(i=0;i<rows.length;i++){
+  var r=SAMPLES[rows[i]];
+  byTid[r[0]]=(byTid[r[0]]||0)+r[2];
+  total+=r[2];
+ }
+ total=total||1;
+ var cells=body.querySelectorAll('.cpu-cycles');
+ for(i=0;i<cells.length;i++){
+  var tid=+cells[i].dataset.tid,cycles=byTid[tid]||0,share=cycles/total*100;
+  cells[i].textContent=fmtCount(cycles);
+  cells[i].dataset.v=cycles;
+  var pct=cells[i].parentNode?cells[i].parentNode.querySelector('.cpu-share'):null;
+  if(pct){pct.textContent=share.toFixed(1)+'%';pct.dataset.v=share.toFixed(3);}
  }
 }
 
+/* ---- Overview: whole-run PMU counters, scoped per thread, never per time.
+   perf only counts --per-thread over the whole run, so the panels say so as
+   soon as a selection is active rather than quietly reporting the whole run
+   as if it were the window. ---- */
 function renderOverview(){
  var body=document.getElementById('overview-body');
  if(!body) return;
@@ -338,16 +673,161 @@ function renderOverview(){
   body.innerHTML=OVERVIEW_HTML.all||'';
  }else{
   body.innerHTML='<div class="panel"><h3>Overview</h3><em>Per-thread hardware counters are unavailable '
-  +'for the selected thread or thread group in this profile.</em></div>';
+   +'for the selected thread or thread group in this profile.</em></div>';
  }
 }
 
-var flameStates=[];
+function renderBadges(){
+ document.body.classList.toggle('sel-active',selectionActive());
+ var panel=document.getElementById('overview-body');
+ if(panel){
+  var notes=panel.querySelectorAll('.whole-run-note');
+  for(var i=0;i<notes.length;i++) notes[i].style.display=selectionActive()?'':'none';
+ }
+ var wt=document.querySelectorAll('#threads .whole-run-note');
+ for(var j=0;j<wt.length;j++) wt[j].style.display=selectionActive()?'':'none';}
+
+/* ============================ flame graph ============================== */
+var FL_ROW=17,FL_FONT=11,FL_GAP=0.5,FL_LMIN=28,FL_CW=0.62,FL_MINW=2,FL_W=1160;
+var flameState=null;
 
 /* data-x/data-w carry four decimals, so a frame's edge can sit a rounding step
    outside its parent's span; FLAME_EPS absorbs that without being wide enough
    to swallow a neighbouring sibling. */
 var FLAME_EPS=1e-3;
+
+function utf8Bytes(s){
+ try{return unescape(encodeURIComponent(s));}catch(e){return s;}}
+
+function flameColor(name){
+ var bytes=utf8Bytes(name),h=0;
+ for(var i=0;i<bytes.length;i++) h=(h*31+bytes.charCodeAt(i))|0;
+ var u=h>>>0;
+ return 'rgb('+(205+u%50)+','+(90+((u>>>3)%110))+','+(30+((u>>>6)%60))+')';}
+
+function flameLabelText(name,w){
+ if(w<=FL_LMIN) return '';
+ var maxc=Math.floor(w/(FL_FONT*FL_CW))-2;
+ if(maxc<1) return '';
+ if(maxc<name.length) return name.slice(0,Math.max(maxc-1,1))+'…';
+ return name;}
+
+function flameNode(name){return {name:name,value:0,self:0,children:{}};}
+
+function flameInsert(root,frames,w){
+ var node=root,i;
+ node.value+=w;
+ for(i=0;i<frames.length-1;i++){
+  var child=node.children[frames[i]];
+  if(!child) child=node.children[frames[i]]=flameNode(frames[i]);
+  node=child;node.value+=w;
+ }
+ var leaf=frames[frames.length-1];
+ var last=node.children[leaf];
+ if(!last) last=node.children[leaf]=flameNode(leaf);
+ last.value+=w;last.self+=w;}
+
+/* how many rows below `node` the depth cap drops, exactly as the server-side
+   renderer counts them, so a rebuilt graph folds the same rows */
+function flameRowsBelow(node,depth,maxDepth){
+ var best=0,stack=[[node,0]];
+ while(stack.length){
+  var cur=stack.pop();
+  if(cur[1]>best) best=cur[1];
+  for(var k in cur[0].children) stack.push([cur[0].children[k],cur[1]+1]);
+ }
+ return Math.max(0,best-(maxDepth-1-depth));}
+
+function flameSvg(fold,title,width){
+ var maxDepth=MAX_FLAME_DEPTH;
+ width=width||FL_W;
+ var root=flameNode('root'),total=0,k;
+ for(k in fold){
+  if(!fold[k]) continue;
+  flameInsert(root,k.split(';'),fold[k]);
+  total+=fold[k];
+ }
+ if(!total){
+  return '<em>No classifiable user-space samples in the selection.</em>';}
+ var levels=[],stack=[[root,0,0,0]];
+ while(stack.length){
+  var item=stack.pop(),node=item[0],x0=item[1],depth=item[2],capped=item[3];
+  if(levels.length<=depth) levels[depth]=[];
+  levels[depth].push([node,x0,capped]);
+  if(depth+1>=maxDepth) continue;
+  var cx=x0,kids=Object.keys(node.children).map(function(nm){return node.children[nm];})
+   .sort(function(a,b){return b.value-a.value;});
+  for(var i=kids.length-1;i>=0;i--){
+   stack.push([kids[i],cx,depth+1,flameRowsBelow(kids[i],depth+1,maxDepth)]);
+   cx+=kids[i].value/total*width;
+  }
+ }
+ /* the picture ends at the last row holding a frame worth reading */
+ var last=0;
+ for(var li=0;li<levels.length;li++)
+  for(var m=0;m<levels[li].length;m++)
+   if(levels[li][m][0].value/total*width>FL_MINW) last=li;
+ var starts=levels[last].map(function(e){return e[1];});
+ var folded=new Array(starts.length).fill(0);
+ for(li=last+1;li<levels.length;li++)
+  for(m=0;m<levels[li].length;m++){
+   var x=levels[li][m][1],lo=0,hi=starts.length-1,owner=-1;
+   while(lo<=hi){var mid=(lo+hi)>>1;
+    if(starts[mid]-1e-6<=x){owner=mid;lo=mid+1;}else hi=mid-1;}
+   if(owner>=0) folded[owner]++;}
+ if(levels.length>last+1) levels=levels.slice(0,last+1);
+ var pad=title?22:8,height=levels.length*FL_ROW+pad,out=[];
+ out.push('<svg xmlns="http://www.w3.org/2000/svg" width="'+width+'" height="'+height
+  +'" viewBox="0 0 '+width+' '+height+'" font-family="Verdana,sans-serif" font-size="'+FL_FONT
+  +'" data-row="'+FL_ROW+'" data-font="'+FL_FONT+'" data-gap="'+FL_GAP+'" data-lmin="'+FL_LMIN
+  +'" data-cw="'+FL_CW+'" data-pad="'+pad+'">');
+ if(title) out.push('<text class="ftitle" x="4" y="14" fill="#ccc">'+escHtml(title)+'</text>');
+ out.push('<g class="fbody">');
+ for(li=0;li<levels.length;li++){
+  var y=height-(li+1)*FL_ROW;
+  for(m=0;m<levels[li].length;m++){
+   var entry=levels[li][m],nd=entry[0],w=nd.value/total*width;
+   if(w<=0.01) continue;
+   var cut=entry[2]+(li===last?folded[m]:0);
+   var note=cut?' +'+cut+' deeper rows folded in':'';
+   var label=nd.name+' ('+(nd.value/total*100).toFixed(1)+'%, '+nd.value.toLocaleString()+')';
+   out.push('<g class="fg" data-n="'+escHtml(nd.name)+'" data-v="'+nd.value+'" data-d="'+li
+    +'" data-y="'+y+'" data-x="'+entry[1].toFixed(4)+'" data-w="'+w.toFixed(4)+'"'
+    +(cut?' data-folds="'+cut+'" data-fold-note="'+escHtml(note)+'"':'')+'>'
+    +'<title>'+escHtml(label+note)+'</title>'
+    +'<rect x="'+entry[1].toFixed(2)+'" y="'+y+'" width="'+Math.max(w-FL_GAP,FL_GAP).toFixed(2)
+    +'" height="'+(FL_ROW-2)+'" rx="1" fill="'+flameColor(nd.name)+'"/>');
+   var text=flameLabelText(nd.name,w);
+   if(text) out.push('<text x="'+(entry[1]+2).toFixed(2)+'" y="'+(y+FL_ROW-5)
+    +'" fill="#111">'+escHtml(text)+'</text>');
+   out.push('</g>');
+  }
+ }
+ out.push('<g class="fovl" style="display:none"><g class="fctx"></g></g>');
+ out.push('</g></svg>');
+ return out.join('');
+}
+
+function flameTitle(samples){
+ var base=scopeKey==='all'?'All threads (user space)':scopeLabel()+' — user space';
+ return base+' — '+samples.toLocaleString()+' samples'
+   +(selectionActive()?' ▸ '+selStart().toFixed(3)+'s — '+selEnd().toFixed(3)+'s':'');}
+
+function renderFlame(){
+ var wrap=document.getElementById('flamewrap');
+ if(!wrap) return;
+ if(firstPaint){
+  /* the server already drew the whole-run, all-threads graph: registering it
+     is all that is left to do before anything is touched */
+  flameState=flameInitOne(wrap.querySelector('.flame'));
+  return;}
+ var res=foldWindow();
+ wrap.dataset.thread=scopeKey;
+ wrap.innerHTML='<div class="flame" data-thread="'+scopeKey+'">'
+  +flameSvg(res.fold,flameTitle(res.samples))+'</div>';
+ var div=wrap.querySelector('.flame');
+ flameState=flameInitOne(div);
+ if(!flameState) wrap.innerHTML='<em>No classifiable user-space samples in the selection.</em>';}
 
 function flameLabel(st,n,w){
  if(w<=st.lmin) return '';
@@ -357,8 +837,8 @@ function flameLabel(st,n,w){
  return n;}
 
 function flameInitOne(div){
- var svg=div.querySelector('svg');
- if(!svg) return;
+ var svg=div&&div.querySelector('svg');
+ if(!svg) return null;
  var ds=svg.dataset;
  var st={svg:svg,frames:[],focus:null,anc:[],byEl:new Map(),
   row:+ds.row,font:+ds.font,gap:+ds.gap,lmin:+ds.lmin,cw:+ds.cw,total:1,
@@ -384,12 +864,8 @@ function flameInitOne(div){
   var hit=e.target.closest?e.target.closest('g.fg,g.fcx'):null;
   if(!hit) return;
   focusFrame(hit.classList.contains('fcx')?st.anc[+hit.dataset.i]:st.byEl.get(hit));});
- flameStates.push(st);
- flameRender(st,null);}  /* lays out, and sizes the canvas to what is drawn */
-
-function flameInit(){
- var divs=document.querySelectorAll('#flamewrap .flame');
- for(var i=0;i<divs.length;i++) flameInitOne(divs[i]);}
+ flameRender(st,null);   /* lays out, and sizes the canvas to what is drawn */
+ return st;}
 
 function flameParent(st,f){
  var p=null;
@@ -457,88 +933,164 @@ function flameRender(st,f){
 
 function resetFlameZoom(e){
  if(e) e.preventDefault();
- for(var i=0;i<flameStates.length;i++) flameRender(flameStates[i],null);}
+ if(flameState) flameRender(flameState,null);}
 
-/* value: '' for every thread, 'gN' for a name group (THREAD_GROUPS holds its
-   tids), anything else a single tid. */
-function setThread(value){
+/* ============================== scope ================================= */
+function scopeLabel(){
+ var sel=document.getElementById('thread-sel');
+ if(sel&&sel.selectedIndex>=0) return sel.options[sel.selectedIndex].text;
+ return 'All threads';}
+
+function setScopeTids(value){
  if(value===null||value===undefined||value===''){scopeTids=null;scopeKey='all';}
  else if(value.charAt(0)==='g'){scopeTids=THREAD_GROUPS[value]||null;scopeKey=value;}
  else{scopeTids=[parseInt(value)];scopeKey=String(parseInt(value));}
- var sel=document.getElementById('thread-sel');
- document.getElementById('thread-label').textContent=sel.options[sel.selectedIndex].text;
- renderHotspots();
- renderChart();
- renderMemory();
- renderOverview();
- document.querySelectorAll('#flamewrap .flame').forEach(d=>{
-  d.style.display=(d.dataset.thread===scopeKey)?'block':'none';});
- resetFlameZoom();
-}
+ scopeSet=scopeTids?new Set(scopeTids):null;
+ chartCacheKey='';keyCache=null;uniqCache=null;}
+
+function setThread(value){
+ setScopeTids(value);
+ renderAll();}
 
 /* Swaps the selector between the per-thread list and the by-name list; both
    are server-rendered, so this only has to pick one and reselect. */
 function toggleGrouped(){
  var sel=document.getElementById('thread-sel');
  sel.innerHTML=document.getElementById('group-threads').checked?GROUP_OPTS:THREAD_OPTS;
- setThread('');
+ setScopeTids('');
+ renderAll();}
+
+/* ========================= time selection ============================= */
+/* The heavy tabs are rebuilt once the drag settles: a 100k-sample profile
+   re-folds and re-lays out in tens of milliseconds, but not on every
+   mousemove, and the chart only ever moves its shade while dragging. */
+var firstPaint=true;
+var refreshTimer=null;
+function scheduleRefresh(){
+ if(refreshTimer) clearTimeout(refreshTimer);
+ refreshTimer=setTimeout(function(){refreshTimer=null;renderScoped();},140);}
+
+function renderAll(){renderScoped();}
+
+function renderScoped(){
+ if(refreshTimer){clearTimeout(refreshTimer);refreshTimer=null;}
+ renderChart();
+ if(firstPaint){renderScopeLine();renderBadges();return;}
+ renderHotspots();
+ renderFlame();
+ renderTree();
+ renderMemory();
+ renderThreads();
+ renderOverview();
+ renderScopeLine();
+ renderBadges();
 }
 
+function renderScopeLine(){
+ var line=document.getElementById('scope-line');
+ if(!line) return;
+ var rows=windowRows(),cycles=0,share=0;
+ for(var i=0;i<rows.length;i++) cycles+=SAMPLES[rows[i]][2];
+ share=TOTAL_CYCLES?cycles/TOTAL_CYCLES*100:0;
+ line.textContent='Scope: '+scopeLabel()
+  +(selectionActive()?' · '+selStart().toFixed(3)+'s — '+selEnd().toFixed(3)+'s ('
+   +((timeEnd-timeStart)*100).toFixed(1)+'% of run)':' · whole run')
+  +' · '+rows.length.toLocaleString()+' samples · '+fmtCount(cycles)+' cycles'
+  +(selectionActive()?' ('+share.toFixed(1)+'% of the run)':'');}
 
-function initDrag(){
+function updateSelectionChrome(){
  var wrap=document.getElementById('chart-wrap');
  if(!wrap) return;
- var left=document.getElementById('drag-left');
- var right=document.getElementById('drag-right');
- var overlay=document.getElementById('drag-overlay');
+ var g=plotGeom(),left=document.getElementById('drag-left'),
+     right=document.getElementById('drag-right'),
+     overlay=document.getElementById('drag-overlay');
  if(!left||!right) return;
+ var a=timeToX(selStart(),g),b=timeToX(selEnd(),g);
+ left.style.left=(a-6)+'px';
+ right.style.left=(b-6)+'px';
+ overlay.style.left=a+'px';
+ overlay.style.width=Math.max(0,b-a)+'px';
+ var start=document.getElementById('time-start'),end=document.getElementById('time-end');
+ if(document.activeElement!==start) start.value=selStart().toFixed(3);
+ if(document.activeElement!==end) end.value=selEnd().toFixed(3);
+ renderScopeLine();
+ renderBadges();}
 
- function updateOverlay(){
-  var W=wrap.clientWidth;
-  overlay.style.left=(timeStart*W)+'px';
-  overlay.style.width=((timeEnd-timeStart)*W)+'px';
-  var total=timeEnd-timeStart;
-  document.getElementById('time-label').textContent=
-   (timeStart*TSPAN).toFixed(3)+'s — '+(timeEnd*TSPAN).toFixed(3)+'s ('+(total*100).toFixed(1)+'% of run)';
- }
+function setSelection(a,b,live){
+ timeStart=Math.max(0,Math.min(1,Math.min(a,b)));
+ timeEnd=Math.min(1,Math.max(timeStart+0.002,Math.max(a,b)));
+ renderChart();                                     /* the shade follows at once */
+ updateSelectionChrome();
+ if(live) scheduleRefresh(); else renderScoped();}
 
- function startDrag(handle,e){
+function applyTimeInputs(){
+ var start=document.getElementById('time-start'),end=document.getElementById('time-end');
+ var a=parseFloat(start.value),b=parseFloat(end.value);
+ if(isNaN(a)||isNaN(b)){updateSelectionChrome();return;}
+ setSelection((a-T0)/TSPAN,(b-T0)/TSPAN,false);}
+
+function resetSelection(){
+ timeStart=0;timeEnd=1;
+ renderChart();updateSelectionChrome();renderScoped();}
+
+function initSelection(){
+ var wrap=document.getElementById('chart-wrap');
+ if(!wrap) return;
+ var drag=null;
+ function frac(x){return (xToTime(x)-T0)/TSPAN;}
+
+ function down(e){
+  var g=plotGeom(),x=e.clientX-g.el.getBoundingClientRect().left,f=frac(x);
+  if(e.target.id==='drag-left') drag={mode:'left'};
+  else if(e.target.id==='drag-right') drag={mode:'right'};
+  else if(f>timeStart&&f<timeEnd&&selectionActive())
+   /* inside the selection: move the whole window instead of starting a new one */
+   drag={mode:'pan',grab:f,width:timeEnd-timeStart};
+  else{
+   drag={mode:'new',anchor:f};
+   timeStart=timeEnd=f;}
   e.preventDefault();
-  var startX=e.clientX;
-  var startVal=handle===left?timeStart:timeEnd;
-  function onMove(ev){
-   var dx=ev.clientX-startX;
-   var W=wrap.clientWidth;
-   var dt=dx/W;
-   if(handle===left){
-    timeStart=Math.max(0,Math.min(timeEnd-0.01,startVal+dt));
-    left.style.left=(timeStart*W-6)+'px';
-   } else {
-    timeEnd=Math.min(1,Math.max(timeStart+0.01,startVal+dt));
-    right.style.left=(timeEnd*W-6)+'px';
-   }
-   updateOverlay();
-   renderHotspots();
-   renderChart();
-  }
-  function onUp(){document.removeEventListener('mousemove',onMove);document.removeEventListener('mouseup',onUp);}
-  document.addEventListener('mousemove',onMove);
-  document.addEventListener('mouseup',onUp);
+  move(e);
  }
 
- left.addEventListener('mousedown',function(e){startDrag(left,e);});
- right.addEventListener('mousedown',function(e){startDrag(right,e);});
- updateOverlay();
-}
+ function move(e){
+  if(!drag) return;
+  var g=plotGeom(),f=frac(e.clientX-g.el.getBoundingClientRect().left);
+  if(drag.mode==='left') setSelection(Math.min(f,timeEnd-0.002),timeEnd,true);
+  else if(drag.mode==='right') setSelection(timeStart,Math.max(f,timeStart+0.002),true);
+  else if(drag.mode==='pan'){
+   var span=drag.width,lo=Math.max(0,Math.min(1-span,drag.grab+(f-drag.anchor)));
+   setSelection(lo,lo+span,true);
+  }else{
+   setSelection(Math.min(drag.anchor,f),Math.max(drag.anchor,f),true);
+  }
+ }
+
+ function up(){
+  if(!drag) return;
+  drag=null;
+  renderScoped();}
+
+ wrap.addEventListener('mousedown',down);
+ document.addEventListener('mousemove',move);
+ document.addEventListener('mouseup',up);
+ wrap.addEventListener('dblclick',function(){resetSelection();});
+ var start=document.getElementById('time-start'),end=document.getElementById('time-end');
+ if(start){start.min=T0;start.max=T0+TSPAN;}
+ if(end){end.min=T0;end.max=T0+TSPAN;}
+ updateSelectionChrome();}
+
+function onResize(){
+ chartCacheKey='';
+ renderChart();
+ updateSelectionChrome();}
 
 function init(){
-  initDrag();
-  flameInit();
-  renderHotspots();
-  renderChart();
-  renderMemory();
-  renderOverview();
-}
+ setScopeTids('');
+ initSelection();
+ window.addEventListener('resize',onResize);
+ renderScoped();
+ firstPaint=false;}
 """
 
 _QUAD_COLORS = {"Retiring": "var(--good)", "Backend": "var(--bad)",
@@ -624,6 +1176,10 @@ def _overview_content(m: MetricsReport, ncpu: int, scope: str = "all threads",
 <td class="mono" style="color:var(--dim)">scalar {_fmt(m.fp_scalar_pct, "%")} ·
  128b {_fmt(m.fp_128_pct, "%")} · 256b {_fmt(m.fp_256_pct, "%")} · 512b {_fmt(m.fp_512_pct, "%")}</td></tr>'''
     return f'''<div style="color:var(--dim);font-size:12px;margin-bottom:12px">Scope: {esc(scope)}</div>
+<div class="whole-run-note">Every number on this tab is whole-run: perf counts
+<span class="mono">--per-thread</span> once over the profile and cannot slice PMU
+counters, so a time selection scopes the Hotspots, Memory, Flame Graph, Call Tree
+and Threads tabs, not these counters.</div>
 {_cards(m, ncpu, prof)}
 <div class="panel"><h3>Pipeline budget (TMA-like quadrants)</h3>
 {_quad_bar(m)}
@@ -834,8 +1390,10 @@ def _threads_table(prof: StackProfile, wp: WaitProfile | None = None) -> str:
         cells = [f"<td class='mono'>{esc(comm)}</td>",
                  f"<td>{t_cpu.pid}</td>" if t_cpu else na,
                  f"<td>{tid}</td>",
-                 f"<td data-v='{cycles}' class='mono'>{_fmt_count(cycles)}</td>",
-                 f"<td data-v='{share:.3f}'>{share:.1f}%</td>"]
+                 # the two CPU columns are the only ones a time selection can
+                 # re-derive, so they carry the tid the browser folds for
+                 f"<td data-v='{cycles}' data-tid='{tid}' class='mono cpu-cycles'>{_fmt_count(cycles)}</td>",
+                 f"<td data-v='{share:.3f}' data-tid='{tid}' class='cpu-share'>{share:.1f}%</td>"]
         if t_wait is not None:
             blocked = t_wait.blocked_s + t_wait.iowait_s
             off = t_wait.sleep_s + blocked
@@ -864,7 +1422,7 @@ def _threads_table(prof: StackProfile, wp: WaitProfile | None = None) -> str:
                     (1, "Blocked/IO"), (1, "Off-CPU"), (1, "Off-CPU % of window"),
                     (1, "Preempted"), (1, "Sleeps"), (1, "Blocks")])
     group = (
-        "<tr><th colspan='5'>Profiler — CPU samples</th>"
+        "<tr><th colspan='5'>Profiler — CPU samples</th><th colspan='8'"
         f"<th colspan='8'{' class=na' if not waits else ''}>"
         f"Scheduler tracepoints — wait{' (n/a: not collected)' if not waits else ''}"
         "</th></tr>")
@@ -966,8 +1524,16 @@ def _memory_content(mem: MemoryProfile | None, backend: str | None = "ibs",
 <div class="panel"><h3>Top functions by memory-stall time</h3>{stall_table}</div>'''
 
 
-def _memory_tab(mem: MemoryProfile | None, backend: str | None = "ibs") -> str:
-    return (f'<div id="mem" class="page"><div id="memory-body">'
+def _memory_tab(mem: MemoryProfile | None, backend: str | None = "ibs",
+                sliced: bool = False) -> str:
+    # The timeline is drawn by the browser from the per-slice rows; a profile
+    # captured without them says so instead of showing an empty plot.
+    chart = ""
+    if mem is not None and mem.detail:
+        chart = ('<div class="panel"><h3>Memory accesses over time — '
+                 f'{esc(backend_label(backend))}, by source</h3>'
+                 '<div class="memchart" id="mem-chart"></div></div>')
+    return (f'<div id="mem" class="page">{chart}<div id="memory-body">'
             f'{_memory_content(mem, backend)}</div></div>')
 
 
@@ -1188,6 +1754,126 @@ def _thread_options(prof: StackProfile, mem: MemoryProfile | None = None,
     return "".join(opts)
 
 
+class _Interner:
+    """One distinct string -> one index.
+
+    The browser folds the samples again for every time selection, so the stacks
+    travel as index arrays: a profile whose stacks name the same 1300 symbols
+    over and over shrinks by an order of magnitude next to shipping the names
+    with every sample.
+    """
+
+    def __init__(self) -> None:
+        self._index: dict[str, int] = {}
+        self.values: list[str] = []
+
+    def __call__(self, value: str) -> int:
+        index = self._index.get(value)
+        if index is None:
+            index = self._index[value] = len(self.values)
+            self.values.append(value)
+        return index
+
+    def json(self) -> list[str]:
+        return self.values
+
+
+def _sample_payload(samples: list, prof: StackProfile) -> list:
+    """The sample rows the browser filters, as interned JSON.
+
+    Each row is ``[tid, time, period, stack, leaf_dso, root, user_frames]``:
+    *stack* is the sanitized full stack caller->leaf (what hotspots and
+    inclusive time need, kernel frames included), and *user_frames* the same
+    stack with the kernel and inline bookkeeping already applied (what the
+    flame graph and the call tree need), or None where the sample has nothing
+    classifiable in user space.  Both are symbol-index arrays; *root* indexes
+    the "comm (pid)" label the folded stacks hang off.
+
+    The user-space half is not re-derived in JavaScript on purpose: the kernel
+    and inline filter stays in one place, here.
+    """
+    sym = _Interner()
+    dso = _Interner()
+    root = _Interner()
+    chains = prof.user_stacks.sample_chains
+    rows = []
+    for index, s in enumerate(samples):
+        frames = s.frames[:MAX_STACK_FRAMES]
+        stack = [sym(sanitize_symbol(f[0])) for f in reversed(frames)] or [sym("[unknown]")]
+        chain = chains[index] if index < len(chains) else None
+        if chain:
+            rows.append([s.tid, round(s.time, 6), s.period, stack,
+                         dso(frames[0][1] if frames else "[unknown]"),
+                         root(chain[0]),
+                         [sym(f) for f in chain[1:]]])
+        else:
+            rows.append([s.tid, round(s.time, 6), s.period, stack,
+                         dso(frames[0][1] if frames else "[unknown]"),
+                         root(f"{s.comm} ({s.pid})"), None])
+    return [rows, sym.json(), dso.json(), root.json()]
+
+
+# The Memory tab draws these as the source mix, in this order.
+_MEM_LEVELS = ("DRAM", "L3", "L2", "L1", "other", "unclassified")
+_MEM_BANDS = tuple(name for name, _lo, _hi in LATENCY_BANDS)
+# Enough rows for any report a browser can carry; beyond it the heaviest symbols
+# of the busiest slices win and the tab says it trimmed them.
+_MEM_ROW_CAP = 250_000
+
+
+def _memory_rows_payload(mem: MemoryProfile | None, t0: float) -> dict:
+    """Time-sliced IBS/PEBS rows for the browser.
+
+    ``mem.detail`` holds one entry per (slice, thread, cache level, latency
+    band, TLB outcome, symbol, module) of the report - the granularity
+    ``_add_row`` accumulates at - so adding up the rows of a time selection
+    reproduces the server-side numbers for that window.  Slice times come from
+    ``perf mem report --sort time``; a profile captured before that (or on a
+    perf that rejected the key) has no slices, and its Memory tab stays
+    whole-run, which is what the empty payload says.
+    """
+    if mem is None or not mem.detail:
+        return {"rows": [], "sym": [], "tlb": [], "slices": [], "q": 0.0, "trunc": 0}
+
+    slices = sorted({key[0] for key in mem.detail})
+    slice_at = {moment: index for index, moment in enumerate(slices)}
+    level_at = {name: index for index, name in enumerate(_MEM_LEVELS)}
+    band_at = {name: index for index, name in enumerate(_MEM_BANDS)}
+    sym = _Interner()
+    tlb = _Interner()
+
+    # the heaviest rows first, so what a cap drops is the least stall time
+    entries = sorted(mem.detail.items(), key=lambda item: -item[1][1])
+    truncated = max(0, len(entries) - _MEM_ROW_CAP)
+    entries = entries[:_MEM_ROW_CAP]
+    rows = []
+    for (moment, tid, level, band, tlb_name, symbol, dso), (samples, weight) in entries:
+        rows.append([
+            slice_at[moment], tid if tid is not None else -1,
+            level_at.get(level, len(_MEM_LEVELS) - 1),
+            band_at.get(band, -1) if band else -1,
+            tlb(tlb_name), sym(symbol + "\t" + dso), samples, weight,
+        ])
+    rows.sort(key=lambda row: row[0])       # slice order, the browser buckets by it
+    return {
+        "rows": rows,
+        "sym": [entry.split("\t", 1) for entry in sym.json()],
+        "tlb": tlb.json(),
+        "slices": [round(moment - t0, 6) for moment in slices],
+        "q": _slice_width(slices),
+        "trunc": truncated,
+    }
+
+
+def _slice_width(slices: list[float]) -> float:
+    """The ``--time-quantum`` a capture was bucketed by, recovered from the
+    slice starts: the smallest gap between two of them.  Perf prints only the
+    slices that hold samples, so the slices are read as ``[start, start + q)``
+    and an empty slice in between is never mistaken for part of a neighbour."""
+    gaps = [round(b - a, 6) for a, b in zip(slices, slices[1:]) if b > a]
+    return min(gaps) if gaps else 0.0
+
+
 def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
                mem: MemoryProfile | None = None,
                wp: WaitProfile | None = None,
@@ -1198,80 +1884,37 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
     memory_cojoined = bool(memory_meta.get("cojoined", False))
     thread_metrics = meta.get("_thread_metrics") or {}
 
-    # ---- flame graphs -------------------------------------------------------
+    # ---- flame graph ---------------------------------------------------------
+    # Only the whole-run, all-threads graph is drawn here: it is the report's
+    # first paint and what a browser with scripting off still shows.  Every
+    # other scope, and every time selection, folds the samples again in the
+    # browser from the payload below - which is both what makes the flame graph
+    # answer a time selection and what keeps one graph per scope (and per name
+    # group) out of a report that is read one scope at a time.
     user = prof.user_stacks
-    flame_divs = []
     if user.folded:
         svg_all, _ = render_flame_svg(
             user.folded, title=f"All threads (user space) — {user.samples:,} samples")
     else:
         svg_all = '<em>No classifiable user-space samples.</em>'
-    flame_divs.append(f'<div class="flame" data-thread="all">{svg_all}</div>')
-    cpu_thread_ids: set[int] = set()
-    flame_thread_ids: set[int] = set()
-    for t in top_threads(prof, 20):
-        cpu_thread_ids.add(t.tid)
-        flame_thread_ids.add(t.tid)
-        sub = user.folded_by_tid.get(t.tid, {})
-        if sub:
-            svg, _ = render_flame_svg(sub, title=f"{t.comm} (tid {t.tid}) — user space")
-        else:
-            svg = '<em>No classifiable user-space samples for this thread.</em>'
-        flame_divs.append(
-            f'<div class="flame" data-thread="{t.tid}" style="display:none">{svg}</div>')
-    if mem is not None and memory_cojoined:
-        memory_threads = sorted(mem.by_tid.values(), key=lambda p: p.total_samples, reverse=True)
-        for profile in memory_threads:
-            if profile.tid is None or profile.tid in cpu_thread_ids:
-                continue
-            flame_thread_ids.add(profile.tid)
-            flame_divs.append(
-                f'<div class="flame" data-thread="{profile.tid}" style="display:none">'
-                '<em>No classifiable user-space samples for this thread.</em></div>')
-    for key, payload in (thread_metrics or {}).items():
-        try:
-            tid = int(payload.get("tid", key)) if isinstance(payload, dict) else int(key)
-        except (TypeError, ValueError):
-            continue
-        if tid in flame_thread_ids:
-            continue
-        flame_thread_ids.add(tid)
-        flame_divs.append(
-            f'<div class="flame" data-thread="{tid}" style="display:none">'
-            '<em>No classifiable user-space samples for this thread.</em></div>')
 
-    # ---- flame graph + scope keys per thread-name group ----------------------
+    # ---- scope keys per thread-name group -----------------------------------
     # A name only one thread answers to reuses that thread's own views; every
-    # other name gets one merged flame graph, so selecting a group in the
-    # browser always has something to show. The merged SVG costs about what its
-    # members cost separately, which is the price of a precomputed group.
+    # other name gets a key of its own, so selecting a group in the browser
+    # always has something to show.
     group_mem = mem if memory_cojoined else None
     groups: list[_ThreadGroup] = []
     for idx, (name, tids) in enumerate(
             _thread_groups(prof, group_mem, thread_metrics)):
-        if len(tids) == 1 and tids[0] in flame_thread_ids:
-            groups.append(_ThreadGroup(name, str(tids[0]), tids))
-            continue
-        merged_folded: dict[str, int] = {}
-        for tid in tids:
-            for stack, weight in user.folded_by_tid.get(tid, {}).items():
-                merged_folded[stack] = merged_folded.get(stack, 0) + weight
-        if merged_folded:
-            svg, _ = render_flame_svg(
-                merged_folded, title=f"{name} ×{len(tids)} — user space")
-        else:
-            svg = '<em>No classifiable user-space samples for this thread group.</em>'
-        flame_divs.append(
-            f'<div class="flame" data-thread="g{idx}" style="display:none">{svg}</div>')
-        groups.append(_ThreadGroup(name, f"g{idx}", tids))
+        key = str(tids[0]) if len(tids) == 1 else f"g{idx}"
+        groups.append(_ThreadGroup(name, key, tids))
 
     # ---- time range ---------------------------------------------------------
     t0, t1 = prof.time_range if prof.time_range else (0.0, 1.0)
     tspan = max(t1 - t0, 1e-9)
 
-    # ---- embed sample data as JSON ------------------------------------------
-    samples_json = json.dumps([[s.tid, s.time, s.period, s.comm,
-                                [f[0] for f in s.frames]] for s in samples]).replace("</", "<\\/")
+    # ---- embed the data the browser re-aggregates ----------------------------
+    samples_json = json.dumps(_sample_payload(samples, prof)).replace("</", "<\\/")
     freq_json = json.dumps(freq_timeline or []).replace("</", "<\\/")
     memory_json = json.dumps(_memory_html_map(
         mem, memory_backend, prof, memory_cojoined,
@@ -1279,6 +1922,22 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
     overview_json = json.dumps(_overview_html_map(
         m, ncpu, prof, thread_metrics, groups,
         meta.get("cpu_vendor"))).replace("</", "<\\/")
+
+    # ---- frequency curve origin, memory slice table, band/level names ------
+    # perf prints sample timestamps on CLOCK_MONOTONIC, the same clock the
+    # frequency sampler reads, so that origin is what lines the two curves up.
+    freq_t0 = meta.get("freq_t0")
+    freq_t0_json = "null" if freq_t0 is None else repr(float(freq_t0))
+    mem_rows = _memory_rows_payload(mem, t0)
+    mem_rows_json = json.dumps(mem_rows["rows"]).replace("</", "<\\/")
+    mem_sym_json = json.dumps(mem_rows["sym"]).replace("</", "<\\/")
+    mem_tlb_json = json.dumps(mem_rows["tlb"]).replace("</", "<\\/")
+    mem_slices_json = json.dumps(mem_rows["slices"]).replace("</", "<\\/")
+    mem_q = repr(mem_rows["q"])
+    mem_trunc = mem_rows["trunc"]
+    mem_levels_json = json.dumps(list(_MEM_LEVELS)).replace("</", "<\\/")
+    mem_bands_json = json.dumps(list(_MEM_BANDS)).replace("</", "<\\/")
+    mem_backend_json = json.dumps(backend_label(memory_backend)).replace("</", "<\\/")
 
     # ---- thread list for selector -------------------------------------------
     thread_opts = _thread_options(prof, group_mem, thread_metrics)
@@ -1290,6 +1949,8 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 
     # ---- initial hotspots table (server-rendered, replaced by JS) -----------
     initial_hotspots = _hotspots_table(prof)
+    initial_tree = (_tree_html(user.call_tree, user.total_cycles) if user.call_tree
+                    else '<em>No classifiable user-space samples.</em>')
 
     meta_line = (
         f"{esc(meta.get('mode', ''))}: {esc(' '.join(meta['target'].get('cmd') or []) or ('PID ' + str(meta['target'].get('pid'))))}"
@@ -1316,13 +1977,23 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 <button class="mode-btn active" data-mode="util" onclick="setChartMode('util')">Utilization</button>
 <button class="mode-btn" data-mode="freq" onclick="setChartMode('freq')">Frequency</button>
 </div>
+<div class="row">
+<label>Time</label>
+<input id="time-start" type="number" step="0.001" onchange="applyTimeInputs()">
+<span class="mono" style="color:var(--dim)">—</span>
+<input id="time-end" type="number" step="0.001" onchange="applyTimeInputs()">
+<span class="note">seconds of the run</span>
+<button class="mode-btn" id="time-reset" onclick="resetSelection()">Reset</button>
+<span class="note">drag on the chart to select a range, drag it to move it,
+double-click to clear — every tab below follows the selection</span>
+</div>
 <div id="chart-wrap">
 <div id="chart-svg"></div>
 <div class="drag-overlay" id="drag-overlay"></div>
 <div class="drag-handle left" id="drag-left" style="left:0"></div>
 <div class="drag-handle right" id="drag-right" style="left:100%"></div>
 </div>
-<div id="time-label"></div>
+<div id="scope-line" class="mono"></div>
 </div>
 
 <div class="tabs">
@@ -1342,13 +2013,13 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 <div class="panel"><h3>Top functions by self time</h3><div id="hotspots-body">{initial_hotspots}</div></div>
 </div>
 
-{_memory_tab(mem, memory_backend)}
+{_memory_tab(mem, memory_backend, sliced=bool(mem and mem.detail))}
 
 <div id="flame" class="page">
 <div class="panel"><div class="flame-head"><h3>Flame graph</h3>
 <span class="note">click a frame to zoom into that branch — click it again to go back up;
 rows too thin to read, and anything past {MAX_FLAME_DEPTH} rows, fold into the last row</span></div>
-<div id="flamewrap">{''.join(flame_divs)}</div>
+<div id="flamewrap"><div class="flame" data-thread="all">{svg_all}</div></div>
 <div class="flame-foot"><span class="note">the graph is as tall as its deepest visible row</span>
 <span style="flex:1"></span>
 <a href="#" class="flame-reset" onclick="resetFlameZoom(event)">Reset zoom</a></div></div>
@@ -1356,21 +2027,28 @@ rows too thin to read, and anything past {MAX_FLAME_DEPTH} rows, fold into the l
 
 <div id="tree" class="page">
 <div class="panel"><h3>Call tree (inclusive time, user space)</h3>
-{_tree_html(user.call_tree, user.total_cycles) if user.call_tree else '<em>No classifiable user-space samples.</em>'}</div>
+<div id="tree-body">{initial_tree}</div></div>
 </div>
 
 <div id="threads" class="page">
 <div class="panel"><h3>Threads — CPU samples and wait time</h3>
-<div class="note" style="margin-bottom:8px">{_wait_note(wp)}</div>
-{_threads_table(prof, wp)}</div>
+<div class="note" style="margin-bottom:8px">{_wait_note(wp)}
+<span class="whole-run-note">the wait columns are whole-run: scheduler tracepoints are not
+re-sliced per time selection.</span></div>
+<div id="threads-body">{_threads_table(prof, wp)}</div></div>
 {_wait_panels(wp)}
 </div>
 
 <footer>Generated by vperf — artifacts: {esc(meta.get('_outdir', ''))}</footer>
 <script>
-SAMPLES={samples_json};FREQ={freq_json};MEMORY_HTML={memory_json};OVERVIEW_HTML={overview_json};
+S={samples_json};FREQ={freq_json};FREQ_T0={freq_t0_json};
+MEM_BACKEND={mem_backend_json};MEM_ROWS={mem_rows_json};MEM_SYM={mem_sym_json};
+MEM_TLB={mem_tlb_json};
+MEM_SLICES={mem_slices_json};MEM_Q={mem_q};MEM_TRUNC={mem_trunc};
+MEMORY_HTML={memory_json};OVERVIEW_HTML={overview_json};
 THREAD_GROUPS={groups_json};THREAD_OPTS={thread_opts_js};GROUP_OPTS={group_opts_js};
 T0={t0};TSPAN={tspan};NCPU={ncpu};TOTAL_CYCLES={prof.total_cycles};CPU_TIME={m.cpu_time or 0};
+MAX_FLAME_DEPTH={MAX_FLAME_DEPTH};MEM_LEVELS={mem_levels_json};MEM_BANDS={mem_bands_json};
 </script>
 <script>{_JS}</script>
 <script>init();</script>

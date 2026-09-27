@@ -24,21 +24,25 @@ CPU analyses on amd64 machine (AMD and Intel), with zero Python dependencies:
   (metric overview, hotspots table, memory access summary, click-to-zoom flame
   graph, timelines, call tree, threads). The HTML thread selector scopes CPU
   views, the Overview metrics, and the IBS/PEBS Memory tab to the selected
-  thread. **Group threads by name** (checkbox next to the selector) swaps that
-  list for one entry per thread name, so a pool of workers that run the same
-  logic reads as a single scope: Hotspots, the utilization chart and the flame
-  graph merge across the group, the Overview sums the group's PMU counters
-  before deriving rates (group IPC is `Σinstructions / Σcycles`, not a mean of
-  per-thread IPCs), and the Memory tab adds up the members' IBS/PEBS samples.
+  thread, and the **movable borders on the utilization chart scope every tab
+  the profile has the samples for** — Hotspots, Flame Graph, Call Tree, Memory
+  and the per-thread cycles — to a time range (see
+  [Time selection](#time-selection)). **Group threads by name** (checkbox next
+  to the selector) swaps that list for one entry per thread name, so a pool of
+  workers that run the same logic reads as a single scope: Hotspots, the
+  utilization chart and the flame graph merge across the group, the Overview
+  sums the group's PMU counters before deriving rates (group IPC is
+  `Σinstructions / Σcycles`, not a mean of per-thread IPCs), and the Memory tab
+  adds up the members' IBS/PEBS samples.
   The Threads tab merges the per-thread CPU and wait tables: each row
   carries sampled cycles next to on/off-CPU seconds, joined on tid, and the
   wait columns read `n/a` when scheduler tracepoints were not collected.
 
 Artifacts (`stat.csv` or `stat_threads.csv`, `perf.data`, `script.txt`,
-`meta.json`) are kept in the profile directory so reports can be regenerated
-any time with `vperf report`. `meta.json` records the CPU vendor, so a profile
-collected on AMD and re-reported on Intel (or the reverse) keeps the vendor
-calibrated constants it was collected with.
+`mem_report.txt`, `meta.json`) are kept in the profile directory so reports can
+be regenerated any time with `vperf report`. `meta.json` records the CPU vendor,
+so a profile collected on AMD and re-reported on Intel (or the reverse) keeps
+the vendor calibrated constants it was collected with.
 
 ## CPU vendor support
 
@@ -53,6 +57,11 @@ calibrated constants it was collected with.
 Only `AMD_ONLY_EVENTS` are vendor-gated: on Intel and on unrecognised vendors
 they are never requested, so `perf stat` does not emit `<not counted>` noise.
 Everything else is collected and reported identically on both vendors.
+
+`vperf run` / `vperf attach` expose `--mem-time-quantum` to set the time slice
+of the HTML Memory tab (default: about 100 slices over the run, clamped to
+25 ms–1 s). Finer slices make the memory timeline finer and `mem_report.txt`
+larger; the whole-run numbers are the same either way.
 
 `vperf run` / `vperf attach` expose `--mem-period` to set the AMD IBS sampling
 period (default 100003 cycles). Memory samples scale linearly with the run
@@ -221,6 +230,7 @@ vperf run -o baseline -- ./yourapp input.bin      # save to a named directory
 vperf run -f 999 -- ./yourapp input.bin           # higher sampling frequency
 vperf run --callgraph dwarf -- ./yourapp         # higher-quality stacks when DWARF is available
 vperf run --mem-period 1000003 -- ./longjob      # thin the IBS memory samples (AMD)
+vperf run --mem-time-quantum 50 -- ./longjob    # 50ms memory timeline slices
 vperf run --no-inline -- ./hugebinary            # skip DWARF inline expansion
 vperf run --startup-grace 0.3 -- ./slowstartup  # let the thread pool come up first
 
@@ -247,7 +257,7 @@ The Flame Graph tab behaves like the SVG `flamegraph.pl` output:
 - **Click the focused frame again** to go back up one level, or click any greyed
   ancestor band to jump straight to it.
 - **Reset zoom** in the bar under the graph returns to the full graph. Switching
-  thread in the header selector also resets the zoom.
+  thread in the header selector, or moving the time selection, also resets it.
 - The graph scales to the panel width, and frames too narrow to show a label get
   one as soon as they are zoomed into.
 - The graph is exactly as tall as the rows it draws, and never shows a row of
@@ -257,6 +267,45 @@ The Flame Graph tab behaves like the SVG `flamegraph.pl` output:
   into the frame they hang off — which keeps the width they gave it and says in
   its tooltip how many rows it stands for. Zooming into a shallow branch brings
   the bottom edge up with it instead of leaving empty space above.
+
+The graph follows the thread selector *and* the time selection: the report ships
+each sample once (as indices into a symbol table) and folds it again in the
+browser, so a scoped or time-sliced flame graph costs nothing in file size — a
+ClickBench report went from 22.6 MB to 6.8 MB once the per-thread and per-group
+copies were dropped.
+
+### Time selection
+
+The utilization chart at the top of the report has two movable borders, and
+they scope every tab the profile holds the data for:
+
+- **Drag inside the plot** to select a range, **drag the selection** to move it,
+  **double-click** or press **Reset** to clear it, and type exact bounds into the
+  **Time** fields. The scope line under the chart says what is selected: the
+  thread, the range in seconds, the share of the run, and the sample count and
+  cycles behind it.
+- The curve always shows the **whole run** with the parts outside the selection
+  dimmed, so a selection keeps its context and the borders line up with the axis.
+  Both chart modes (Utilization, Frequency) share that axis and the same
+  selection, and the frequency curve is placed on the sample timeline by the
+  clock its sampler shares with perf.
+- What follows the selection: **Hotspots** (self, inclusive and estimated CPU
+  time, over the selection), the **Flame Graph**, the **Call Tree**, the
+  **Memory** tab (all five panels, plus a memory-accesses-over-time chart with
+  the selection shaded) and the per-thread **cycles** in the Threads tab.
+- What cannot: the **Overview** metrics and the Threads tab's **wait** columns.
+  `perf stat --per-thread` counts once over the whole profile (perf refuses
+  `-I` together with `--per-thread`) and the scheduler tracepoints are counted
+  the same way, so those panels say *whole run* while a selection is active
+  instead of quietly reporting the run as if it were the window.
+- While you drag, the chart and the counters follow the borders; the flame
+  graph, the call tree and the memory panels are rebuilt once the drag settles,
+  which keeps dragging smooth on a profile with 100k+ samples.
+- Memory samples are only known to the `--time-quantum` slice they fell in
+  (default: about 100 slices over the run, 25 ms–1 s, `--mem-time-quantum` to
+  override), so a window that cuts a slice in half counts half of it. A profile
+  captured before this existed — or on a perf that rejected the `time` sort key —
+  keeps its whole-run Memory tab and says so.
 
 ### Grouping threads by name
 
@@ -281,10 +330,10 @@ before is one line, not 54:
   `perf stat --per-thread` only reports the threads alive when counting
   attaches — falls back to what the sampler knows: thread count, cycle share of
   the run, and the CPU time that share works out to
-- the flame graph of a group is precomputed, so a busy profile grows: a
-  ClickBench profile of 62 sampled threads went from 29.8 MB to 39.2 MB of
-  `report.html` with six grouped flame graphs
-- the Call Tree, the Threads tab and the Frequency chart stay run-level, as they
+- the flame graph of a group costs nothing extra in the report: only the
+  whole-run graph is drawn into the file, and every other scope — one thread or
+  a whole name group — is folded again in the browser from the same samples
+- the Threads tab's wait columns and the Frequency chart stay run-level, as they
   were before grouping existed
 
 `perf mem report` labels every thread of a process with the *process* name, so a
@@ -349,14 +398,17 @@ sampler never caught fall back to the coarser memory-report name.
    replays. `perf stat`, `perf script`, and `perf mem report` dumps are then
    parsed in pure Python; memory events are kept out of CPU hotspots, full
    stacks are folded for hotspot analysis, and a user-only stack view is built
-   for the Flame Graph and Call Tree. Metrics are derived and HTML/SVG
-   rendered.
+   for the Flame Graph and Call Tree. `perf mem report` is asked for its
+   `--sort time` view, so the memory rows also carry the time slice their
+   samples fell in and the HTML Memory tab can answer a time selection. Metrics
+   are derived and HTML/SVG rendered.
 
 Notes & caveats:
 - The normal combined run uses one workload lifetime for per-thread counters,
   CPU samples, and co-joined memory samples. The HTML thread selector scopes
-  CPU views, Overview cards, and the Memory tab; the terminal report remains
-  whole-run scoped.
+  CPU views, Overview cards, and the Memory tab, and the chart's time selection
+  scopes every sample-derived view; the terminal report remains whole-run
+  scoped.
 - `perf stat --per-thread` reports independent rows for threads present when
   collection attaches, which is why the target is settled for `--startup-grace`
   seconds first (default 0.15 s). TIDs created after that are unavailable

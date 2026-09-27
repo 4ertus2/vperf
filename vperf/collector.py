@@ -92,7 +92,7 @@ class _MemoryPlan:
 
 def _memory_meta(*, enabled: bool, backend: str | None, period: int,
                  events: list[str], data_file: str | None,
-                 cojoined: bool) -> dict:
+                 cojoined: bool, time_quantum_ms: int | None = None) -> dict:
     """Metadata for the memory pass, describing the knob each backend honours.
 
     IBS is driven by a sampling *period*; PEBS is driven by a load-latency
@@ -107,6 +107,9 @@ def _memory_meta(*, enabled: bool, backend: str | None, period: int,
         "events": events,
         "data_file": data_file,
         "cojoined": cojoined,
+        # the perf mem report --time-quantum these samples were bucketed by;
+        # None when memory analysis did not run
+        "time_quantum_ms": time_quantum_ms if enabled else None,
     }
 
 
@@ -118,8 +121,30 @@ DEFAULT_STACK_DEPTH = 127      # perf's own default; kept explicit, see _callgra
 # key makes perf exit 0 with an *empty* report, so a bogus key silently costs the
 # whole memory analysis.  `pid` already means "command and tid", which is the
 # column parse_mem_report() uses for per-thread views, so no tgid sort is needed.
-_MEMORY_SORT = "pid,comm,local_weight,mem,sym,dso,tlb"
+#
+# `time` leads the sort so the report also carries the --time-quantum slice each
+# row's samples fell in, which is what lets the HTML Memory tab answer a time
+# selection.  It costs no extra perf pass and leaves the whole-run numbers
+# identical - only the report text grows (the same rows, split by slice).
+_MEMORY_SORT = "time,pid,comm,local_weight,mem,sym,dso,tlb"
+_MEMORY_SORT_NO_TIME = "pid,comm,local_weight,mem,sym,dso,tlb"
 _MEMORY_SORT_FALLBACK = "comm,pid,local_weight,mem,sym,dso,tlb"
+
+# perf buckets time-sorted samples by floor(time / quantum), so a finer quantum
+# is a finer Memory timeline and a fatter report.  Aim for ~100 slices over the
+# run, never finer than 25ms (that is 100MB of report text for a short run) and
+# never coarser than a second.  `--mem-time-quantum` overrides it.
+MEM_TIME_QUANTUM_MS = 100
+MEM_TIME_QUANTUM_MIN_MS = 25
+MEM_TIME_QUANTUM_MAX_MS = 1000
+
+
+def mem_time_quantum_ms(elapsed_s: float | None) -> int:
+    """The `--time-quantum` to ask `perf mem report` for, from the run length."""
+    if not elapsed_s or elapsed_s <= 0:
+        return MEM_TIME_QUANTUM_MS
+    target = round(elapsed_s * 1000 / 100)
+    return max(MEM_TIME_QUANTUM_MIN_MS, min(MEM_TIME_QUANTUM_MAX_MS, target))
 
 
 def _intel_memory_events(ldlat: int = doctor.INTEL_LDLAT) -> list[str]:
@@ -287,24 +312,28 @@ def _perf_error_summary(error_lines: list[str]) -> str:
 
 
 def _memory_report_args(data_path: str, report_path: str, sort_name: str,
-                        inline: bool) -> list[str]:
+                        inline: bool, time_quantum_ms: int | None = None) -> list[str]:
     args = ["mem", "report", "-i", data_path, "--stdio", "--field-separator=\t",
             "--show-total-period"]
     if sort_name:
         args += ["--sort", sort_name]
+    if time_quantum_ms:
+        args += ["--time-quantum", f"{time_quantum_ms}ms"]
     if not inline:
         args.append("--no-inline")
     return args
 
 
-def _start_memory_report(data_path: str, report_path: str, inline: bool) -> PerfProcess:
+def _start_memory_report(data_path: str, report_path: str, inline: bool,
+                         time_quantum_ms: int | None = None) -> PerfProcess:
     """Start the first `perf mem report` attempt in the background.
 
     It reads perf.data and nothing else, so it can run at the same time as
     `perf script`; the retry loop in _memory_report still owns the result.
     """
     return run_perf(
-        _memory_report_args(data_path, report_path, _MEMORY_SORT, inline),
+        _memory_report_args(data_path, report_path, _MEMORY_SORT, inline,
+                            time_quantum_ms),
         timeout=900, stdout_file=report_path, defer=True,
     )
 
@@ -312,18 +341,24 @@ def _start_memory_report(data_path: str, report_path: str, inline: bool) -> Perf
 def _memory_report(data_path: str, outdir: str, events: list[str],
                    backend: str, warnings: list[str],
                    inline: bool = True,
-                   started: PerfProcess | None = None) -> str | None:
+                   started: PerfProcess | None = None,
+                   time_quantum_ms: int | None = None) -> str | None:
     report_path = os.path.join(outdir, "mem_report.txt")
     saw_report = False
     last_error = ""
     last_report_text = None
-    for attempt, sort_name in enumerate((_MEMORY_SORT, _MEMORY_SORT_FALLBACK, "")):
+    # `time`/`--time-quantum` buy the per-slice split the HTML Memory tab reads;
+    # if this perf rejects either, the next attempts drop them and fall back to
+    # the whole-run report rather than losing memory analysis altogether.
+    attempts = ((_MEMORY_SORT, time_quantum_ms), (_MEMORY_SORT, None),
+                (_MEMORY_SORT_NO_TIME, None), (_MEMORY_SORT_FALLBACK, None), ("", None))
+    for attempt, (sort_name, quantum) in enumerate(attempts):
         try:
             if attempt == 0 and started is not None:
                 result = started.join(timeout=900)
             else:
                 result = run_perf(
-                    _memory_report_args(data_path, report_path, sort_name, inline),
+                    _memory_report_args(data_path, report_path, sort_name, inline, quantum),
                     timeout=900, stdout_file=report_path,
                 )
         except (PerfError, subprocess.TimeoutExpired) as exc:
@@ -422,6 +457,10 @@ class _FreqSampler:
         self.samples: list[tuple[float, dict[int, int]]] = []
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # absolute CLOCK_MONOTONIC reading the sample times are relative to.
+        # perf prints sample timestamps on the same clock, so this is what puts
+        # the frequency curve on the sample timeline in the HTML report.
+        self.t0: float | None = None
 
     def start(self) -> None:
         self._stop.clear()
@@ -435,7 +474,7 @@ class _FreqSampler:
         return self.samples
 
     def _run(self) -> None:
-        t0 = time.monotonic()
+        t0 = self.t0 = time.monotonic()
         while not self._stop.is_set():
             freqs = _read_freqs()
             if freqs:
@@ -651,6 +690,7 @@ def _collect_combined(
     memory_plan: _MemoryPlan | None,
     warnings: list[str],
     startup_grace: float = DEFAULT_STARTUP_GRACE,
+    mem_time_quantum: int | None = None,
 ) -> ProfileData:
     started = time.strftime("%Y-%m-%d %H:%M:%S")
     stat_path = os.path.abspath(os.path.join(outdir, "stat_threads.csv"))
@@ -782,6 +822,7 @@ def _collect_combined(
             _cleanup_run_target(target, warnings)
             raise
     elapsed = max(0.0, observation_end - session_start)
+    quantum_ms = mem_time_quantum if mem_time_quantum else mem_time_quantum_ms(elapsed)
     freq_timeline: list | None = None
     if freq_sampler is not None:
         freq_timeline = freq_sampler.stop()
@@ -848,7 +889,7 @@ def _collect_combined(
                                defer=True)
     if want_mem_report:
         mem_proc = _start_memory_report(data_path, os.path.join(outdir, "mem_report.txt"),
-                                        inline)
+                                        inline, quantum_ms)
 
     if script_proc is not None:
         try:
@@ -877,7 +918,7 @@ def _collect_combined(
         try:
             mem_report_path = _memory_report(
                 data_path, outdir, memory_events, mem_backend or "memory", warnings,
-                inline=inline, started=mem_proc,
+                inline=inline, started=mem_proc, time_quantum_ms=quantum_ms,
             )
         finally:
             if mem_proc is not None:
@@ -926,9 +967,10 @@ def _collect_combined(
             events=memory_events,
             data_file=(os.path.basename(data_path)
                        if record_ok and active_memory_plan is not None else None),
-            cojoined=memory_cojoined,
+            cojoined=memory_cojoined, time_quantum_ms=quantum_ms,
         ),
         "wait": {"enabled": wait_path is not None},
+        "freq_t0": getattr(freq_sampler, "t0", None),
         "startup_grace": startup_grace if pid is None else None,
         "perf_version": perf_version(),
         "elapsed_wall": elapsed,
@@ -959,6 +1001,7 @@ def collect(
     use_record: bool = True,
     use_memory: bool = True,
     mem_period: int = 100003,
+    mem_time_quantum: int | None = None,
     use_wait: bool = True,
     use_freq: bool = True,
     callgraph_mode: str = DEFAULT_CALLGRAPH,
@@ -990,6 +1033,7 @@ def collect(
             duration=duration,
             use_memory=use_memory,
             mem_period=mem_period,
+            mem_time_quantum=mem_time_quantum,
             use_wait=use_wait,
             use_freq=use_freq,
             callgraph_mode=callgraph_mode,
@@ -1067,6 +1111,10 @@ def collect(
     mem_backend = requested_memory_plan.backend if requested_memory_plan else None
     memory_events = requested_memory_plan.events if requested_memory_plan else []
     memory_data_path = None
+    # how long the run took decides the memory slice width; this path measured
+    # it on the stat pass above, and an attach knows the window it asked for
+    quantum_ms = mem_time_quantum if mem_time_quantum else mem_time_quantum_ms(
+        elapsed or (duration or None))
     if use_record:
         data_path = os.path.join(outdir, "perf.data")
         if memory_plan:
@@ -1121,7 +1169,8 @@ def collect(
         if memory_plan:
             memory_data_path = data_path
             mem_report_path = _memory_report(
-                data_path, outdir, memory_events, mem_backend or "memory", warnings)
+                data_path, outdir, memory_events, mem_backend or "memory", warnings,
+                time_quantum_ms=quantum_ms)
             memory_enabled = mem_report_path is not None
             memory_cojoined = memory_enabled
 
@@ -1183,7 +1232,7 @@ def collect(
         if r.ok:
             mem_report_path = _memory_report(
                 memory_data_path, outdir, memory_events, mem_backend or "memory",
-                warnings, inline=inline)
+                warnings, inline=inline, time_quantum_ms=quantum_ms)
             memory_enabled = mem_report_path is not None
         else:
             memory_error = (r.stderr or "").strip().splitlines()
@@ -1225,9 +1274,10 @@ def collect(
             enabled=memory_enabled, backend=mem_backend, period=mem_period,
             events=memory_events,
             data_file=os.path.basename(memory_data_path) if memory_data_path else None,
-            cojoined=memory_cojoined,
+            cojoined=memory_cojoined, time_quantum_ms=quantum_ms,
         ),
         "wait": {"enabled": wait_enabled},
+        "freq_t0": getattr(freq_sampler, "t0", None),
         "perf_version": perf_version(),
         "elapsed_wall": elapsed,
     }

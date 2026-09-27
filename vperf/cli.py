@@ -53,7 +53,9 @@ def _analyze(stat_data: StatData, elapsed: float | None, script_path: str | None
     # bounds the sample payload that build_html embeds in the report.
     cap_stacks(samples)
 
-    prof = build_profile(samples)
+    # the HTML report folds the samples again per time selection, so it needs
+    # each sample's user-space chain as well as its aggregate
+    prof = build_profile(samples, keep_sample_chains=True)
     cpu_ms = stat_data.summary.get("task-clock")
     scale_hotspot_times(prof, cpu_ms / 1000.0 if cpu_ms else None)
 
@@ -153,6 +155,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         callgraph_mode=args.callgraph,
         use_memory=True,
         mem_period=args.mem_period,
+        mem_time_quantum=args.mem_time_quantum,
         use_wait=not args.no_wait,
         inline=not args.no_inline,
         startup_grace=args.startup_grace,
@@ -191,6 +194,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
         callgraph_mode=args.callgraph,
         use_memory=True,
         mem_period=args.mem_period,
+        mem_time_quantum=args.mem_time_quantum,
         use_wait=not args.no_wait,
         inline=not args.no_inline,
         startup_grace=args.startup_grace,
@@ -352,6 +356,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="AMD IBS sampling period in cycles (default 100003; "
                              "raise it to thin the memory samples when profiling "
                              "long-running targets)")
+        sp.add_argument("--mem-time-quantum", type=int, default=None, metavar="MS",
+                        help="time slice of the Memory tab in the HTML report, in ms "
+                             "(default: ~100 slices over the run, 25ms-1000ms; "
+                             "finer means a finer memory timeline and a bigger "
+                             "mem_report.txt)")
         sp.add_argument("--no-inline", action="store_true",
                         help="dump stacks without DWARF inline expansion; hotspot "
                              "self time then lands on the enclosing function "
