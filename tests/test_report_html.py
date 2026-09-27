@@ -1,3 +1,4 @@
+import json
 import re
 from dataclasses import asdict
 
@@ -6,7 +7,10 @@ from vperf.memory import MemSymbol, MemoryProfile
 from vperf.metrics import LLC_SOURCE_AMD, LLC_SOURCE_GENERIC, MetricsReport, compute_metrics
 from vperf.parsers import ScriptSample, StatData
 from vperf.report_html import (
+    _CSS,
     _JS,
+    _memory_rows_payload,
+    _sample_payload,
     _group_options,
     _memory_html_map,
     _memory_tab,
@@ -19,6 +23,7 @@ from vperf.report_html import (
     build_html,
 )
 from vperf.stacks import StackProfile, ThreadInfo, build_profile
+from vperf import report_html
 from vperf.wait import ThreadWait, WaitProfile
 
 
@@ -83,16 +88,23 @@ def test_build_html_embeds_cojoined_memory_threads():
 
     assert "MEMORY_HTML=" in html
     assert "canonical (tid 42)" in html
-    assert 'data-thread="43"' in html
-    assert "No classifiable user-space samples for this thread." in html
+    # a thread the sampler never saw is still selectable, and the browser draws
+    # its flame graph from the payload: nothing is pre-rendered per scope
+    assert "No classifiable user-space samples for this thread." not in html
+    # one graph, for the whole run and every thread: the browser folds the rest
+    flame = html[html.index('id="flamewrap"'):html.index('<div id="tree"')]
+    assert re.findall(r'data-thread="([^"]+)"', flame) == ["all"]
 
 
-def test_build_html_uses_tid_scoped_flame_graphs():
+def test_build_html_carries_the_samples_the_browser_folds_per_scope():
+    """One graph is drawn server-side; every scope and every time selection is
+    folded in the browser from these rows, so the payload has to carry each
+    sample's tid, time, weight and user-space chain - not an aggregate."""
     samples = [
         ScriptSample("worker", 100, 101, 1.0, 10, "cycles:P", [("alpha", "app")]),
         ScriptSample("worker", 100, 102, 1.1, 20, "cycles:P", [("beta", "app")]),
     ]
-    prof = build_profile(samples)
+    prof = build_profile(samples, keep_sample_chains=True)
     html = build_html(
         {"target": {"cmd": ["app"]}, "mode": "run"},
         samples,
@@ -100,25 +112,16 @@ def test_build_html_uses_tid_scoped_flame_graphs():
         prof,
     )
 
-    flame_start = html.index('id="flamewrap"')
-    flame_end = html.index('<div id="tree"', flame_start)
-    flame_html = html[flame_start:flame_end]
-    markers = [match.start() for match in re.finditer(r'data-thread="[^"]+"', flame_html)]
-
-    def flame_section(tid):
-        marker = f'data-thread="{tid}"'
-        start = flame_html.index(marker)
-        end = next((position for position in markers if position > start), len(flame_html))
-        return flame_html[start:end]
-
-    alpha = flame_section(101)
-    beta = flame_section(102)
-    assert "alpha" in alpha
-    assert "beta" not in alpha
-    assert "beta" in beta
-    assert "alpha" not in beta
-    assert "10" in alpha
-    assert "20" in beta
+    rows, syms, dsos, roots = _sample_payload(samples, prof)
+    assert [row[0] for row in rows] == [101, 102]
+    assert [row[1] for row in rows] == [1.0, 1.1]
+    assert [row[2] for row in rows] == [10, 20]
+    # the user-space chain the flame graph and call tree hang off, as indices
+    assert [syms[i] for i in rows[0][6]] == ["alpha"]
+    assert [syms[i] for i in rows[1][6]] == ["beta"]
+    # the full stack keeps the kernel frames hotspots count
+    assert [syms[i] for i in rows[0][3]] == ["alpha"]
+    assert "S=" + json.dumps([rows, syms, dsos, roots]) in html
 
 
 def test_build_html_flame_and_tree_are_user_space_only():
@@ -181,12 +184,13 @@ def test_flame_graph_is_click_to_zoom_with_a_reset_link():
     assert "click a frame to zoom into that branch" in html
     assert 'class="flame-reset"' in html
     assert "resetFlameZoom(event)" in html
-    # the per-thread graphs are wired up on load
-    assert "function flameInit()" in _JS
+    # the graph is wired up on load and redrawn for each scope
+    assert "function flameInitOne(div)" in _JS
     assert "function flameRender(st,f)" in _JS
-    assert "flameInit();" in _JS
+    assert "function renderFlame()" in _JS
+    assert "flameState=flameInitOne(div);" in _JS
     # switching thread starts the new graph un-zoomed
-    assert "resetFlameZoom();" in _JS
+    assert "renderFlame();" in _JS
 
 
 def test_flame_reset_link_is_frame_chrome_at_the_bottom():
@@ -482,12 +486,12 @@ def test_build_html_embeds_group_scopes_and_the_checkbox():
     assert "function toggleGrouped()" in html
     assert "THREAD_GROUPS=" in html
     assert 'THREAD_GROUPS={"g0": [101, 102]}' in html
-    assert 'data-thread="g0"' in html
     # a group the browser can select, and the two per-thread views it replaces
-    assert "worker ×2" in html
-    assert 'data-thread="101"' in html and 'data-thread="102"' in html
+    grouped = json.loads(re.search(r'GROUP_OPTS=(".*?");\s*\n', html, re.S).group(1))
+    assert "worker ×2" in grouped
+    assert "101" in grouped and "102" in grouped
     # the group scope filters samples by tid set, not by a single tid
-    assert "scopeTids.indexOf(s[0])" in html
+    assert "scopeSet.has(r[0])" in html
     assert "threadFilter" not in html
 
 
@@ -496,7 +500,9 @@ def test_frequency_legend_sits_in_the_bottom_right_of_the_plot():
     and the space under it is the part of the plot with nothing to cover. The
     legend has to stay in that corner, hanging below the zero line into the
     band the frequency view leaves empty - and out of the top of the plot."""
-    assert "var lw=118,lh=44,lx=W-10-lw,ly=H-lh-4;" in _JS
+    assert "var lw=118,lh=44" in _JS
+    assert "lx=g.W-10-lw" in _JS
+    assert "ly=H-lh-4" in _JS
     assert "ly=pad_t+14" not in _JS
 
 
@@ -695,3 +701,145 @@ def test_threads_table_nas_a_thread_the_scheduler_never_saw():
     assert "<td></td>" not in html  # never a silently blank cell
     # the thread that does have wait data is unaffected
     assert "0.900 s" in html
+
+
+# ---------------------------------------------------------------------------
+# The time selection: what it owns, what it cannot scope, and what it carries
+# ---------------------------------------------------------------------------
+
+def _sliced_memory() -> MemoryProfile:
+    """A capture whose report was sorted by time, as the collector now asks."""
+    root = MemoryProfile()
+    for moment in (1070.0, 1070.1, 1070.2, 1070.3):
+        level = "DRAM" if moment < 1070.2 else "L1"
+        band = "201-500" if level == "DRAM" else "<=50"
+        root.total_samples += 5
+        root.classified_samples += 5
+        root.level_samples[level] = root.level_samples.get(level, 0) + 5
+        root.level_weight[level] = root.level_weight.get(level, 0) + 500
+        root.bands[band] = 5
+        root.tlb_samples["L2 miss"] = 5
+        root.by_symbol["worker"] = MemSymbol("worker", "app", 5, 500,
+                                             5 if level == "DRAM" else 0)
+        root.detail[(moment, 42, level, band, "L2 miss", "worker", "app")] = [5, 500]
+    root.by_tid[42] = MemoryProfile(tid=42, comm="worker")
+    return root
+
+
+def test_memory_rows_payload_is_sliced_against_the_sample_clock():
+    payload = _memory_rows_payload(_sliced_memory(), t0=1069.9)
+
+    # slice starts are relative to the first sample, and the quantum is
+    # recovered from them so the browser can measure a window's overlap
+    assert [round(value, 6) for value in payload["slices"]] == [0.1, 0.2, 0.3, 0.4]
+    assert payload["q"] == 0.1
+    assert [row[0] for row in payload["rows"]] == [0, 1, 2, 3]
+    assert [row[1] for row in payload["rows"]] == [42] * 4
+    assert payload["sym"] == [["worker", "app"]]
+    assert payload["tlb"] == ["L2 miss"]
+    # DRAM is level 0 and L1 is level 3, in the order the Memory tab draws
+    assert [row[2] for row in payload["rows"]] == [0, 0, 3, 3]
+    assert [row[6] for row in payload["rows"]] == [5] * 4
+
+
+def test_memory_rows_payload_is_empty_for_a_capture_without_slices():
+    """A profile collected before the report was sorted by time still reports
+    its memory access - it just cannot answer a time selection."""
+    assert _memory_rows_payload(_profile(), t0=0.0) == {
+        "rows": [], "sym": [], "tlb": [], "slices": [], "q": 0.0, "trunc": 0,
+    }
+    assert _memory_rows_payload(None, t0=0.0)["rows"] == []
+
+
+def test_memory_rows_payload_trims_the_lightest_rows_and_says_so(monkeypatch):
+    """A profile with more memory rows than a browser report should carry keeps
+    the heaviest ones, and the tab says the numbers are trimmed."""
+    mem = _sliced_memory()
+    assert _memory_rows_payload(mem, t0=0.0)["trunc"] == 0
+
+    monkeypatch.setattr(report_html, "_MEM_ROW_CAP", 2)
+    payload = _memory_rows_payload(mem, t0=0.0)
+
+    assert len(payload["rows"]) == 2
+    assert payload["trunc"] == 2
+    # the two rows it kept are the two heaviest
+    assert [row[6] for row in payload["rows"]] == [5, 5]
+    assert "MEM_TRUNC" in _JS
+
+
+def test_memory_tab_gets_a_timeline_when_the_capture_has_slices():
+    sliced = _sliced_memory()
+
+    assert "mem-chart" in _memory_tab(sliced, "ibs", sliced=True)
+    # and says nothing about a timeline it cannot draw
+    assert "mem-chart" not in _memory_tab(_profile(), "ibs")
+
+
+def test_the_selection_owns_the_borders_the_curve_and_the_tabs():
+    html = build_html({"target": {"cmd": ["app"]}, "mode": "run", "ncpus": 4},
+                      [], MetricsReport(), build_profile([]))
+    assert 'id="time-start"' in html and 'id="time-end"' in html
+    assert 'onclick="resetSelection()"' in html
+    assert "applyTimeInputs()" in html
+    # one pixel mapping, used by the curve, the shade and the borders alike:
+    # they used to each have their own, and the borders ignored the axis gutter
+    assert "function timeToX(t,g)" in _JS
+    assert "function xToTime(x,g)" in _JS
+    assert _JS.count("timeToX(") >= 4
+    # drag to brush, drag the band to move it, double-click to clear
+    assert "mode:'new'" in _JS and "mode:'pan'" in _JS
+    assert "wrap.addEventListener('dblclick'" in _JS
+    # the curve is the whole run; the selection dims what is outside it
+    assert "function shadeSvg" in _JS
+    assert "function utilBuckets" in _JS
+    assert "windowRows().length" not in _JS.split("function utilSvg")[1][:2000]
+
+
+def test_every_tab_reads_the_selection():
+    for renderer in ("renderHotspots()", "renderFlame()", "renderTree()",
+                     "renderMemory()", "renderThreads()"):
+        assert renderer in _JS
+    # and they all run from one place, after the drag settles
+    assert "function renderScoped()" in _JS
+    body = _JS.split("function renderScoped()")[1].split("function renderScopeLine()")[0]
+    for renderer in ("renderHotspots()", "renderFlame()", "renderTree()",
+                     "renderMemory()", "renderThreads()", "renderChart()"):
+        assert renderer in body
+    # the heavy tabs are not rebuilt on every mousemove
+    assert "scheduleRefresh()" in _JS
+    assert "setTimeout(function(){refreshTimer=null;renderScoped();},140)" in _JS
+
+
+def test_the_scope_line_says_what_the_views_are_scoped_to():
+    assert 'id="scope-line"' in build_html(
+        {"target": {"cmd": ["app"]}, "mode": "run"}, [], MetricsReport(),
+        build_profile([]))
+    assert "function renderScopeLine()" in _JS
+    assert "% of run" in _JS
+    assert "samples ·" in _JS
+
+
+def test_the_overview_says_it_is_whole_run_while_a_selection_is_active():
+    overview = _overview_content(MetricsReport(), 4, "all threads")
+
+    assert "whole-run" in overview
+    assert "class=\"whole-run-note\"" in overview
+    # perf counts --per-thread once over the profile, so nothing here can move
+    assert "cannot slice PMU" in overview
+    assert "body.sel-active .whole-run-note{display:inline-block" in _CSS
+    assert "function renderBadges()" in _JS
+
+
+def test_the_threads_table_marks_the_wait_columns_whole_run():
+    samples = _cpu_samples()
+    prof = build_profile(samples)
+    html = build_html({"target": {"cmd": ["app"]}, "mode": "run"}, samples,
+                      MetricsReport(elapsed=2.0), prof, wp=_wait_profile())
+
+    # the CPU columns carry the tid the browser folds for; the wait columns do
+    # not, because scheduler tracepoints are not re-sliced per selection
+    assert "class='mono cpu-cycles'" in html
+    assert "class='cpu-share'" in html
+    assert "data-tid='101'" in html
+    assert "the wait columns are whole-run" in html
+    assert "body.querySelectorAll('.cpu-cycles')" in _JS

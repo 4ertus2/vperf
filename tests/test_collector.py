@@ -83,6 +83,7 @@ worker-b-202,,,,,,,0.60,instructions  insn_per_cycle
 class _FakeSampler:
     def __init__(self, *args, **kwargs):
         self.samples = []
+        self.t0 = None
 
     def start(self):
         return None
@@ -781,6 +782,10 @@ def test_memory_sort_keys_are_accepted_by_perf_report():
     accepted = {
         "pid", "comm", "dso", "symbol", "sym", "parent", "cpu", "socket",
         "srcline", "weight", "local_weight", "cgroup_id", "addr", "mem", "tlb",
+        # `time` is a documented perf report key (`--sort=time` splits the
+        # samples by the --time-quantum slice), and `perf mem report` lists it
+        # among its own; it is what gives the HTML Memory tab a time axis.
+        "time",
     }
     keys = set()
     for spec in (collector._MEMORY_SORT, collector._MEMORY_SORT_FALLBACK):
@@ -788,6 +793,10 @@ def test_memory_sort_keys_are_accepted_by_perf_report():
     assert keys, "no sort keys configured"
     assert keys <= accepted, f"perf report would reject sort keys: {keys - accepted}"
     assert "tgid" not in keys
+    # and if a perf does not accept it, the retry chain drops it instead of
+    # losing the whole memory analysis
+    assert collector._MEMORY_SORT.startswith("time,")
+    assert "time" not in collector._MEMORY_SORT_NO_TIME
 
 
 def test_memory_report_retries_when_perf_exits_zero_with_no_output(monkeypatch, tmp_path):
@@ -836,3 +845,88 @@ def test_memory_report_names_the_cause_when_every_sort_fails(monkeypatch, tmp_pa
     assert warnings == ["PEBS memory report failed: Unknown --sort key: `bogus'"]
     assert "contained no samples" not in warnings[0], (
         "an empty report caused by a rejected argument is not 'no samples'")
+
+
+def test_mem_time_quantum_scales_with_the_run_and_is_clamped():
+    """The memory timeline wants ~100 slices over the run.  A very short run is
+    floored (finer slices mean a fatter mem_report.txt, and 25ms is already
+    100 slices of a 2.5s run) and a long one capped at a second."""
+    assert collector.mem_time_quantum_ms(2.3) == 25
+    assert collector.mem_time_quantum_ms(10.0) == 100
+    assert collector.mem_time_quantum_ms(30.0) == 300
+    assert collector.mem_time_quantum_ms(300.0) == 1000
+    # an unknown run length falls back to the default rather than dividing by 0
+    assert collector.mem_time_quantum_ms(None) == collector.MEM_TIME_QUANTUM_MS
+    assert collector.mem_time_quantum_ms(0) == collector.MEM_TIME_QUANTUM_MS
+
+
+def test_memory_report_args_carry_the_time_quantum():
+    args = collector._memory_report_args("p.data", "out.txt",
+                                         collector._MEMORY_SORT, True, 40)
+
+    assert "--time-quantum" in args
+    assert args[args.index("--time-quantum") + 1] == "40ms"
+    # and the fallback attempts can drop it
+    assert "--time-quantum" not in collector._memory_report_args(
+        "p.data", "out.txt", collector._MEMORY_SORT_NO_TIME, True, None)
+
+
+def test_memory_report_falls_back_off_time_sorting(monkeypatch, tmp_path):
+    """A perf that rejects `time` still gets its memory analysis, just without
+    the per-slice split the HTML Memory tab reads."""
+    sorts_tried = []
+
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
+        sort = args[args.index("--sort") + 1] if "--sort" in args else "<none>"
+        sorts_tried.append((sort, "--time-quantum" in args))
+        if sort.startswith("time"):
+            # rc 0, an error on stderr and an empty report
+            Path(stdout_file).write_text("", encoding="utf-8")
+            return PerfResult(0, "", "Error:\nUnknown --sort key: `time'\n")
+        Path(stdout_file).write_text(PEBS_REPORT, encoding="utf-8")
+        return PerfResult(0, "", "")
+
+    monkeypatch.setattr(collector, "run_perf", fake_run_perf)
+    warnings: list[str] = []
+
+    report = collector._memory_report(
+        str(tmp_path / "perf.data"), str(tmp_path), ["cpu/mem-loads,ldlat=30/P"],
+        "pebs", warnings, time_quantum_ms=100,
+    )
+
+    assert report is not None, warnings
+    assert not warnings, warnings
+    # the time-sorted attempts come first, with and without the quantum, and
+    # the whole-run sort is what finally answers
+    assert sorts_tried[0] == (collector._MEMORY_SORT, True)
+    assert sorts_tried[1] == (collector._MEMORY_SORT, False)
+    assert sorts_tried[2] == (collector._MEMORY_SORT_NO_TIME, False)
+
+
+def test_collect_records_the_quantum_it_used(monkeypatch, tmp_path):
+    _amd_vendor(monkeypatch)
+
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
+        if args[:1] == ["script"]:
+            Path(stdout_file).write_text("worker 42 1.0: 100 cycles:P:\n", encoding="utf-8")
+        elif args[:2] == ["mem", "report"]:
+            Path(stdout_file).write_text(MEM_REPORT, encoding="utf-8")
+        return _defer(PerfResult(0, "", ""), defer)
+
+    monkeypatch.setattr(collector, "_probe_capabilities", lambda: (["task-clock"], [], "cycles:P"))
+    monkeypatch.setattr(collector, "probe_ibs", lambda: True)
+    monkeypatch.setattr(collector, "probe_intel_mem", lambda: False)
+    monkeypatch.setattr(collector, "probe_wait", lambda: False)
+    monkeypatch.setattr(collector, "run_perf", fake_run_perf)
+    monkeypatch.setattr(collector, "perf_version", lambda: "perf test")
+    monkeypatch.setattr(collector, "_FreqSampler", _FakeSampler)
+
+    profile = collector.collect(
+        target_cmd=["true"], pid=None, outdir=str(tmp_path / "profile"),
+        freq=399, use_stat=False, use_record=True, use_memory=True,
+        use_wait=False, use_freq=False, mem_time_quantum=75,
+    )
+
+    # the knob the report reads is the one the capture was actually made with
+    assert profile.meta["memory"]["time_quantum_ms"] == 75
+    assert profile.meta["freq_t0"] is None  # no frequency sampling in this profile

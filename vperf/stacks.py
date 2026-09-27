@@ -40,6 +40,13 @@ class UserStackView:
     folded: dict[str, int] = field(default_factory=dict)
     folded_by_tid: dict[int, dict[str, int]] = field(default_factory=dict)
     call_tree: TreeNode | None = None
+    # One sanitized user-space chain per input sample, in the same order (None
+    # where the sample has no classifiable user frames), for the HTML report to
+    # fold again in the browser: the flame graph and the call tree have to
+    # answer a time selection, and re-deriving them client-side would mean
+    # shipping the raw stacks and porting the kernel/inline filter to
+    # JavaScript.  Only collected when the caller asks for them.
+    sample_chains: list[list[str] | None] = field(default_factory=list, repr=False)
 
 
 @dataclass
@@ -162,7 +169,8 @@ def _build_call_tree(chains: dict[tuple[str, ...], int]) -> TreeNode:
     return root
 
 
-def build_profile(samples: list[ScriptSample]) -> StackProfile:
+def build_profile(samples: list[ScriptSample],
+                  keep_sample_chains: bool = False) -> StackProfile:
     prof = StackProfile()
     self_by_func: dict[str, int] = defaultdict(int)
     dso_by_func: dict[str, str] = {}
@@ -229,12 +237,19 @@ def build_profile(samples: list[ScriptSample]) -> StackProfile:
                 user_callers.append(_KERNEL_BOUNDARY)
             user.total_cycles += w
             user.samples += 1
+            if keep_sample_chains:
+                # root first, matching the folded keys: [comm (pid), frame...]
+                user.sample_chains.append([key_root, *user_callers])
             user_thread_folded = user.folded_by_tid.setdefault(s.tid, {})
             user_thread_key = ";".join(user_callers)
             user_thread_folded[user_thread_key] = user_thread_folded.get(user_thread_key, 0) + w
             user_chain = (key_root, *user_callers)
             user_chains[user_chain] += w
             user.folded[";".join(user_chain)] = user.folded.get(";".join(user_chain), 0) + w
+        elif keep_sample_chains:
+            # a sample with nothing classifiable in the user view still occupies
+            # a slot, so the list stays aligned with the samples it came from
+            user.sample_chains.append(None)
 
     total = max(prof.total_cycles, 1)
 
@@ -252,6 +267,11 @@ def build_profile(samples: list[ScriptSample]) -> StackProfile:
     if renames:
         prof.folded, chains = _rename_folded_roots(prof.folded, chains, renames)
         user.folded, user_chains = _rename_folded_roots(user.folded, user_chains, renames)
+        # the per-sample chains carry the same root label, so the browser folds
+        # them under the corrected name rather than perf's transient one
+        for chain in user.sample_chains:
+            if chain:
+                chain[0] = renames.get(chain[0], chain[0])
 
     rows: dict[str, Hotspot] = {}
     for fname, sc in self_by_func.items():

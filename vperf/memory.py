@@ -70,6 +70,7 @@ _HEADER_HINTS = {
     "tgid:command": None,
     "pid:command": None,
     "command": None,
+    "time": None,
 }
 
 
@@ -116,6 +117,20 @@ def _identity_value(value: str) -> tuple[int | None, str]:
     return number, comm.strip() if separator else ""
 
 
+def _time_value(value: str) -> float | None:
+    """The `Time` column of a time-sorted report, as a slice start in seconds.
+
+    Absent on a report that was not sorted by `time`, which is how a legacy
+    capture is told apart from one that can be scoped to a time selection.
+    """
+    if not value or value in ("N/A", "-"):
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
 def _split_cells(line: str, field_separator: str | None) -> list[str]:
     separator = field_separator or ("\t" if "\t" in line else None)
     if separator and separator in line:
@@ -159,6 +174,13 @@ class MemoryProfile:
     tgid: int | None = None
     comm: str = ""
     by_tid: dict[int, "MemoryProfile"] = field(default_factory=dict, repr=False)
+    # (slice, tid, level, band, tlb, symbol, dso) -> [samples, stall cycles]:
+    # the same rows the maps above are folded from, kept per --time-quantum
+    # slice so the HTML report can re-add them for a time selection.  Only a
+    # report sorted by `time` fills this, and the slice is part of the key
+    # because a symbol's rows straddle bands and that split is not recoverable
+    # from a merged average.
+    detail: dict[tuple, list[int]] = field(default_factory=dict, repr=False)
 
     @property
     def avg_latency(self) -> float | None:
@@ -181,8 +203,13 @@ class MemoryProfile:
 
 
 def _add_row(prof: MemoryProfile, samples: int, weight: int, level: str,
-             symbol: str, dso: str, tlb: str, weight_is_average: bool = False) -> None:
+             symbol: str, dso: str, tlb: str,
+             weight_is_average: bool = False) -> tuple[str | None, int, str]:
+    """Fold one report row into a profile; returns its band, stall weight and
+    normalized TLB outcome, which the caller keeps for the per-slice detail."""
     prof.total_samples += samples
+    band: str | None = None
+    total_weight = 0
     if level != "unclassified":
         total_weight = weight * samples if weight_is_average else weight
         prof.classified_samples += samples
@@ -192,8 +219,10 @@ def _add_row(prof: MemoryProfile, samples: int, weight: int, level: str,
         avg = weight if weight_is_average else weight / samples if samples else 0
         for name, lo, hi in LATENCY_BANDS:
             if lo <= avg < hi or (hi == float("inf") and avg >= lo):
-                prof.bands[name] = prof.bands.get(name, 0) + samples
+                band = name
                 break
+        if band is not None:
+            prof.bands[band] = prof.bands.get(band, 0) + samples
 
     tl = tlb if tlb and tlb != "N/A" else "n/a"
     prof.tlb_samples[tl] = prof.tlb_samples.get(tl, 0) + samples
@@ -203,9 +232,34 @@ def _add_row(prof: MemoryProfile, samples: int, weight: int, level: str,
         ms = prof.by_symbol[symbol] = MemSymbol(symbol=symbol, dso=dso)
     ms.samples += samples
     if level != "unclassified":
-        ms.weight += weight * samples if weight_is_average else weight
+        ms.weight += total_weight
     if level == "DRAM":
         ms.dram_samples += samples
+    return band, total_weight, tl
+
+
+def _add_row_to(targets: list[MemoryProfile], samples: int, weight: int, level: str,
+                symbol: str, dso: str, tlb: str, weight_is_average: bool
+                ) -> tuple[str | None, int, str]:
+    """Fold one report row into every profile that wants it."""
+    band = total_weight = tlb_name = None
+    for target in targets:
+        band, total_weight, tlb_name = _add_row(
+            target, samples, weight, level, symbol, dso, tlb, weight_is_average)
+    return band, total_weight, tlb_name
+
+
+def _thread_view(prof: MemoryProfile, tid: int, tgid: int | None,
+                 comm: str) -> MemoryProfile:
+    thread = prof.by_tid.get(tid)
+    if thread is None:
+        thread = prof.by_tid[tid] = MemoryProfile(tid=tid, tgid=tgid, comm=comm)
+    else:
+        if thread.tgid is None and tgid is not None:
+            thread.tgid = tgid
+        if not thread.comm and comm:
+            thread.comm = comm
+    return thread
 
 
 def parse_mem_report(text: str, memory_events: set[str] | None = None,
@@ -277,18 +331,21 @@ def parse_mem_report(text: str, memory_events: set[str] | None = None,
             tid, tid_comm = _identity_value(at("Tid:Command"))
         comm = tid_comm or at("Command") or tgid_comm
 
-        _add_row(prof, samples, weight, level, symbol, dso, tlb, row_weight_is_average)
+        targets = [prof]
         if tid is not None:
-            thread = prof.by_tid.get(tid)
-            if thread is None:
-                thread = MemoryProfile(tid=tid, tgid=tgid, comm=comm)
-                prof.by_tid[tid] = thread
+            targets.append(_thread_view(prof, tid, tgid, comm))
+        band, stall_weight, tlb_name = _add_row_to(
+            targets, samples, weight, level, symbol, dso, tlb, row_weight_is_average)
+
+        slice_start = _time_value(at("Time"))
+        if slice_start is not None:
+            key = (slice_start, tid, level, band, tlb_name, symbol, dso)
+            entry = prof.detail.get(key)
+            if entry is None:
+                prof.detail[key] = [samples, stall_weight]
             else:
-                if thread.tgid is None and tgid is not None:
-                    thread.tgid = tgid
-                if not thread.comm and comm:
-                    thread.comm = comm
-            _add_row(thread, samples, weight, level, symbol, dso, tlb, row_weight_is_average)
+                entry[0] += samples
+                entry[1] += stall_weight
 
     return prof
 
