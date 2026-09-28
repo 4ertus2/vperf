@@ -344,7 +344,8 @@ function freqEnvelope(){
   if(!n) continue;
   function pct(p){var kk=p*(n-1),lo=Math.floor(kk),hi=Math.min(lo+1,n-1);
    return vals[lo]+(vals[hi]-vals[lo])*(kk-lo);}
-  out.push([FREQ_T0!==null?FREQ_T0+f[0]:f[0],vals[0]/1e3,pct(0.25)/1e3,pct(0.5)/1e3,pct(0.75)/1e3,vals[n-1]/1e3]);
+  /* sysfs reports kHz, the axis is GHz: 3767705 kHz is 3.77 GHz, not 3767 */
+  out.push([FREQ_T0!==null?FREQ_T0+f[0]:f[0],vals[0]/1e6,pct(0.25)/1e6,pct(0.5)/1e6,pct(0.75)/1e6,vals[n-1]/1e6]);
  }
  return out;}
 
@@ -353,7 +354,7 @@ function freqSvg(g,H,pad_t,ph){
  var env=freqEnvelope();
  if(!env.length) return '<svg xmlns="http://www.w3.org/2000/svg" width="'+g.W+'" height="'+H+'"></svg>';
  var span=TSPAN,lo=env[0][0],hi=env[env.length-1][0];
- if(FREQ_T0===null){span=Math.max(hi-lo,1e-9);lo=env[0][0];hi=env[env.length-1][0];}
+ if(FREQ_T0===null) span=Math.max(hi-lo,1e-9);
  var ymax=0,i,e;
  for(i=0;i<env.length;i++) if(env[i][5]>ymax) ymax=env[i][5];
  ymax*=1.05;if(ymax<=0) ymax=5;
@@ -367,21 +368,23 @@ function freqSvg(g,H,pad_t,ph){
   var y=Y(gr);
   svg+='<line x1="'+g.pad_l+'" y1="'+y.toFixed(1)+'" x2="'+(g.W-10)+'" y2="'+y.toFixed(1)
     +'" stroke="#333" stroke-width="1"/>';
-  svg+='<text x="'+(g.pad_l-6)+'" y="'+(y+4).toFixed(1)+'" text-anchor="end" fill="#999">'+gr.toFixed(1)+'</text>';
+  svg+='<text x="'+(g.pad_l-6)+'" y="'+(y+4).toFixed(1)+'" text-anchor="end" fill="#999">'+gr.toFixed(2)+'</text>';
  }
  svg+=shadeSvg(g,H,pad_t,ph);
+ /* the envelope is the min..max band, not max..zero: filling down to the floor
+    drew a min of 0 GHz the sampler never measured, right under the min curve */
  var mx='',mn='';
  for(i=0;i<env.length;i++){
   e=env[i];
   if(e[0]<T0||e[0]>T0+TSPAN) continue;
   mx+=X(e[0]).toFixed(1)+','+Y(e[5]).toFixed(1)+' ';
   mn=X(e[0]).toFixed(1)+','+Y(e[1]).toFixed(1)+' '+mn;}
- if(mx) svg+='<polygon points="'+X(Math.max(T0,lo)).toFixed(1)+','+(pad_t+ph)+' '+mx
-   +X(Math.max(T0,lo)).toFixed(1)+','+(pad_t+ph)+'" fill="rgba(64,156,255,0.20)" stroke="none"/>';
+ if(mx) svg+='<polygon points="'+mx+mn+'" fill="rgba(64,156,255,0.20)" stroke="none"/>';
  svg+=polyFreq(env,X,Y,3,'1.5','');
  svg+=polyFreq(env,X,Y,4,'1','6,3',0.6);
  svg+=polyFreq(env,X,Y,2,'1','6,3',0.6);
  svg+=polyFreq(env,X,Y,1,'1','2,3',0.4);
+ svg+=polyFreq(env,X,Y,5,'1','2,3',0.4);
  if(FREQ_T0!==null) svg+=timeLabels(g,H);
  svg+='<text x="'+(g.pad_l-44)+'" y="'+(pad_t+10)+'" fill="#bbb">GHz</text>';
  svg+=freqLegend(g,H);
