@@ -280,15 +280,30 @@ The utilization chart at the top of the report has two movable borders, and
 they scope every tab the profile holds the data for:
 
 - **Drag inside the plot** to select a range, **drag the selection** to move it,
-  **double-click** or press **Reset** to clear it, and type exact bounds into the
-  **Time** fields. The scope line under the chart says what is selected: the
-  thread, the range in seconds, the share of the run, and the sample count and
-  cycles behind it.
+  **double-click** or press **Reset Selection** to clear it. A range is picked
+  on the chart, never typed. The label beside the button and the scope line
+  under the chart say what is selected: the range in seconds into the run, the
+  share of the run, the sample count and the cycles behind it.
 - The curve always shows the **whole run** with the parts outside the selection
   dimmed, so a selection keeps its context and the borders line up with the axis.
   Both chart modes (Utilization, Frequency) share that axis and the same
   selection, and the frequency curve is placed on the sample timeline by the
-  clock its sampler shares with perf.
+  clock its sampler shares with perf. Every time the report shows is seconds
+  into the run — perf's raw `CLOCK_MONOTONIC` timestamps stay inside it.
+- The utilization y axis is **busy cores in the current scope, capped at what
+  that scope could possibly use**: every thread at the machine's logical CPU
+  count, a name group at its own thread count, and **a single thread at one
+  core**. Its average is that scope's own CPU time over the window the chart
+  shows — the per-thread `task-clock` `perf stat` already counted, summed over
+  a group. So a thread that used half a core reads as 0.5, and the plot never
+  puts a thread at 16. The *shape* between those points is an estimate: perf
+  hands a sample the cycles its core ran since that core's last sample, which
+  is whatever else ran in between, so the sampled buckets are smoothed before
+  they are scaled. Read the curve as "how busy, and where", not as a counter,
+  and remember a curve resting on the ceiling means "all of them, saturated".
+- The Memory tab's own timeline plots **accesses per time slice** by cache
+  source, on the same axis and with the same shaded selection as the chart
+  above it.
 - What follows the selection: **Hotspots** (self, inclusive and estimated CPU
   time, over the selection), the **Flame Graph**, the **Call Tree**, the
   **Memory** tab (all five panels, plus a memory-accesses-over-time chart with

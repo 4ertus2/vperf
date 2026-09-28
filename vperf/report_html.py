@@ -98,8 +98,6 @@ font-size:12px}
 #chart-wrap{position:relative;height:160px;cursor:crosshair;overflow:visible}
 #chart-wrap svg{width:100%;height:100%}
 .drag-handle{position:absolute;top:0;width:12px;height:100%;cursor:ew-resize;z-index:10}
-#chart-header input[type=number]{width:96px;background:var(--bg);color:var(--fg);
- border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:12px}
 #scope-line{color:var(--dim);font-size:11px;margin-top:6px}
 .memchart svg{width:100%;height:auto;display:block}
 /* a panel that cannot follow the time selection says so only while one is
@@ -142,6 +140,26 @@ function xToTime(x,g){g=g||plotGeom();return T0+Math.min(1,Math.max(0,(x-g.pad_l
 function selStart(){return T0+timeStart*TSPAN;}
 function selEnd(){return T0+timeEnd*TSPAN;}
 function selectionActive(){return timeStart>0.0005||timeEnd<0.9995;}
+
+/* How busy the *scope* is, and how busy it could possibly get.  Anchoring a
+   thread's curve to the whole run's average put a single thread at 16 cores -
+   it is one thread, so one core is all it can be, and its own task-clock is
+   what says how much of that core it used.  A name group sums its members and
+   is capped by the number of them, like the machine caps the whole run. */
+function scopeCpuSeconds(){
+ if(scopeTids===null) return CPU_TIME;
+ var seconds=0,counted=0;
+ for(var i=0;i<scopeTids.length;i++){
+  var v=THREAD_CPU[scopeTids[i]];
+  if(v>0){seconds+=v;counted++;}}
+ if(counted) return seconds;
+ /* no per-thread counters for this scope: its share of the sampled cycles */
+ var rows=scopeRows(),cycles=0;
+ for(i=0;i<rows.length;i++) cycles+=SAMPLES[rows[i]][2];
+ return CPU_TIME*(TOTAL_CYCLES?cycles/TOTAL_CYCLES:0);}
+function scopeCeiling(){
+ if(scopeTids===null) return NCPU;
+ return Math.max(Math.min(scopeTids.length,NCPU),0.25);}
 
 function showTab(btn,id){
  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
@@ -259,17 +277,66 @@ function renderHotspots(){
 
 /* ---- the utilization curve: always the whole run, so the selection keeps its
    context; the parts outside it are dimmed rather than dropped ---- */
-function utilBuckets(){
+/* Average busy cores per bucket, from the sampled cycles.
+ *
+ * Two things about the sample periods make the raw bucket sums unusable as a
+ * core count.  perf attributes a sample's period to whichever thread was
+ * running when the timer fired, so the periods a thread collects between two
+ * of its samples cover the *other* work that ran on its core in between, and
+ * a thread that was descheduled hands its next sample one enormous period.  On
+ * a 16-core ClickBench query that put a single 18ms bucket at 89 busy cores,
+ * and 39 of 120 buckets above the machine's core count.  Smoothing the shape
+ * and then scaling it to the average the PMU actually measured - CPU time over
+ * the window the chart shows - keeps the timeline's *level* true and lets its
+ * *shape* say where the work moved, without ever claiming more cores than the
+ * machine has.  The scaling is a bisection because the cap at the core count
+ * makes the mean a non-linear function of the scale factor. */
+var UTIL_SMOOTH=5;
+function utilCurve(){
  var g=plotGeom(),key=scopeKey+'|'+g.W+'|'+NBUCKETS;
  if(chartCacheKey===key) return chartCache;
- var buckets=new Float64Array(NBUCKETS),rows=scopeRows();
- for(var i=0;i<rows.length;i++){
-  var r=SAMPLES[rows[i]],idx=Math.min(Math.floor((r[1]-T0)/TSPAN*NBUCKETS),NBUCKETS-1);
+ var buckets=new Float64Array(NBUCKETS),rows=scopeRows(),i,k,w,sum=0;
+ for(i=0;i<rows.length;i++){
+  var r=SAMPLES[rows[i]],idx=Math.floor((r[1]-T0)/TSPAN*NBUCKETS);
   if(idx<0) idx=0;
+  if(idx>NBUCKETS-1) idx=NBUCKETS-1;
   buckets[idx]+=r[2];
  }
- chartCacheKey=key;chartCache=buckets;
- return buckets;}
+ var shape=new Float64Array(NBUCKETS),half=UTIL_SMOOTH>>1;
+ for(i=0;i<NBUCKETS;i++){
+  var lo=Math.max(0,i-half),hi=Math.min(NBUCKETS,i+half+1),n=0;
+  for(k=lo;k<hi;k++){shape[i]+=buckets[k];n++;}
+  shape[i]/=n||1;sum+=shape[i];
+ }
+ var ceiling=scopeCeiling();
+ var out={cores:new Float64Array(NBUCKETS),ymax:ceiling,unit:'cores'};
+ if(sum<=0){
+  chartCacheKey=key;chartCache=out;
+  return out;}
+ if(CPU_TIME<=0){
+  /* no task-clock to anchor the level: show where the samples were instead of
+     inventing a core count out of a cycles-per-second guess */
+  for(i=0;i<NBUCKETS;i++) out.cores[i]=shape[i]/sum;
+  out.ymax=1;out.unit='share';
+  chartCacheKey=key;chartCache=out;
+  return out;}
+ var target=scopeCpuSeconds()/TSPAN,mean=sum/NBUCKETS,lo=0,hi=target/mean;
+ /* capping at the ceiling throws area away, so the scale that lands the mean
+    on the target is *above* target/mean: grow the bracket until it is really a
+    bracket, then bisect (the mean is monotone in the scale) */
+ function meanAt(scale){
+  var t=0;
+  for(i=0;i<NBUCKETS;i++) t+=Math.min(shape[i]*scale,ceiling);
+  return t/NBUCKETS;}
+ for(var grow=0;grow<40&&meanAt(hi)<target;grow++) hi*=4;
+ for(var pass=0;pass<40;pass++){
+  var mid=(lo+hi)/2;
+  if(meanAt(mid)<target) lo=mid; else hi=mid;
+ }
+ var scale=(lo+hi)/2;
+ for(i=0;i<NBUCKETS;i++) out.cores[i]=Math.min(shape[i]*scale,ceiling);
+ chartCacheKey=key;chartCache=out;
+ return out;}
 
 function renderChart(){
  var wrap=document.getElementById('chart-wrap');
@@ -292,44 +359,66 @@ function shadeSvg(g,H,pad_t,ph){
    +'" height="'+ph+'" fill="rgba(14,17,23,0.62)"/>';
  return out;}
 
+/* perf's timestamps are a raw CLOCK_MONOTONIC reading (8514.22s on one host),
+   which is meaningless next to the report's own "Elapsed Time 1.89 s": every
+   time the report shows is seconds into the run, and T0 is only the offset
+   that maps the selection's fractions back onto perf's clock. */
+function runSeconds(t){return t-T0;}
+function relTime(t){return runSeconds(t).toFixed(2)+'s';}
 function timeLabels(g,H){
  var out='';
  for(var f=0;f<=1.0001;f+=0.25){
   var t=T0+f*TSPAN,x=timeToX(t,g);
   if(x<g.pad_l-2||x>g.W-8) continue;
   out+='<text x="'+x.toFixed(1)+'" y="'+(H-4)+'" text-anchor="middle" fill="#999">'
-      +t.toFixed(2)+'s</text>';}
+      +relTime(t)+'</text>';}
  return out;}
 
 function utilSvg(g,H,pad_t,ph){
- var buckets=utilBuckets();
- var hz=CPU_TIME>0?TOTAL_CYCLES/CPU_TIME:1;
- var dur=TSPAN/NBUCKETS;
- var maxv=0,i,v;
- for(i=0;i<NBUCKETS;i++){v=buckets[i]/(dur*hz);if(v>maxv) maxv=v;}
- var ymax=Math.max(Math.ceil(maxv),NCPU);
+ var curve=utilCurve(),ymax=curve.ymax,share=curve.unit==='share';
  function Y(v){return pad_t+ph-Math.min(v/ymax,1)*ph;}
  var svg='<svg xmlns="http://www.w3.org/2000/svg" width="'+g.W+'" height="'+H
    +'" font-family="Verdana,sans-serif" font-size="11">';
- var step=niceAxes(ymax);
- for(var gr=0;gr<=ymax+1e-9;gr+=step){
+ var step=niceAxes(ymax),i,gr;
+ for(gr=0;gr<=ymax-1e-9;gr+=step){
   var y=Y(gr);
   svg+='<line x1="'+g.pad_l+'" y1="'+y.toFixed(1)+'" x2="'+(g.W-10)+'" y2="'+y.toFixed(1)
     +'" stroke="#333" stroke-width="1"/>';
-  svg+='<text x="'+(g.pad_l-6)+'" y="'+(y+4).toFixed(1)+'" text-anchor="end" fill="#999">'+gr+'</text>';
+  svg+='<text x="'+(g.pad_l-6)+'" y="'+(y+4).toFixed(1)+'" text-anchor="end" fill="#999">'
+    +(share?Math.round(gr*100)+'%':gr)+'</text>';
+ }
+ if(!share){
+  /* the ceiling is the top of the plot, so it gets its own line and its own
+     label rather than being left above the last round step */
+  svg+='<line x1="'+g.pad_l+'" y1="'+pad_t.toFixed(1)+'" x2="'+(g.W-10)+'" y2="'+pad_t.toFixed(1)
+    +'" stroke="#4a5570" stroke-width="1" stroke-dasharray="4,3"/>';
+  svg+='<text x="'+(g.pad_l-6)+'" y="'+(pad_t+4).toFixed(1)+'" text-anchor="end" fill="#bbb">'
+    +fmtCount(ymax)+'</text>';
  }
  svg+=shadeSvg(g,H,pad_t,ph);
  var pts='';
  for(i=0;i<NBUCKETS;i++){
   var x=g.pad_l+i/Math.max(NBUCKETS-1,1)*g.pw;
-  pts+=x.toFixed(1)+','+Y(buckets[i]/(dur*hz)).toFixed(1)+' ';}
+  pts+=x.toFixed(1)+','+Y(curve.cores[i]).toFixed(1)+' ';}
  svg+='<polygon points="'+g.pad_l+','+(pad_t+ph)+' '+pts
    +timeToX(T0+TSPAN,g).toFixed(1)+','+(pad_t+ph)+'" fill="rgba(64,156,255,0.35)" '
    +'stroke="#409cff" stroke-width="1.5"/>';
+ /* what the ceiling means in the current scope: one core for a single thread,
+    the group's thread count for a name group, the machine for every thread */
+ svg+='<text x="'+(g.pad_l-34)+'" y="'+(pad_t+10)+'" fill="#bbb">'
+   +(share?'share':'cores')+'</text>';
+ svg+=ceilingNote(g);
  svg+=timeLabels(g,H);
- svg+='<text x="'+(g.pad_l-34)+'" y="'+(pad_t+10)+'" fill="#bbb">cores</text>';
  svg+='</svg>';
  return svg;}
+
+function ceilingNote(g){
+ var what;
+ if(scopeTids===null) what='of '+fmtCount(scopeCeiling())+' logical CPUs';
+ else if(scopeTids.length===1) what='one thread can use one core';
+ else what=scopeTids.length+' threads, at most '+fmtCount(scopeCeiling())+' cores';
+ return '<text x="'+(g.W-10)+'" y="'+(plotGeom().pad_t-2)+'" text-anchor="end" fill="#777" '
+   +'font-size="10">ceiling: '+escHtml(what)+'</text>';}
 
 function freqEnvelope(){
  /* the frequency sampler counts from its own origin, but it reads the same
@@ -531,7 +620,7 @@ function renderMemory(){
   ?'<div class="note" style="margin-bottom:8px">This profile carries more memory rows than a browser '
    +'report can hold: the heaviest '+MEM_ROWS.length+' rows are shown.</div>':'';
  var body0='<div style="color:var(--dim);font-size:12px;margin-bottom:12px">Scope: '
-  +escHtml(scopeLabel())+(selectionActive()?' · '+selStart().toFixed(3)+'s — '+selEnd().toFixed(3)+'s':'')
+  +escHtml(scopeLabel())+(selectionActive()?' · '+relTime(selStart())+' — '+relTime(selEnd()):'')
   +'</div>';
  body.innerHTML=truncNote
   +body0
@@ -554,39 +643,53 @@ function renderMemory(){
 function renderMemChart(){
  var host=document.getElementById('mem-chart');
  if(!host||!MEM_ROWS.length) return;
- var g=plotGeom(host,34),H=110,pad_t=6,ph=76,W=g.W;
+ /* the same left margin as the utilization chart above, so the same instant
+    lands at the same x in both timelines, and a value axis like that one: the
+    y scale is accesses per time slice, which is the quantity the stack adds */
+ var g=plotGeom(host,56),H=132,pad_t=8,pad_b=20,ph=H-pad_t-pad_b,W=g.W;
  var n=MEM_SLICES.length,levels=MEM_LEVELS.length-1;
- var series=[],li;
+ var series=[],li,i,bi;
  for(li=0;li<levels;li++) series.push(new Float64Array(n));
- for(var i=0;i<MEM_ROWS.length;i++){
+ for(i=0;i<MEM_ROWS.length;i++){
   var r=MEM_ROWS[i];
   if(r[2]>=levels) continue;
   if(scopeSet!==null&&!scopeSet.has(r[1])) continue;
   series[r[2]][r[0]]+=r[6];
  }
- var peak=0,bi;
- for(bi=0;bi<n;bi++){var sum=0;for(li=0;li<levels;li++) sum+=series[li][bi];
-  if(sum>peak) peak=sum;}
- peak=peak||1;
+ var totals=new Float64Array(n),peak=0;
+ for(bi=0;bi<n;bi++){
+  for(li=0;li<levels;li++) totals[bi]+=series[li][bi];
+  if(totals[bi]>peak) peak=totals[bi];}
+ var ymax=Math.max(peak,1);
+ function Y(v){return pad_t+ph-Math.min(v/ymax,1)*ph;}
  var svg='<svg xmlns="http://www.w3.org/2000/svg" width="'+W+'" height="'+H
   +'" font-family="Verdana,sans-serif" font-size="11">';
+ var step=niceAxes(ymax);
+ for(var gr=0;gr<=ymax-1e-9;gr+=step){
+  var y=Y(gr);
+  svg+='<line x1="'+g.pad_l+'" y1="'+y.toFixed(1)+'" x2="'+(g.W-10)+'" y2="'+y.toFixed(1)
+    +'" stroke="#333" stroke-width="1"/>';
+  svg+='<text x="'+(g.pad_l-6)+'" y="'+(y+4).toFixed(1)+'" text-anchor="end" fill="#999">'
+    +fmtCount(gr)+'</text>';
+ }
+ svg+='<text x="'+(g.pad_l-6)+'" y="'+(pad_t+4).toFixed(1)
+   +'" text-anchor="end" fill="#bbb">'+fmtCount(ymax)+'</text>';
+ svg+=shadeSvg(g,H,pad_t,ph);
  var colors=['#ff6f7d','#ffb340','#409cff','#59d499','#a1887f'];
  var acc=new Float64Array(n);
  for(li=0;li<levels;li++){
   var top='',bot='';
   for(bi=0;bi<n;bi++){
-   var x=MEM_SLICES[bi]!==undefined?timeToX(T0+MEM_SLICES[bi],g):g.pad_l;
-   var yTop=pad_t+ph-Math.min((acc[bi]+series[li][bi])/peak,1)*ph;
-   var yBot=pad_t+ph-Math.min(acc[bi]/peak,1)*ph;
-   top+=(bi?' ':'')+x.toFixed(1)+','+yTop.toFixed(1);
-   bot=(bi?' ':'')+x.toFixed(1)+','+yBot.toFixed(1)+' '+bot;
+   var x=timeToX(T0+MEM_SLICES[bi],g);
+   top+=(bi?' ':'')+x.toFixed(1)+','+Y(acc[bi]+series[li][bi]).toFixed(1);
+   bot=(bi?' ':'')+x.toFixed(1)+','+Y(acc[bi]).toFixed(1)+' '+bot;
    acc[bi]+=series[li][bi];
   }
   svg+='<polygon points="'+top+' '+bot+'" fill="'+colors[li%colors.length]
    +'" fill-opacity="0.8" stroke="none"><title>'+escHtml(MEM_LEVELS[li])+'</title></polygon>';
  }
- svg+=shadeSvg(g,H,pad_t,ph);
  svg+=timeLabels(g,H);
+ svg+='<text x="'+(g.pad_l-44)+'" y="'+(pad_t+10)+'" fill="#bbb">accesses</text>';
  var lx=g.pad_l+2,ly=H-6;
  for(li=0;li<levels;li++){
   svg+='<rect x="'+lx+'" y="'+(ly-8)+'" width="9" height="9" fill="'+colors[li%colors.length]+'"/>';
@@ -814,7 +917,7 @@ function flameSvg(fold,title,width){
 function flameTitle(samples){
  var base=scopeKey==='all'?'All threads (user space)':scopeLabel()+' — user space';
  return base+' — '+samples.toLocaleString()+' samples'
-   +(selectionActive()?' ▸ '+selStart().toFixed(3)+'s — '+selEnd().toFixed(3)+'s':'');}
+   +(selectionActive()?' ▸ '+relTime(selStart())+' — '+relTime(selEnd()):'');}
 
 function renderFlame(){
  var wrap=document.getElementById('flamewrap');
@@ -996,7 +1099,7 @@ function renderScopeLine(){
  for(var i=0;i<rows.length;i++) cycles+=SAMPLES[rows[i]][2];
  share=TOTAL_CYCLES?cycles/TOTAL_CYCLES*100:0;
  line.textContent='Scope: '+scopeLabel()
-  +(selectionActive()?' · '+selStart().toFixed(3)+'s — '+selEnd().toFixed(3)+'s ('
+  +(selectionActive()?' · '+relTime(selStart())+' — '+relTime(selEnd())+' ('
    +((timeEnd-timeStart)*100).toFixed(1)+'% of run)':' · whole run')
   +' · '+rows.length.toLocaleString()+' samples · '+fmtCount(cycles)+' cycles'
   +(selectionActive()?' ('+share.toFixed(1)+'% of the run)':'');}
@@ -1013,9 +1116,10 @@ function updateSelectionChrome(){
  right.style.left=(b-6)+'px';
  overlay.style.left=a+'px';
  overlay.style.width=Math.max(0,b-a)+'px';
- var start=document.getElementById('time-start'),end=document.getElementById('time-end');
- if(document.activeElement!==start) start.value=selStart().toFixed(3);
- if(document.activeElement!==end) end.value=selEnd().toFixed(3);
+ var label=document.getElementById('selection-label');
+ if(label) label.textContent=selectionActive()
+  ?relTime(selStart())+' — '+relTime(selEnd())
+  :'whole run';
  renderScopeLine();
  renderBadges();}
 
@@ -1025,12 +1129,6 @@ function setSelection(a,b,live){
  renderChart();                                     /* the shade follows at once */
  updateSelectionChrome();
  if(live) scheduleRefresh(); else renderScoped();}
-
-function applyTimeInputs(){
- var start=document.getElementById('time-start'),end=document.getElementById('time-end');
- var a=parseFloat(start.value),b=parseFloat(end.value);
- if(isNaN(a)||isNaN(b)){updateSelectionChrome();return;}
- setSelection((a-T0)/TSPAN,(b-T0)/TSPAN,false);}
 
 function resetSelection(){
  timeStart=0;timeEnd=1;
@@ -1078,9 +1176,6 @@ function initSelection(){
  document.addEventListener('mousemove',move);
  document.addEventListener('mouseup',up);
  wrap.addEventListener('dblclick',function(){resetSelection();});
- var start=document.getElementById('time-start'),end=document.getElementById('time-end');
- if(start){start.min=T0;start.max=T0+TSPAN;}
- if(end){end.min=T0;end.max=T0+TSPAN;}
  updateSelectionChrome();}
 
 function onResize(){
@@ -1942,6 +2037,20 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
     mem_bands_json = json.dumps(list(_MEM_BANDS)).replace("</", "<\\/")
     mem_backend_json = json.dumps(backend_label(memory_backend)).replace("</", "<\\/")
 
+    # ---- per-thread CPU time, so a scope's timeline is anchored to its own --
+    # `perf stat --per-thread` already counted task-clock for every thread, and a
+    # thread's average busy cores is its own CPU time over the window.  Scopes
+    # with no counters (a memory-only thread, a group the stat pass missed) fall
+    # back to the share of the run's sampled cycles the browser adds up.
+    thread_cpu = {
+        str(payload.get("tid", key)): payload.get("metrics", {}).get("cpu_time")
+        for key, payload in (thread_metrics or {}).items()
+        if isinstance(payload, dict)
+    }
+    thread_cpu_json = json.dumps(
+        {tid: seconds for tid, seconds in thread_cpu.items() if seconds},
+        separators=(",", ":")).replace("</", "<\\/")
+
     # ---- thread list for selector -------------------------------------------
     thread_opts = _thread_options(prof, group_mem, thread_metrics)
     group_opts = _group_options(groups, prof)
@@ -1981,14 +2090,11 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 <button class="mode-btn" data-mode="freq" onclick="setChartMode('freq')">Frequency</button>
 </div>
 <div class="row">
-<label>Time</label>
-<input id="time-start" type="number" step="0.001" onchange="applyTimeInputs()">
-<span class="mono" style="color:var(--dim)">—</span>
-<input id="time-end" type="number" step="0.001" onchange="applyTimeInputs()">
-<span class="note">seconds of the run</span>
-<button class="mode-btn" id="time-reset" onclick="resetSelection()">Reset</button>
-<span class="note">drag on the chart to select a range, drag it to move it,
-double-click to clear — every tab below follows the selection</span>
+<label>Time selection</label>
+<span id="selection-label" class="mono" style="font-size:12px;color:var(--fg)"></span>
+<button class="mode-btn" id="time-reset" onclick="resetSelection()">Reset Selection</button>
+<span class="note">drag on the chart to select a range, drag the selection to move it,
+double-click to clear — every tab below follows it</span>
 </div>
 <div id="chart-wrap">
 <div id="chart-svg"></div>
@@ -2050,6 +2156,7 @@ MEM_TLB={mem_tlb_json};
 MEM_SLICES={mem_slices_json};MEM_Q={mem_q};MEM_TRUNC={mem_trunc};
 MEMORY_HTML={memory_json};OVERVIEW_HTML={overview_json};
 THREAD_GROUPS={groups_json};THREAD_OPTS={thread_opts_js};GROUP_OPTS={group_opts_js};
+THREAD_CPU={thread_cpu_json};
 T0={t0};TSPAN={tspan};NCPU={ncpu};TOTAL_CYCLES={prof.total_cycles};CPU_TIME={m.cpu_time or 0};
 MAX_FLAME_DEPTH={MAX_FLAME_DEPTH};MEM_LEVELS={mem_levels_json};MEM_BANDS={mem_bands_json};
 </script>
