@@ -506,6 +506,32 @@ def test_frequency_legend_sits_in_the_bottom_right_of_the_plot():
     assert "ly=pad_t+14" not in _JS
 
 
+def test_frequency_axis_reads_ghz_not_mhz():
+    """The sampler stores sysfs kHz; the axis is titled GHz, so the envelope
+    has to be scaled by 1e6. Dividing by 1e3 drew 2000/4000 under a 'GHz'
+    label, and a whole number of thousands is not a frequency anyone reads."""
+    assert "vals[0]/1e6" in _JS
+    assert "pct(0.25)/1e6" in _JS and "pct(0.5)/1e6" in _JS and "pct(0.75)/1e6" in _JS
+    assert "vals[n-1]/1e6" in _JS
+    assert "/1e3" not in _JS
+    # two decimals, so the ticks are 0.00 / 2.00 / 4.00 and not 0.0 / 2000.0
+    assert "'+gr.toFixed(2)+'</text>'" in _JS
+    assert ">GHz</text>" in _JS
+
+
+def test_frequency_envelope_fills_between_the_min_and_max_curves():
+    """The band is the measured min..max envelope. Filling it down to the zero
+    line claimed a 0 GHz floor under a min curve that sits well above it, and
+    the min list the code builds for exactly that purpose went unread."""
+    assert "svg+='<polygon points=\"'+mx+mn+'\" fill=\"rgba(64,156,255,0.20)\" stroke=\"none\"/>';" in _JS
+    # the fill no longer reaches for the plot floor as a fake min
+    assert "+','+(pad_t+ph)+'\" fill=\"rgba(64,156,255,0.20)\"" not in _JS
+    # and both bounds of the band are drawn, min and max in the same style the
+    # legend's dotted "min / max" entry promises
+    assert "svg+=polyFreq(env,X,Y,1,'1','2,3',0.4);" in _JS
+    assert "svg+=polyFreq(env,X,Y,5,'1','2,3',0.4);" in _JS
+
+
 def test_memory_tab_has_dynamic_body():
     html = _memory_tab(_profile(), "ibs")
 
