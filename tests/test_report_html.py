@@ -852,11 +852,13 @@ def test_the_utilization_curve_cannot_invent_cores():
     # smoothed before anything is scaled
     assert "UTIL_SMOOTH=5" in _JS
     assert "shape[i]+=buckets[k]" in curve
-    # the level comes from the counters, not from the sample periods
-    assert "var target=CPU_TIME/TSPAN" in curve
-    # the cap is the machine's core count, and the mean is solved for exactly
-    assert "Math.min(shape[i]*scale,NCPU)" in curve
-    assert "ymax:NCPU" in curve
+    # the level comes from the counters, and from the *scope's* ones: anchoring a
+    # thread to the whole run's average plotted one thread at 16 cores busy
+    assert "var target=scopeCpuSeconds()/TSPAN" in curve
+    assert "function scopeCpuSeconds()" in _JS
+    # the cap is the scope's own ceiling, and the mean is solved for exactly
+    assert "Math.min(shape[i]*scale,ceiling)" in curve
+    assert "ymax:ceiling" in curve
     assert "meanAt(hi)<target" in curve, "the scale bracket must be grown, not assumed"
     # a run with no task-clock says "share" rather than inventing a core count
     assert "out.unit='share'" in curve
@@ -864,7 +866,7 @@ def test_the_utilization_curve_cannot_invent_cores():
     # and the ceiling gets a label of its own, above the last round step
     plot = _JS.split("function utilSvg")[1].split("\nfunction ")[0]
     assert "stroke-dasharray=\"4,3\"" in plot
-    assert "ymax+'</text>'" in plot
+    assert "fmtCount(ymax)+'</text>'" in plot
 
 
 def test_the_memory_timeline_shares_the_chart_geometry_and_scales():
@@ -926,3 +928,30 @@ def test_the_threads_table_marks_the_wait_columns_whole_run():
     assert "data-tid='101'" in html
     assert "the wait columns are whole-run" in html
     assert "body.querySelectorAll('.cpu-cycles')" in _JS
+
+
+def test_a_thread_or_group_timeline_is_capped_at_its_own_ceiling():
+    """One thread is one core, a name group is as many cores as it has threads,
+    and every thread together is as many as the machine has CPUs.  Anchoring a
+    scope's curve to the whole run's average put a single thread at 16 cores."""
+    assert "function scopeCeiling()" in _JS
+    ceiling = _JS.split("function scopeCeiling()")[1].split("\\nfunction ")[0]
+    assert "if(scopeTids===null) return NCPU;" in ceiling
+    assert "Math.min(scopeTids.length,NCPU)" in ceiling
+    # the per-thread task-clock the level is anchored to, straight from the
+    # per-thread counters the Overview already shows
+    assert "THREAD_CPU=" in build_html(
+        {"target": {"cmd": ["app"]}, "mode": "run", "ncpus": 8,
+         "_thread_metrics": {"42": {"tid": 42, "comm": "w",
+                                    "metrics": {"cpu_time": 0.5}}}},
+        [], MetricsReport(), build_profile([]))
+    assert "function scopeCpuSeconds()" in _JS
+    cpu = _JS.split("function scopeCpuSeconds()")[1].split("\\nfunction ")[0]
+    assert "if(scopeTids===null) return CPU_TIME;" in cpu
+    assert "THREAD_CPU[scopeTids[i]]" in cpu
+    # a scope the stat pass missed falls back to its share of the sampled cycles
+    assert "return CPU_TIME*(TOTAL_CYCLES?cycles/TOTAL_CYCLES:0);" in cpu
+    # and the plot says which ceiling it drew
+    assert "function ceilingNote(g)" in _JS
+    assert "one thread can use one core" in _JS
+    assert "of '+fmtCount(scopeCeiling())+' logical CPUs" in _JS

@@ -141,6 +141,26 @@ function selStart(){return T0+timeStart*TSPAN;}
 function selEnd(){return T0+timeEnd*TSPAN;}
 function selectionActive(){return timeStart>0.0005||timeEnd<0.9995;}
 
+/* How busy the *scope* is, and how busy it could possibly get.  Anchoring a
+   thread's curve to the whole run's average put a single thread at 16 cores -
+   it is one thread, so one core is all it can be, and its own task-clock is
+   what says how much of that core it used.  A name group sums its members and
+   is capped by the number of them, like the machine caps the whole run. */
+function scopeCpuSeconds(){
+ if(scopeTids===null) return CPU_TIME;
+ var seconds=0,counted=0;
+ for(var i=0;i<scopeTids.length;i++){
+  var v=THREAD_CPU[scopeTids[i]];
+  if(v>0){seconds+=v;counted++;}}
+ if(counted) return seconds;
+ /* no per-thread counters for this scope: its share of the sampled cycles */
+ var rows=scopeRows(),cycles=0;
+ for(i=0;i<rows.length;i++) cycles+=SAMPLES[rows[i]][2];
+ return CPU_TIME*(TOTAL_CYCLES?cycles/TOTAL_CYCLES:0);}
+function scopeCeiling(){
+ if(scopeTids===null) return NCPU;
+ return Math.max(Math.min(scopeTids.length,NCPU),0.25);}
+
 function showTab(btn,id){
  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
@@ -288,7 +308,8 @@ function utilCurve(){
   for(k=lo;k<hi;k++){shape[i]+=buckets[k];n++;}
   shape[i]/=n||1;sum+=shape[i];
  }
- var out={cores:new Float64Array(NBUCKETS),ymax:NCPU,unit:'cores'};
+ var ceiling=scopeCeiling();
+ var out={cores:new Float64Array(NBUCKETS),ymax:ceiling,unit:'cores'};
  if(sum<=0){
   chartCacheKey=key;chartCache=out;
   return out;}
@@ -299,13 +320,13 @@ function utilCurve(){
   out.ymax=1;out.unit='share';
   chartCacheKey=key;chartCache=out;
   return out;}
- var target=CPU_TIME/TSPAN,mean=sum/NBUCKETS,lo=0,hi=target/mean;
- /* capping at the core count throws area away, so the scale that lands the
-    mean on the target is *above* target/mean: grow the bracket until it is
-    really a bracket, then bisect (the mean is monotone in the scale) */
+ var target=scopeCpuSeconds()/TSPAN,mean=sum/NBUCKETS,lo=0,hi=target/mean;
+ /* capping at the ceiling throws area away, so the scale that lands the mean
+    on the target is *above* target/mean: grow the bracket until it is really a
+    bracket, then bisect (the mean is monotone in the scale) */
  function meanAt(scale){
   var t=0;
-  for(i=0;i<NBUCKETS;i++) t+=Math.min(shape[i]*scale,NCPU);
+  for(i=0;i<NBUCKETS;i++) t+=Math.min(shape[i]*scale,ceiling);
   return t/NBUCKETS;}
  for(var grow=0;grow<40&&meanAt(hi)<target;grow++) hi*=4;
  for(var pass=0;pass<40;pass++){
@@ -313,7 +334,7 @@ function utilCurve(){
   if(meanAt(mid)<target) lo=mid; else hi=mid;
  }
  var scale=(lo+hi)/2;
- for(i=0;i<NBUCKETS;i++) out.cores[i]=Math.min(shape[i]*scale,NCPU);
+ for(i=0;i<NBUCKETS;i++) out.cores[i]=Math.min(shape[i]*scale,ceiling);
  chartCacheKey=key;chartCache=out;
  return out;}
 
@@ -367,12 +388,12 @@ function utilSvg(g,H,pad_t,ph){
     +(share?Math.round(gr*100)+'%':gr)+'</text>';
  }
  if(!share){
-  /* the core count is the ceiling of the plot, so it gets its own line and its
-     own label rather than being left above the last round step */
+  /* the ceiling is the top of the plot, so it gets its own line and its own
+     label rather than being left above the last round step */
   svg+='<line x1="'+g.pad_l+'" y1="'+pad_t.toFixed(1)+'" x2="'+(g.W-10)+'" y2="'+pad_t.toFixed(1)
     +'" stroke="#4a5570" stroke-width="1" stroke-dasharray="4,3"/>';
   svg+='<text x="'+(g.pad_l-6)+'" y="'+(pad_t+4).toFixed(1)+'" text-anchor="end" fill="#bbb">'
-    +ymax+'</text>';
+    +fmtCount(ymax)+'</text>';
  }
  svg+=shadeSvg(g,H,pad_t,ph);
  var pts='';
@@ -382,11 +403,22 @@ function utilSvg(g,H,pad_t,ph){
  svg+='<polygon points="'+g.pad_l+','+(pad_t+ph)+' '+pts
    +timeToX(T0+TSPAN,g).toFixed(1)+','+(pad_t+ph)+'" fill="rgba(64,156,255,0.35)" '
    +'stroke="#409cff" stroke-width="1.5"/>';
- svg+=timeLabels(g,H);
+ /* what the ceiling means in the current scope: one core for a single thread,
+    the group's thread count for a name group, the machine for every thread */
  svg+='<text x="'+(g.pad_l-34)+'" y="'+(pad_t+10)+'" fill="#bbb">'
    +(share?'share':'cores')+'</text>';
+ svg+=ceilingNote(g);
+ svg+=timeLabels(g,H);
  svg+='</svg>';
  return svg;}
+
+function ceilingNote(g){
+ var what;
+ if(scopeTids===null) what='of '+fmtCount(scopeCeiling())+' logical CPUs';
+ else if(scopeTids.length===1) what='one thread can use one core';
+ else what=scopeTids.length+' threads, at most '+fmtCount(scopeCeiling())+' cores';
+ return '<text x="'+(g.W-10)+'" y="'+(plotGeom().pad_t-2)+'" text-anchor="end" fill="#777" '
+   +'font-size="10">ceiling: '+escHtml(what)+'</text>';}
 
 function freqEnvelope(){
  /* the frequency sampler counts from its own origin, but it reads the same
@@ -2005,6 +2037,20 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
     mem_bands_json = json.dumps(list(_MEM_BANDS)).replace("</", "<\\/")
     mem_backend_json = json.dumps(backend_label(memory_backend)).replace("</", "<\\/")
 
+    # ---- per-thread CPU time, so a scope's timeline is anchored to its own --
+    # `perf stat --per-thread` already counted task-clock for every thread, and a
+    # thread's average busy cores is its own CPU time over the window.  Scopes
+    # with no counters (a memory-only thread, a group the stat pass missed) fall
+    # back to the share of the run's sampled cycles the browser adds up.
+    thread_cpu = {
+        str(payload.get("tid", key)): payload.get("metrics", {}).get("cpu_time")
+        for key, payload in (thread_metrics or {}).items()
+        if isinstance(payload, dict)
+    }
+    thread_cpu_json = json.dumps(
+        {tid: seconds for tid, seconds in thread_cpu.items() if seconds},
+        separators=(",", ":")).replace("</", "<\\/")
+
     # ---- thread list for selector -------------------------------------------
     thread_opts = _thread_options(prof, group_mem, thread_metrics)
     group_opts = _group_options(groups, prof)
@@ -2110,6 +2156,7 @@ MEM_TLB={mem_tlb_json};
 MEM_SLICES={mem_slices_json};MEM_Q={mem_q};MEM_TRUNC={mem_trunc};
 MEMORY_HTML={memory_json};OVERVIEW_HTML={overview_json};
 THREAD_GROUPS={groups_json};THREAD_OPTS={thread_opts_js};GROUP_OPTS={group_opts_js};
+THREAD_CPU={thread_cpu_json};
 T0={t0};TSPAN={tspan};NCPU={ncpu};TOTAL_CYCLES={prof.total_cycles};CPU_TIME={m.cpu_time or 0};
 MAX_FLAME_DEPTH={MAX_FLAME_DEPTH};MEM_LEVELS={mem_levels_json};MEM_BANDS={mem_bands_json};
 </script>

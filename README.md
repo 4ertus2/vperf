@@ -290,13 +290,17 @@ they scope every tab the profile holds the data for:
   selection, and the frequency curve is placed on the sample timeline by the
   clock its sampler shares with perf. Every time the report shows is seconds
   into the run — perf's raw `CLOCK_MONOTONIC` timestamps stay inside it.
-- The utilization y axis is **busy cores, capped at the machine's core count**,
-  and its average is the CPU time the PMU measured over the window it shows
-  (the same number the Overview's effective utilization comes from, per second
-  rather than per core). The *shape* is an estimate: perf hands a sample the
-  cycles its core ran since that core's last sample, which is whatever else ran
-  in between, so the sampled buckets are smoothed before they are scaled. Read
-  the curve as "how busy, and where", not as a counter.
+- The utilization y axis is **busy cores in the current scope, capped at what
+  that scope could possibly use**: every thread at the machine's logical CPU
+  count, a name group at its own thread count, and **a single thread at one
+  core**. Its average is that scope's own CPU time over the window the chart
+  shows — the per-thread `task-clock` `perf stat` already counted, summed over
+  a group. So a thread that used half a core reads as 0.5, and the plot never
+  puts a thread at 16. The *shape* between those points is an estimate: perf
+  hands a sample the cycles its core ran since that core's last sample, which
+  is whatever else ran in between, so the sampled buckets are smoothed before
+  they are scaled. Read the curve as "how busy, and where", not as a counter,
+  and remember a curve resting on the ceiling means "all of them, saturated".
 - The Memory tab's own timeline plots **accesses per time slice** by cache
   source, on the same axis and with the same shaded selection as the chart
   above it.
