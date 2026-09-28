@@ -804,9 +804,11 @@ def test_memory_tab_gets_a_timeline_when_the_capture_has_slices():
 def test_the_selection_owns_the_borders_the_curve_and_the_tabs():
     html = build_html({"target": {"cmd": ["app"]}, "mode": "run", "ncpus": 4},
                       [], MetricsReport(), build_profile([]))
-    assert 'id="time-start"' in html and 'id="time-end"' in html
-    assert 'onclick="resetSelection()"' in html
-    assert "applyTimeInputs()" in html
+    # a range is picked on the chart, never typed: brush, pan, reset
+    assert 'id="selection-label"' in html
+    assert ">Reset Selection</button>" in html
+    assert 'id="time-start"' not in html and 'id="time-end"' not in html
+    assert "applyTimeInputs" not in _JS
     # one pixel mapping, used by the curve, the shade and the borders alike:
     # they used to each have their own, and the borders ignored the axis gutter
     assert "function timeToX(t,g)" in _JS
@@ -817,8 +819,63 @@ def test_the_selection_owns_the_borders_the_curve_and_the_tabs():
     assert "wrap.addEventListener('dblclick'" in _JS
     # the curve is the whole run; the selection dims what is outside it
     assert "function shadeSvg" in _JS
-    assert "function utilBuckets" in _JS
+    assert "function utilCurve" in _JS
     assert "windowRows().length" not in _JS.split("function utilSvg")[1][:2000]
+
+
+def test_the_timeline_is_seconds_into_the_run():
+    """perf's sample timestamps are a raw CLOCK_MONOTONIC reading - 8514.22s
+    on one host - which reads as a broken axis next to the report's own
+    "Elapsed Time 1.89 s".  The offset stays inside the report; everything the
+    reader sees is seconds from the first sample."""
+    assert "function relTime(t)" in _JS
+    assert "return runSeconds(t).toFixed(2)+'s';" in _JS
+    assert "function runSeconds(t){return t-T0;}" in _JS
+    # no time label prints a raw timestamp
+    for site in ("timeLabels", "renderScopeLine", "flameTitle"):
+        body = _JS.split("function " + site)[1].split("\nfunction ")[0]
+        assert "selStart().toFixed" not in body, site
+        assert "selEnd().toFixed" not in body, site
+    labels = _JS.split("function timeLabels")[1].split("\nfunction ")[0]
+    assert "relTime(t)" in labels
+    assert "+t.toFixed(2)" not in labels
+
+
+def test_the_utilization_curve_cannot_invent_cores():
+    """The sampled periods are not a core count.  perf gives a sample the cycles
+    its core ran since that core's last sample - which is whatever *else* ran
+    in between - and a descheduled thread hands its next sample one enormous
+    period, so raw bucket sums put a 18ms bucket of a 16-core query at 89 busy
+    cores.  The curve is smoothed, scaled to the average the PMU measured, and
+    capped at the core count."""
+    curve = _JS.split("function utilCurve")[1].split("\nfunction ")[0]
+    # smoothed before anything is scaled
+    assert "UTIL_SMOOTH=5" in _JS
+    assert "shape[i]+=buckets[k]" in curve
+    # the level comes from the counters, not from the sample periods
+    assert "var target=CPU_TIME/TSPAN" in curve
+    # the cap is the machine's core count, and the mean is solved for exactly
+    assert "Math.min(shape[i]*scale,NCPU)" in curve
+    assert "ymax:NCPU" in curve
+    assert "meanAt(hi)<target" in curve, "the scale bracket must be grown, not assumed"
+    # a run with no task-clock says "share" rather than inventing a core count
+    assert "out.unit='share'" in curve
+    assert "out.ymax=1" in curve
+    # and the ceiling gets a label of its own, above the last round step
+    plot = _JS.split("function utilSvg")[1].split("\nfunction ")[0]
+    assert "stroke-dasharray=\"4,3\"" in plot
+    assert "ymax+'</text>'" in plot
+
+
+def test_the_memory_timeline_shares_the_chart_geometry_and_scales():
+    chart = _JS.split("function renderMemChart")[1].split("\n/* ---- Call Tree")[0]
+    # same left margin as the utilization chart, so the same instant is the
+    # same x in both timelines
+    assert "plotGeom(host,56)" in chart
+    # and a value axis: accesses per time slice, the quantity it stacks
+    assert "var totals=new Float64Array(n),peak=0;" in chart
+    assert "fmtCount(ymax)" in chart
+    assert "step=niceAxes(ymax)" in chart
 
 
 def test_every_tab_reads_the_selection():
