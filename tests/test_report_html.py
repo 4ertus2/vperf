@@ -827,11 +827,15 @@ def test_wait_tab_is_folded_into_the_threads_tab():
     assert "showTab(this,'threads')" in html
     assert "showTab(this,'wait')" not in html
     assert 'id="wait"' not in html
-    # the run-level wait content moved into the same page, under the table
+    # the run-level wait content moved into the same page, and it leads it: the
+    # graphics come first here as they do in every other tab, and the per-thread
+    # table, with the note explaining its own wait columns, is last
     assert "Where the time went" in page
     assert "Sleep/block delay distribution" in page
-    assert page.index("On-CPU / off-CPU come from scheduler tracepoints") \
-        < page.index("Where the time went")
+    table_at = page.index("Threads — CPU samples and wait time")
+    assert page.index("Where the time went") < table_at
+    assert page.index("Sleep/block delay distribution") < table_at
+    assert page.index("On-CPU / off-CPU come from scheduler tracepoints") > table_at
 
 
 def test_threads_page_explains_missing_wait_data():
