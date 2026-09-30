@@ -305,9 +305,12 @@ they scope every tab the profile holds the data for:
   is whatever else ran in between, so the sampled buckets are smoothed before
   they are scaled. Read the curve as "how busy, and where", not as a counter,
   and remember a curve resting on the ceiling means "all of them, saturated".
-- The Memory tab's own timeline plots **accesses per time slice** by cache
-  source, on the same axis and with the same shaded selection as the chart
-  above it.
+- The Memory tab's own timeline plots, by cache source on the same axis and with
+  the same shaded selection as the chart above it, either **accesses per time
+  slice** or the **stall cycles they cost** — the selector in the panel's top
+  right corner switches between the two, and both follow the thread scope.
+  Latency there is a sum of each source's access latency, not an average: the
+  same weight the tab's "Average Access Latency" divides by the access count.
 - What follows the selection: **Hotspots** (self, inclusive and estimated CPU
   time, over the selection), the **Flame Graph**, the **Call Tree**, the
   **Memory** tab (all five panels, plus a memory-accesses-over-time chart with
@@ -342,8 +345,8 @@ size — `/proc/<pid>/task/<tid>/statm` and the per-thread `RssAnon`/`RssFile` i
 `.../status` both report the process total, which is why there is no per-thread
 footprint to plot anywhere in procfs (measured on a 4-thread process with 300 MiB
 allocated on one thread: 312.4 MiB reported by all four). For per-thread memory
-*behaviour* use the Memory tab, which follows the selector: its timeline is
-accesses per time slice for the selected thread or group.
+*behaviour* use the Memory tab, which follows the selector: its timeline counts
+the selected thread's or group's accesses and stall cycles per time slice.
 
 `--no-rss` skips the sampling, and then the report has no memory curve and no
 peak row. A profile collected before this existed has neither and says so in
