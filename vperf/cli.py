@@ -90,7 +90,8 @@ def _finish(outdir: str, meta: dict, warnings: list[str], stat_data: StatData,
             mem_report_path: str | None = None,
             wait_path: str | None = None,
             freq_timeline: list | None = None,
-            thread_stats=None) -> None:
+            thread_stats=None,
+            rss_timeline: list | None = None) -> None:
     memory_events = set(meta.get("memory", {}).get("events", []))
     samples, prof, m = _analyze(
         stat_data, elapsed, script_path,
@@ -111,7 +112,8 @@ def _finish(outdir: str, meta: dict, warnings: list[str], stat_data: StatData,
     meta["_outdir"] = os.path.abspath(outdir)
     meta["_thread_metrics"] = _thread_metrics_payload(thread_stats, meta, elapsed)
     with open(report_path, "w", encoding="utf-8") as f:
-        f.write(build_html(meta, samples, m, prof, mem, wp, freq_timeline=freq_timeline))
+        f.write(build_html(meta, samples, m, prof, mem, wp,
+                           freq_timeline=freq_timeline, rss_timeline=rss_timeline))
     print(f"HTML report: {report_path}")
 
 
@@ -157,11 +159,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         mem_period=args.mem_period,
         mem_time_quantum=args.mem_time_quantum,
         use_wait=not args.no_wait,
+        use_rss=not args.no_rss,
         inline=not args.no_inline,
         startup_grace=args.startup_grace,
     )
     _finish(outdir, pd.meta, pd.warnings, pd.stat, pd.elapsed, pd.script_path,
-            pd.mem_report_path, pd.wait_path, pd.freq_timeline, pd.thread_stats)
+            pd.mem_report_path, pd.wait_path, pd.freq_timeline, pd.thread_stats,
+            pd.rss_timeline)
     exit_code = pd.meta.get("target", {}).get("exit_code")
     return exit_code if isinstance(exit_code, int) and exit_code >= 0 else (
         128 + abs(exit_code) if isinstance(exit_code, int) else 0
@@ -196,12 +200,13 @@ def cmd_attach(args: argparse.Namespace) -> int:
         mem_period=args.mem_period,
         mem_time_quantum=args.mem_time_quantum,
         use_wait=not args.no_wait,
+        use_rss=not args.no_rss,
         inline=not args.no_inline,
         startup_grace=args.startup_grace,
     )
     _finish(outdir, pd.meta, pd.warnings, pd.stat, pd.elapsed or args.duration,
             pd.script_path, pd.mem_report_path, pd.wait_path, pd.freq_timeline,
-            pd.thread_stats)
+            pd.thread_stats, pd.rss_timeline)
     return 0
 
 
@@ -213,6 +218,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     wait_path = loaded[4] if len(loaded) > 4 else None
     freq_timeline = loaded[5] if len(loaded) > 5 else None
     thread_stats = loaded[6] if len(loaded) > 6 else None
+    rss_timeline = loaded[7] if len(loaded) > 7 else None
     memory_events = set(meta.get("memory", {}).get("events", []))
     samples, prof, m = _analyze(
         stat_data, meta.get("elapsed_wall"), script_path,
@@ -228,7 +234,8 @@ def cmd_report(args: argparse.Namespace) -> int:
     print(render_terminal(meta, m, prof, mem, wp))
     report_path = os.path.join(args.dir, "report.html")
     with open(report_path, "w", encoding="utf-8") as f:
-        f.write(build_html(meta, samples, m, prof, mem, wp, freq_timeline=freq_timeline))
+        f.write(build_html(meta, samples, m, prof, mem, wp,
+                           freq_timeline=freq_timeline, rss_timeline=rss_timeline))
     print(f"HTML report: {report_path}")
     return 0
 
@@ -352,6 +359,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="call graph unwinding method (default: fp; dwarf for higher-quality stacks)")
         sp.add_argument("--no-wait", action="store_true",
                         help="skip the wait/off-CPU pass (scheduler tracepoints)")
+        sp.add_argument("--no-rss", action="store_true",
+                        help="skip sampling the target's resident memory, so the "
+                             "report has no memory-usage curve and no peak RSS")
         sp.add_argument("--mem-period", type=int, default=100003,
                         help="AMD IBS sampling period in cycles (default 100003; "
                              "raise it to thin the memory samples when profiling "

@@ -28,6 +28,16 @@ def _fmt_count(v: float | None) -> str:
     return f"{v:,.0f}"
 
 
+def _fmt_bytes(v: float | None) -> str:
+    """Memory as a size, not a count: the unit has to say which one it is."""
+    if v is None:
+        return "n/a"
+    for div, suf in ((1 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")):
+        if abs(v) >= div:
+            return f"{v/div:,.2f} {suf}"
+    return f"{v:,.0f} B"
+
+
 def _table(rows: list[list[str]], headers: list[str]) -> str:
     widths = [len(h) for h in headers]
     ncols = len(widths)
@@ -138,6 +148,9 @@ def render_terminal(meta: dict, m: MetricsReport, prof: StackProfile | None,
         ["Samples Collected", _fmt_count(prof.samples) if prof else "n/a"],
         ["Sampled Cycles", _fmt_count(prof.total_cycles) if prof else "n/a"],
     ]
+    # only a profile that sampled memory has a footprint to quote
+    if meta.get("rss_peak"):
+        rows.append(["Peak RSS", _fmt_bytes(meta["rss_peak"])])
     out.append(_table(rows, ["Metric", "Value"]))
 
     hw_rows = [

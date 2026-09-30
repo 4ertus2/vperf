@@ -344,7 +344,8 @@ function renderChart(){
  if(!wrap||!host) return;
  var g=plotGeom(),H=160,pad_l=g.pad_l,pad_b=g.pad_b,pad_t=g.pad_t,pw=g.pw,ph=g.ph,W=g.W;
  host.innerHTML=chartMode==='freq'?freqSvg(g,H,pad_t,ph)
-                           :utilSvg(g,H,pad_t,ph);
+                :chartMode==='mem'?rssSvg(g,H,pad_t,ph)
+                :utilSvg(g,H,pad_t,ph);
  updateSelectionChrome();}
 
 function shadeSvg(g,H,pad_t,ph){
@@ -419,6 +420,90 @@ function ceilingNote(g){
  else what=scopeTids.length+' threads, at most '+fmtCount(scopeCeiling())+' cores';
  return '<text x="'+(g.W-10)+'" y="'+(plotGeom().pad_t-2)+'" text-anchor="end" fill="#777" '
    +'font-size="10">ceiling: '+escHtml(what)+'</text>';}
+
+/* ---- the target's resident memory over time ----
+ * One process, one curve.  RSS comes from /proc/<pid>/statm - the same number
+ * `top` prints - and a process is a single address space, so every thread of it
+ * reads the same value: there is no per-thread footprint to plot anywhere, and
+ * the curve therefore does not follow the thread selector.
+ *
+ * No scaling is needed here, unlike the utilization curve: this is a measured
+ * value, not a count inferred from sample periods.  What bucketing can lose is
+ * a spike shorter than a bucket, which is why the peak the sampler recorded is
+ * drawn as its own line instead of being read off the area. */
+function rssBuckets(){
+ var key='rss|'+RSS_T0+'|'+NBUCKETS;
+ if(chartCacheKey===key) return chartCache;
+ var sums=new Float64Array(NBUCKETS),counts=new Float64Array(NBUCKETS),i;
+ for(i=0;i<RSS.length;i++){
+  var r=RSS[i],t=RSS_T0!==null?RSS_T0+r[0]:r[0];
+  var idx=Math.floor((t-T0)/TSPAN*NBUCKETS);
+  if(idx<0||idx>NBUCKETS-1) continue;
+  sums[idx]+=r[1];counts[idx]++;}
+ /* the sampler runs at a fixed cadence, so a bucket with no sample is the edge
+    of the window rather than a reading: hold the value across it, ahead of the
+    first sample and behind the last, and never let a gap read as zero bytes */
+ var first=NaN,last=NaN;
+ for(i=0;i<NBUCKETS;i++) if(counts[i]){first=sums[i]/counts[i];break;}
+ last=first;
+ var out=new Float64Array(NBUCKETS);
+ for(i=0;i<NBUCKETS;i++){
+  if(counts[i]) last=sums[i]/counts[i];
+  out[i]=isNaN(last)?(isNaN(first)?0:first):last;}
+ chartCacheKey=key;chartCache=out;
+ return out;}
+
+function rssUnit(bytes){
+ var units=[[1073741824,'GiB'],[1048576,'MiB'],[1024,'KiB']];
+ for(var i=0;i<units.length;i++) if(bytes>=units[i][0]) return units[i];
+ return [1,'B'];}
+
+function rssEmpty(g,H,msg){
+ return '<svg xmlns="http://www.w3.org/2000/svg" width="'+g.W+'" height="'+H
+  +'" font-family="Verdana,sans-serif" font-size="11">'
+  +'<text x="'+(g.W/2).toFixed(0)+'" y="'+(g.pad_t+g.ph/2).toFixed(0)
+  +'" text-anchor="middle" fill="#777">'+escHtml(msg)+'</text></svg>';}
+
+function rssSvg(g,H,pad_t,ph){
+ if(!RSS.length) return rssEmpty(g,H,
+  'Memory over time was not collected in this profile (--no-rss skips it).');
+ var buckets=rssBuckets(),i,peak=RSS_PEAK||0;
+ for(i=0;i<NBUCKETS;i++) if(buckets[i]>peak) peak=buckets[i];
+ if(peak<=0) return rssEmpty(g,H,'No memory samples fall on this run\'s timeline.');
+ var unit=rssUnit(peak),div=unit[0];
+ /* the run's peak is the top of the plot, the way the utilization chart puts
+    its ceiling there, so the marker line is the last thing the eye lands on */
+ var ymax=peak/div;
+ function Y(v){return pad_t+ph-Math.min(v/ymax,1)*ph;}
+ function ticks(v){return v.toFixed(v>=10?1:2);}
+ var svg='<svg xmlns="http://www.w3.org/2000/svg" width="'+g.W+'" height="'+H
+   +'" font-family="Verdana,sans-serif" font-size="11">';
+ var step=niceAxes(ymax),gr;
+ for(gr=0;gr<=ymax-1e-9;gr+=step){
+  var y=Y(gr);
+  svg+='<line x1="'+g.pad_l+'" y1="'+y.toFixed(1)+'" x2="'+(g.W-10)+'" y2="'+y.toFixed(1)
+    +'" stroke="#333" stroke-width="1"/>';
+  svg+='<text x="'+(g.pad_l-6)+'" y="'+(y+4).toFixed(1)+'" text-anchor="end" fill="#999">'
+    +ticks(gr)+'</text>';}
+ svg+='<text x="'+(g.pad_l-6)+'" y="'+(pad_t+4).toFixed(1)+'" text-anchor="end" fill="#bbb">'
+   +ticks(ymax)+'</text>';
+ svg+=shadeSvg(g,H,pad_t,ph);
+ var pts='';
+ for(i=0;i<NBUCKETS;i++){
+  var x=g.pad_l+i/Math.max(NBUCKETS-1,1)*g.pw;
+  pts+=x.toFixed(1)+','+Y(buckets[i]/div).toFixed(1)+' ';}
+ svg+='<polygon points="'+g.pad_l+','+(pad_t+ph)+' '+pts
+   +timeToX(T0+TSPAN,g).toFixed(1)+','+(pad_t+ph)+'" fill="rgba(64,156,255,0.35)" '
+   +'stroke="#409cff" stroke-width="1.5"/>';
+ var py=Y(ymax).toFixed(1);
+ svg+='<line x1="'+g.pad_l+'" y1="'+py+'" x2="'+(g.W-10)+'" y2="'+py
+   +'" stroke="#4a5570" stroke-width="1" stroke-dasharray="4,3"/>';
+ svg+='<text x="'+(g.W-10)+'" y="'+(pad_t+10)+'" text-anchor="end" fill="#bbb" font-size="10">peak '
+   +ticks(ymax)+' '+unit[1]+'</text>';
+ svg+='<text x="'+(g.pad_l-44)+'" y="'+(pad_t+10)+'" fill="#bbb">'+unit[1]+'</text>';
+ svg+=timeLabels(g,H);
+ svg+='</svg>';
+ return svg;}
 
 function freqEnvelope(){
  /* the frequency sampler counts from its own origin, but it reads the same
@@ -1975,7 +2060,8 @@ def _slice_width(slices: list[float]) -> float:
 def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
                mem: MemoryProfile | None = None,
                wp: WaitProfile | None = None,
-               freq_timeline: list | None = None) -> str:
+               freq_timeline: list | None = None,
+               rss_timeline: list | None = None) -> str:
     ncpu = meta.get("ncpus", 1)
     memory_meta = meta.get("memory", {})
     memory_backend = memory_meta.get("backend")
@@ -2014,6 +2100,7 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
     # ---- embed the data the browser re-aggregates ----------------------------
     samples_json = json.dumps(_sample_payload(samples, prof)).replace("</", "<\\/")
     freq_json = json.dumps(freq_timeline or []).replace("</", "<\\/")
+    rss_json = json.dumps(rss_timeline or []).replace("</", "<\\/")
     memory_json = json.dumps(_memory_html_map(
         mem, memory_backend, prof, memory_cojoined,
         groups)).replace("</", "<\\/")
@@ -2021,11 +2108,18 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
         m, ncpu, prof, thread_metrics, groups,
         meta.get("cpu_vendor"))).replace("</", "<\\/")
 
-    # ---- frequency curve origin, memory slice table, band/level names ------
+    # ---- sampler curve origins, memory slice table, band/level names --------
     # perf prints sample timestamps on CLOCK_MONOTONIC, the same clock the
-    # frequency sampler reads, so that origin is what lines the two curves up.
+    # frequency and memory samplers read, so those origins are what line the
+    # three curves up.  rss_peak is the raw high-water mark the sampler saw: a
+    # spike shorter than a bucket is gone from the area, so the chart draws the
+    # peak as its own line and the terminal prints the same number.
     freq_t0 = meta.get("freq_t0")
     freq_t0_json = "null" if freq_t0 is None else repr(float(freq_t0))
+    rss_t0 = meta.get("rss_t0")
+    rss_t0_json = "null" if rss_t0 is None else repr(float(rss_t0))
+    rss_peak = meta.get("rss_peak")
+    rss_peak_json = "0" if rss_peak is None else repr(int(rss_peak))
     mem_rows = _memory_rows_payload(mem, t0)
     mem_rows_json = json.dumps(mem_rows["rows"]).replace("</", "<\\/")
     mem_sym_json = json.dumps(mem_rows["sym"]).replace("</", "<\\/")
@@ -2086,7 +2180,8 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 <label class="check"><input type="checkbox" id="group-threads" onchange="toggleGrouped()"> Group threads by name</label>
 <span style="flex:1"></span>
 <label>Chart</label>
-<button class="mode-btn active" data-mode="util" onclick="setChartMode('util')">Utilization</button>
+<button class="mode-btn active" data-mode="util" onclick="setChartMode('util')">CPU Utilization</button>
+<button class="mode-btn" data-mode="mem" onclick="setChartMode('mem')">Memory RSS</button>
 <button class="mode-btn" data-mode="freq" onclick="setChartMode('freq')">Frequency</button>
 </div>
 <div class="row">
@@ -2151,6 +2246,7 @@ re-sliced per time selection.</span></div>
 <footer>Generated by vperf — artifacts: {esc(meta.get('_outdir', ''))}</footer>
 <script>
 S={samples_json};FREQ={freq_json};FREQ_T0={freq_t0_json};
+RSS={rss_json};RSS_T0={rss_t0_json};RSS_PEAK={rss_peak_json};
 MEM_BACKEND={mem_backend_json};MEM_ROWS={mem_rows_json};MEM_SYM={mem_sym_json};
 MEM_TLB={mem_tlb_json};
 MEM_SLICES={mem_slices_json};MEM_Q={mem_q};MEM_TRUNC={mem_trunc};
