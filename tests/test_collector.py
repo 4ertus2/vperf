@@ -1,4 +1,5 @@
 import json
+import os
 import signal
 import time
 from pathlib import Path
@@ -90,6 +91,26 @@ class _FakeSampler:
 
     def stop(self):
         return self.samples
+
+
+class _FakeRssSampler:
+    """Stands in for the memory sampler: records the pid it was pointed at and
+    hands back a fixed series, so the artifact and the meta keys can be checked
+    without a target to read."""
+
+    series = [(0.0, 100 << 20), (0.5, 140 << 20), (1.0, 900 << 20)]
+    pids: list[int] = []
+
+    def __init__(self, pid, *args, **kwargs):
+        self.pid = pid
+        self.t0 = 4242.0
+        _FakeRssSampler.pids.append(pid)
+
+    def start(self):
+        return None
+
+    def stop(self):
+        return list(self.series)
 
 
 class _FakeTarget:
@@ -444,13 +465,15 @@ def test_load_profile_prefers_thread_stats_and_appends_value(tmp_path):
 
     loaded = collector.load_profile(str(tmp_path), include_threads=True)
 
-    assert len(loaded) == 7
+    # fixed shape: [meta, stat, script, mem, wait, freq, thread_stats, rss]
+    assert len(loaded) == 8
     assert loaded[1].summary["task-clock"] == 300
     assert loaded[1].summary["cycles"] == 600
     assert loaded[1].summary["instructions"] == 1000
     assert "insn_per_cycle" not in loaded[1].metrics
     assert set(loaded[6]) == {101, 202}
     assert loaded[6][101].stat.metrics["insn_per_cycle"] == 0.40
+    assert loaded[7] is None  # no rss.json in this profile
     thread_metrics = _thread_metrics_payload(loaded[6], {"ncpus": 4}, 1.0)
     assert thread_metrics["101"]["metrics"]["ipc"] == 2.0
     assert thread_metrics["101"]["metrics"]["ncpus"] == 1
@@ -901,6 +924,121 @@ def test_memory_report_falls_back_off_time_sorting(monkeypatch, tmp_path):
     assert sorts_tried[0] == (collector._MEMORY_SORT, True)
     assert sorts_tried[1] == (collector._MEMORY_SORT, False)
     assert sorts_tried[2] == (collector._MEMORY_SORT_NO_TIME, False)
+
+
+def test_collect_writes_the_memory_timeline_and_the_peak_it_saw(monkeypatch, tmp_path):
+    """The memory curve needs three things kept: the samples, the clock they
+    count from, and the peak.  The peak is the number the terminal prints, so it
+    is computed once, here, rather than again in the report."""
+    _amd_vendor(monkeypatch)
+    _FakeRssSampler.pids = []
+
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
+        if args[:1] == ["script"]:
+            Path(stdout_file).write_text("worker 42/42 1.0: 100 cycles:P:\n", encoding="utf-8")
+        elif args[:2] == ["mem", "report"]:
+            Path(stdout_file).write_text(MEM_REPORT, encoding="utf-8")
+        return _defer(PerfResult(0, "", ""), defer)
+
+    monkeypatch.setattr(collector, "_probe_capabilities",
+                        lambda: (["task-clock", "cycles"], [], "cycles:P"))
+    monkeypatch.setattr(collector, "probe_ibs", lambda: True)
+    monkeypatch.setattr(collector, "probe_intel_mem", lambda: False)
+    monkeypatch.setattr(collector, "probe_wait", lambda: False)
+    monkeypatch.setattr(collector.subprocess, "Popen", lambda *a, **k: _FakeTarget())
+    monkeypatch.setattr(collector.os, "killpg", lambda pid, sig: None)
+    monkeypatch.setattr(collector, "start_perf", lambda args: _FakeCollector(args))
+    monkeypatch.setattr(collector, "run_perf", fake_run_perf)
+    monkeypatch.setattr(collector, "perf_version", lambda: "perf test")
+    monkeypatch.setattr(collector, "_FreqSampler", _FakeSampler)
+    monkeypatch.setattr(collector, "_RssSampler", _FakeRssSampler)
+
+    outdir = tmp_path / "rss"
+    profile = collector.collect(
+        target_cmd=["app"], pid=None, outdir=str(outdir),
+        freq=399, use_stat=True, use_record=True, use_memory=False,
+        use_wait=False, use_freq=False,
+    )
+
+    # the target's own pid, so the sampler read the process vperf profiled
+    assert _FakeRssSampler.pids == [4242]
+    assert json.loads((outdir / "rss.json").read_text(encoding="utf-8")) == [
+        list(row) for row in _FakeRssSampler.series]
+    assert profile.rss_timeline == _FakeRssSampler.series
+    assert profile.meta["rss_t0"] == 4242.0
+    assert profile.meta["rss_peak"] == 900 << 20
+
+
+def test_no_rss_sampling_leaves_the_profile_without_a_memory_chart(monkeypatch, tmp_path):
+    """--no-rss has to cost the report its memory curve and nothing else."""
+    _amd_vendor(monkeypatch)
+    _FakeRssSampler.pids = []
+
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
+        if args[:1] == ["script"]:
+            Path(stdout_file).write_text("worker 42/42 1.0: 100 cycles:P:\n", encoding="utf-8")
+        return _defer(PerfResult(0, "", ""), defer)
+
+    monkeypatch.setattr(collector, "_probe_capabilities",
+                        lambda: (["task-clock", "cycles"], [], "cycles:P"))
+    monkeypatch.setattr(collector, "probe_ibs", lambda: False)
+    monkeypatch.setattr(collector, "probe_intel_mem", lambda: False)
+    monkeypatch.setattr(collector, "probe_wait", lambda: False)
+    monkeypatch.setattr(collector.subprocess, "Popen", lambda *a, **k: _FakeTarget())
+    monkeypatch.setattr(collector.os, "killpg", lambda pid, sig: None)
+    monkeypatch.setattr(collector, "start_perf", lambda args: _FakeCollector(args))
+    monkeypatch.setattr(collector, "run_perf", fake_run_perf)
+    monkeypatch.setattr(collector, "perf_version", lambda: "perf test")
+    monkeypatch.setattr(collector, "_FreqSampler", _FakeSampler)
+    monkeypatch.setattr(collector, "_RssSampler", _FakeRssSampler)
+
+    outdir = tmp_path / "norss"
+    profile = collector.collect(
+        target_cmd=["app"], pid=None, outdir=str(outdir),
+        freq=399, use_stat=True, use_record=True, use_memory=False,
+        use_wait=False, use_freq=False, use_rss=False,
+    )
+
+    assert _FakeRssSampler.pids == []
+    assert not (outdir / "rss.json").exists()
+    assert profile.rss_timeline is None
+    assert profile.meta["rss_t0"] is None
+    assert profile.meta["rss_peak"] is None
+
+
+def test_load_profile_reads_the_memory_timeline_for_vperf_report(tmp_path):
+    """`vperf report` replays the artifacts, so the memory curve has to come
+    back out of the profile directory like the frequency one does."""
+    (tmp_path / "meta.json").write_text(json.dumps({
+        "events": ["task-clock"], "metrics": [], "rss_t0": 100.0, "rss_peak": 4096,
+    }), encoding="utf-8")
+    (tmp_path / "rss.json").write_text("[[0.0, 2048], [0.5, 4096]]", encoding="utf-8")
+
+    loaded = collector.load_profile(str(tmp_path))
+
+    assert loaded[7] == [[0.0, 2048], [0.5, 4096]]
+    assert loaded[6] is None  # threads were not parsed
+
+
+def test_read_rss_is_the_resident_field_and_a_dead_pid_is_not_fatal():
+    """statm field 2 is what top prints, and it is the field that matters: field
+    1 is the program size, which is never the footprint.  A pid that is gone -
+    the target exited, or the pid was never ours - is None, not an exception."""
+    page = os.sysconf("SC_PAGE_SIZE")
+    statm = f"/proc/{os.getpid()}/statm"
+    before = int(open(statm, encoding="utf-8").read().split()[1])
+
+    rss = collector._read_rss(os.getpid())
+    after = int(open(statm, encoding="utf-8").read().split()[1])
+
+    assert rss is not None
+    assert rss > 0
+    assert rss % page == 0            # a whole number of pages
+    # the resident field, bracketed by this process's own two readings rather
+    # than compared exactly, so a page faulted mid-test cannot flake it
+    assert before <= rss // page <= max(before, after)
+    assert collector._read_rss(999999999) is None
+    assert collector._read_rss(-1) is None
 
 
 def test_collect_records_the_quantum_it_used(monkeypatch, tmp_path):

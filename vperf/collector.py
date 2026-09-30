@@ -80,6 +80,7 @@ class ProfileData:
     wait_path: str | None
     warnings: list[str]
     freq_timeline: list | None = None
+    rss_timeline: list | None = None
     thread_stats: ThreadStatMap | None = None
 
 
@@ -449,6 +450,67 @@ def _read_freqs() -> dict[int, int]:
     return freqs
 
 
+def _read_rss(pid: int) -> int | None:
+    """Resident memory of one process in bytes, or None if it is not readable.
+
+    statm field 2 is what `top` reads too, so the number matches what a user
+    sees elsewhere.  The whole process is one address space: every thread reads
+    the same value, so there is no per-thread footprint to read anywhere in
+    /proc and the sampler records the process, not its threads.
+
+    A zero is reported as unreadable rather than as zero bytes.  A process that
+    has exited but not been reaped still has a /proc entry whose statm is all
+    zeros, and a curve that dives to nothing in its last sample says the target
+    shrank when it had in fact already gone.
+    """
+    try:
+        with open(f"/proc/{pid}/statm", encoding="utf-8") as source:
+            fields = source.read().split()
+    except (OSError, ValueError):
+        return None
+    if len(fields) < 2:
+        return None
+    try:
+        pages = int(fields[1])
+    except ValueError:
+        return None
+    return pages * os.sysconf("SC_PAGE_SIZE") if pages > 0 else None
+
+
+class _RssSampler:
+    """Background thread that samples the target's resident memory over time."""
+
+    def __init__(self, pid: int, interval: float = 0.01):
+        self.pid = pid
+        self.interval = interval
+        self.samples: list[tuple[float, int]] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        # same clock and the same reason as the frequency sampler's: perf prints
+        # sample timestamps on CLOCK_MONOTONIC, so this is what puts the memory
+        # curve on the sample timeline in the HTML report.
+        self.t0: float | None = None
+
+    def start(self) -> None:
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> list[tuple[float, int]]:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        return self.samples
+
+    def _run(self) -> None:
+        t0 = self.t0 = time.monotonic()
+        while not self._stop.is_set():
+            rss = _read_rss(self.pid)
+            if rss is not None:
+                self.samples.append((time.monotonic() - t0, rss))
+            self._stop.wait(self.interval)
+
+
 class _FreqSampler:
     """Background thread that samples CPU frequencies from sysfs."""
 
@@ -681,6 +743,7 @@ def _collect_combined(
     mem_period: int,
     use_wait: bool,
     use_freq: bool,
+    use_rss: bool,
     callgraph_mode: str,
     inline: bool,
     quiet_stdout: bool,
@@ -798,6 +861,13 @@ def _collect_combined(
             freq_sampler.start()
         except Exception:
             freq_sampler = None
+    rss_sampler: _RssSampler | None = None
+    if use_rss and target_pid > 0:
+        try:
+            rss_sampler = _RssSampler(target_pid, interval=0.01)
+            rss_sampler.start()
+        except Exception:
+            rss_sampler = None
     if target_paused:
         if _signal_target(target_pid, signal.SIGCONT, warnings, process_group=target is not None):
             target_paused = False
@@ -826,6 +896,10 @@ def _collect_combined(
     freq_timeline: list | None = None
     if freq_sampler is not None:
         freq_timeline = freq_sampler.stop()
+    rss_timeline: list | None = None
+    if rss_sampler is not None:
+        # the target is still alive here, so the last reading is a real one
+        rss_timeline = rss_sampler.stop()
 
     if target is not None:
         if target_paused and _signal_target(
@@ -929,6 +1003,9 @@ def _collect_combined(
     if freq_timeline:
         with open(os.path.join(outdir, "freq.json"), "w", encoding="utf-8") as destination:
             json.dump(freq_timeline, destination)
+    if rss_timeline:
+        with open(os.path.join(outdir, "rss.json"), "w", encoding="utf-8") as destination:
+            json.dump(rss_timeline, destination)
 
     target_meta: dict = {
         "cmd": target_cmd,
@@ -971,6 +1048,8 @@ def _collect_combined(
         ),
         "wait": {"enabled": wait_path is not None},
         "freq_t0": getattr(freq_sampler, "t0", None),
+        "rss_t0": getattr(rss_sampler, "t0", None),
+        "rss_peak": max((rss for _, rss in rss_timeline), default=None) if rss_timeline else None,
         "startup_grace": startup_grace if pid is None else None,
         "perf_version": perf_version(),
         "elapsed_wall": elapsed,
@@ -986,6 +1065,7 @@ def _collect_combined(
         wait_path=wait_path,
         warnings=warnings,
         freq_timeline=freq_timeline,
+        rss_timeline=rss_timeline,
         thread_stats=thread_stats,
     )
 
@@ -1004,6 +1084,7 @@ def collect(
     mem_time_quantum: int | None = None,
     use_wait: bool = True,
     use_freq: bool = True,
+    use_rss: bool = True,
     callgraph_mode: str = DEFAULT_CALLGRAPH,
     inline: bool = True,
     quiet_stdout: bool = False,
@@ -1036,6 +1117,7 @@ def collect(
             mem_time_quantum=mem_time_quantum,
             use_wait=use_wait,
             use_freq=use_freq,
+            use_rss=use_rss,
             callgraph_mode=callgraph_mode,
             inline=inline,
             quiet_stdout=quiet_stdout,
@@ -1106,6 +1188,15 @@ def collect(
     # ---- pass 2: perf record -------------------------------------------------
     script_path = None
     freq_timeline: list[tuple[float, dict[int, int]]] = []
+    rss_timeline: list | None = None
+    # this path launches the target through `perf record`, so only an attach
+    # names a pid whose memory can be read; a `run` here gets no memory curve
+    rss_sampler: _RssSampler | None = None
+    if use_rss and pid is not None:
+        try:
+            rss_sampler = _RssSampler(int(pid), interval=0.01)
+        except Exception:
+            rss_sampler = None
     mem_report_path = None
     memory_enabled = False
     mem_backend = requested_memory_plan.backend if requested_memory_plan else None
@@ -1134,8 +1225,11 @@ def collect(
             freq_sampler.stop()
         freq_sampler = _FreqSampler(interval=0.01)
         freq_sampler.start()
+        if rss_sampler is not None:
+            rss_sampler.start()
         r = run_perf(args + ["--", *placeholder], timeout=(duration or 0) + 3600)
         freq_timeline = freq_sampler.stop()
+        rss_timeline = rss_sampler.stop() if rss_sampler is not None else None
         if not r.ok and memory_plan and callgraph_mode == "dwarf":
             warnings.append("DWARF call graphs failed; retrying with frame pointers.")
             args = _frame_pointer_args(args)
@@ -1248,6 +1342,10 @@ def collect(
             freq_path = os.path.join(outdir, "freq.json")
             with open(freq_path, "w", encoding="utf-8") as f:
                 json.dump(freq_timeline, f)
+    if rss_timeline:
+        rss_path = os.path.join(outdir, "rss.json")
+        with open(rss_path, "w", encoding="utf-8") as f:
+            json.dump(rss_timeline, f)
 
     meta = {
         "version": 1,
@@ -1278,6 +1376,8 @@ def collect(
         ),
         "wait": {"enabled": wait_enabled},
         "freq_t0": getattr(freq_sampler, "t0", None),
+        "rss_t0": getattr(rss_sampler, "t0", None),
+        "rss_peak": max((rss for _, rss in rss_timeline), default=None) if rss_timeline else None,
         "perf_version": perf_version(),
         "elapsed_wall": elapsed,
     }
@@ -1298,6 +1398,7 @@ def collect(
         wait_path=wait_path,
         warnings=warnings,
         freq_timeline=freq_timeline,
+        rss_timeline=rss_timeline,
     )
 
 
@@ -1336,5 +1437,12 @@ def load_profile(
     if os.path.exists(freq_path):
         with open(freq_path, encoding="utf-8") as f:
             freq_timeline = json.load(f)
-    result = (meta, stat, script_path, mem_report_path, wait_path, freq_timeline)
-    return result + (thread_stats,) if include_threads else result
+    rss_path = os.path.join(outdir, "rss.json")
+    rss_timeline: list | None = None
+    if os.path.exists(rss_path):
+        with open(rss_path, encoding="utf-8") as f:
+            rss_timeline = json.load(f)
+    # fixed shape: thread_stats keeps index 6 and the memory timeline follows it,
+    # so `vperf report` reads the same slots whether or not threads were parsed
+    return (meta, stat, script_path, mem_report_path, wait_path, freq_timeline,
+            thread_stats if include_threads else None, rss_timeline)

@@ -20,11 +20,13 @@ CPU analyses on amd64 machine (AMD and Intel), with zero Python dependencies:
 - **Memory-access profiling** — AMD IBS or Intel PEBS, whichever the host
   exposes (see `vperf doctor`)
 - **Effective CPU utilization** — average busy cores + utilization timeline
+- **Memory usage over time** — the target's resident set, sampled from `/proc`
+  like `top` reads it, with the run's peak in the terminal summary
 - **Reports** — terminal summary + a single-file interactive `report.html`
   (metric overview, hotspots table, memory access summary, click-to-zoom flame
   graph, timelines, call tree, threads). The HTML thread selector scopes CPU
   views, the Overview metrics, and the IBS/PEBS Memory tab to the selected
-  thread, and the **movable borders on the utilization chart scope every tab
+  thread, and the **movable borders on the CPU utilization chart scope every tab
   the profile has the samples for** — Hotspots, Flame Graph, Call Tree, Memory
   and the per-thread cycles — to a time range (see
   [Time selection](#time-selection)). **Group threads by name** (checkbox next
@@ -39,7 +41,8 @@ CPU analyses on amd64 machine (AMD and Intel), with zero Python dependencies:
   wait columns read `n/a` when scheduler tracepoints were not collected.
 
 Artifacts (`stat.csv` or `stat_threads.csv`, `perf.data`, `script.txt`,
-`mem_report.txt`, `meta.json`) are kept in the profile directory so reports can
+`mem_report.txt`, `freq.json`, `rss.json`, `meta.json`) are kept in the profile
+directory so reports can
 be regenerated any time with `vperf report`. `meta.json` records the CPU vendor,
 so a profile collected on AMD and re-reported on Intel (or the reverse) keeps
 the vendor calibrated constants it was collected with.
@@ -231,6 +234,7 @@ vperf run -f 999 -- ./yourapp input.bin           # higher sampling frequency
 vperf run --callgraph dwarf -- ./yourapp         # higher-quality stacks when DWARF is available
 vperf run --mem-period 1000003 -- ./longjob      # thin the IBS memory samples (AMD)
 vperf run --mem-time-quantum 50 -- ./longjob    # 50ms memory timeline slices
+vperf run --no-rss -- ./yourapp                  # skip the memory-usage timeline
 vperf run --no-inline -- ./hugebinary            # skip DWARF inline expansion
 vperf run --startup-grace 0.3 -- ./slowstartup  # let the thread pool come up first
 
@@ -276,7 +280,7 @@ copies were dropped.
 
 ### Time selection
 
-The utilization chart at the top of the report has two movable borders, and
+The chart at the top of the report has two movable borders, and
 they scope every tab the profile holds the data for:
 
 - **Drag inside the plot** to select a range, **drag the selection** to move it,
@@ -286,9 +290,9 @@ they scope every tab the profile holds the data for:
   share of the run, the sample count and the cycles behind it.
 - The curve always shows the **whole run** with the parts outside the selection
   dimmed, so a selection keeps its context and the borders line up with the axis.
-  Both chart modes (Utilization, Frequency) share that axis and the same
-  selection, and the frequency curve is placed on the sample timeline by the
-  clock its sampler shares with perf. Every time the report shows is seconds
+  All three chart modes (CPU Utilization, Memory RSS, Frequency) share that
+  axis and the same selection, and the frequency and memory curves are placed
+  on the sample timeline by the clock their samplers share with perf. Every time the report shows is seconds
   into the run — perf's raw `CLOCK_MONOTONIC` timestamps stay inside it.
 - The utilization y axis is **busy cores in the current scope, capped at what
   that scope could possibly use**: every thread at the machine's logical CPU
@@ -321,6 +325,29 @@ they scope every tab the profile holds the data for:
   override), so a window that cuts a slice in half counts half of it. A profile
   captured before this existed — or on a perf that rejected the `time` sort key —
   keeps its whole-run Memory tab and says so.
+
+### Memory usage over time
+
+The **Memory RSS** chart in the header (between CPU Utilization and Frequency)
+plots the target's resident memory across the run, sampled every 10 ms from
+`/proc/<pid>/statm` — the same number `top` prints — and the run's peak is also
+printed in the terminal summary. The curve is a measured value, not an estimate:
+the only thing bucketing loses is a spike shorter than a bucket, so the peak is
+drawn as its own dashed line at the top of the plot, labelled with the same
+number the terminal quotes.
+
+It is the **whole process, and it does not follow the thread selector**. A
+process is one address space, so every thread of it reads the same resident
+size — `/proc/<pid>/task/<tid>/statm` and the per-thread `RssAnon`/`RssFile` in
+`.../status` both report the process total, which is why there is no per-thread
+footprint to plot anywhere in procfs (measured on a 4-thread process with 300 MiB
+allocated on one thread: 312.4 MiB reported by all four). For per-thread memory
+*behaviour* use the Memory tab, which follows the selector: its timeline is
+accesses per time slice for the selected thread or group.
+
+`--no-rss` skips the sampling, and then the report has no memory curve and no
+peak row. A profile collected before this existed has neither and says so in
+place of the chart.
 
 ### Grouping threads by name
 

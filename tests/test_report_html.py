@@ -532,6 +532,76 @@ def test_frequency_envelope_fills_between_the_min_and_max_curves():
     assert "svg+=polyFreq(env,X,Y,5,'1','2,3',0.4);" in _JS
 
 
+def test_the_chart_offers_three_modes_with_memory_in_the_middle():
+    """CPU, then memory, then frequency: the modes read in the order the report
+    explains them, and the utilization button is named for what it plots."""
+    html = build_html({"target": {"cmd": ["app"]}, "ncpus": 4}, [], MetricsReport(),
+                      build_profile([]))
+    modes = re.findall(r'data-mode="(\w+)"[^>]*>([^<]+)<', html)
+
+    assert modes == [("util", "CPU Utilization"), ("mem", "Memory RSS"),
+                     ("freq", "Frequency")]
+    assert ">Utilization</button>" not in html
+    # every mode the buttons offer is one the chart can draw
+    for mode, _label in modes:
+        assert f"setChartMode('{mode}')" in html
+    assert "chartMode==='mem'?rssSvg(g,H,pad_t,ph)" in _JS
+
+
+def test_the_memory_curve_is_the_process_and_says_so_when_it_is_missing():
+    """A process is one address space: every thread reads the same RSS, so the
+    curve is the whole process and the thread selector cannot move it. Buckets
+    average, so the peak is drawn as its own line rather than read off the area,
+    and a profile without the artifact says that instead of showing nothing."""
+    assert "function rssBuckets()" in _JS
+    assert "function rssSvg(g,H,pad_t,ph)" in _JS
+    # no per-thread filtering: the scope is deliberately not consulted
+    assert "scopeSet" not in _JS.split("function rssBuckets()")[1].split("function rssSvg")[0]
+    assert "RSS_T0!==null?RSS_T0+r[0]:r[0]" in _JS
+    # the run's high-water mark, the same number the terminal prints
+    assert "var buckets=rssBuckets(),i,peak=RSS_PEAK||0;" in _JS
+    assert "for(i=0;i<NBUCKETS;i++) if(buckets[i]>peak) peak=buckets[i];" in _JS
+    assert 'font-size="10">peak ' in _JS
+    assert "Memory over time was not collected in this profile" in _JS
+
+
+def test_the_memory_axis_picks_a_unit_and_scales_the_ticks_to_it():
+    """A 20 GiB query and a 40 MiB one read in their own unit, with the unit on
+    the axis: the ticks are plain numbers in that unit, like 'cores' and 'GHz'."""
+    assert "function rssUnit(bytes)" in _JS
+    assert "[1073741824,'GiB'],[1048576,'MiB'],[1024,'KiB']" in _JS
+    assert "var unit=rssUnit(peak),div=unit[0];" in _JS
+    assert "function ticks(v){return v.toFixed(v>=10?1:2);}" in _JS
+    assert "' '+unit[1]+'</text>'" in _JS
+
+
+def test_build_html_embeds_the_memory_timeline_and_its_origin():
+    """The curve needs three things from the collector: the samples, the clock
+    they count from, and the run's peak - the last one is what the terminal
+    prints too, so the two never disagree."""
+    meta = {"target": {"cmd": ["app"]}, "ncpus": 4,
+            "rss_t0": 100.0, "rss_peak": 1073741824}
+
+    html = build_html(meta, [], MetricsReport(), build_profile([]),
+                      rss_timeline=[[0.01, 536870912], [0.02, 1073741824]])
+
+    assert "RSS=[[0.01, 536870912], [0.02, 1073741824]];" in html
+    assert "RSS_T0=100.0;" in html
+    assert "RSS_PEAK=1073741824;" in html
+
+
+def test_a_profile_without_memory_data_still_offers_the_mode():
+    """Every profile collected before this existed has no rss.json, and one
+    collected with --no-rss will not have one either."""
+    html = build_html({"target": {"cmd": ["app"]}, "ncpus": 4}, [], MetricsReport(),
+                      build_profile([]))
+
+    assert "RSS=[];" in html
+    assert "RSS_T0=null;" in html
+    assert "RSS_PEAK=0;" in html
+    assert "Memory RSS" in html
+
+
 def test_memory_tab_has_dynamic_body():
     html = _memory_tab(_profile(), "ibs")
 
@@ -547,6 +617,31 @@ def test_memory_tab_labels_pebs():
     assert "Memory access summary (PEBS)" in html
     assert "IBS samples collected" not in html
     assert "PEBS samples collected" in html
+
+
+def test_the_terminal_quotes_the_peak_rss_only_when_memory_was_sampled():
+    """The peak is the number a leak hunt ends on, and it is the same number the
+    chart draws, so it is computed once in the collector. A profile without the
+    sampler (--no-rss, or any profile from before it existed) has no row at all
+    rather than a row of zeros."""
+    from vperf.report_terminal import _fmt_bytes, render_terminal
+
+    prof = build_profile([
+        ScriptSample("canonical", 42, 42, 1.0, 1, "cycles:P", [("worker", "app")]),
+    ])
+    m = MetricsReport()
+    m.branch_penalty_cycles = 13.0
+    base = {"target": {"cmd": ["app"]}, "started": "now", "host": "h", "ncpus": 4}
+
+    without = render_terminal(dict(base), m, prof)
+    with_peak = render_terminal({**base, "rss_peak": 1_352_619_648}, m, prof)
+
+    assert "Peak RSS" not in without
+    assert "Peak RSS" in with_peak and "1.26 GiB" in with_peak
+    # a byte order of magnitude reads as bytes, not as a count
+    assert _fmt_bytes(999) == "999 B"
+    assert _fmt_bytes(1 << 20) == "1.00 MiB"
+    assert _fmt_bytes(3 * (1 << 30) + (1 << 29)) == "3.50 GiB"
 
 
 def test_terminal_and_html_agree_on_a_missing_backend():
