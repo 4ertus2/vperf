@@ -2189,7 +2189,7 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 <span id="selection-label" class="mono" style="font-size:12px;color:var(--fg)"></span>
 <button class="mode-btn" id="time-reset" onclick="resetSelection()">Reset Selection</button>
 <span class="note">drag on the chart to select a range, drag the selection to move it,
-double-click to clear — every tab below follows it</span>
+double-click to clear — tabs below follow it</span>
 </div>
 <div id="chart-wrap">
 <div id="chart-svg"></div>
