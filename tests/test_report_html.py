@@ -1012,10 +1012,70 @@ def test_the_memory_timeline_shares_the_chart_geometry_and_scales():
     # same left margin as the utilization chart, so the same instant is the
     # same x in both timelines
     assert "plotGeom(host,56)" in chart
-    # and a value axis: accesses per time slice, the quantity it stacks
+    # and a value axis: per time slice, the quantity it stacks
     assert "var totals=new Float64Array(n),peak=0;" in chart
     assert "fmtCount(ymax)" in chart
     assert "step=niceAxes(ymax)" in chart
+
+
+def test_the_memory_timeline_switches_between_accesses_and_latency():
+    """One chart, two readings of the same rows: r[6] is how many accesses a
+    slice saw, r[7] the access latency they cost in cycles.  Only the accumulator
+    changes, so the stack, the colours, the legend, the shared left margin and the
+    thread scope stay the same in both - they are one chart, not two."""
+    chart = _JS.split("function renderMemChart")[1].split("\n/* ---- Call Tree")[0]
+
+    assert "var byLatency=memChartMode==='latency';" in chart
+    assert "series[r[2]][r[0]]+=byLatency?r[7]:r[6];" in chart
+    # the axis says which of the two it is showing
+    assert "(byLatency?'cycles':'accesses')" in chart
+    # the scope filter is outside the mode, so both modes follow the selector
+    scope_line = [line for line in chart.splitlines() if "scopeSet" in line]
+    assert scope_line == ["  if(scopeSet!==null&&!scopeSet.has(r[1])) continue;"]
+    # a latency average would be a second unit on the same axis; the sum is not
+    assert "r[7]/r[6]" not in chart
+
+
+def test_the_memory_chart_selector_is_its_own_switch():
+    """The buttons sit top right of the chart like the header's, but they cannot
+    be the header's: setChartMode() toggles every .mode-btn[data-mode], so these
+    carry data-memmode and only their own handler reaches them."""
+    sliced = _sliced_memory()
+    html = _memory_tab(sliced, "ibs", sliced=True)
+    head = html[html.index('<div class="panel-head">'):html.index('id="mem-chart"')]
+
+    assert 'data-memmode="count"' in head and 'data-memmode="latency"' in head
+    assert "Accesses</button>" in head and "Latency</button>" in head
+    assert "setMemChartMode('count')" in head and "setMemChartMode('latency')" in head
+    assert "data-mode=" not in head
+    # the head is a flex row so the buttons land in the top right corner
+    assert ".panel-head{display:flex;align-items:center;gap:8px;margin-bottom:12px}" in _CSS
+    assert ".panel-head h3{margin:0;flex:1}" in _CSS
+
+    switch = _JS.split("function setMemChartMode")[1].split("\nfunction ")[0]
+    assert ".mode-btn[data-memmode]" in switch
+    assert "b.dataset.memmode===mode" in switch
+    assert "renderMemChart();" in switch
+    assert "var memChartMode='count';" in _JS
+    # and a capture with no slices gets neither the chart nor the switch
+    assert "data-memmode" not in _memory_tab(_profile(), "ibs")
+
+
+def test_the_memory_chart_title_follows_the_mode():
+    """A heading that says 'accesses' above a stack of stall cycles is a lie, so
+    both titles ship with the report and the switch sets the one it shows."""
+    full = build_html(
+        {"target": {"cmd": ["app"]}, "mode": "run", "ncpus": 4,
+         "memory": {"backend": "ibs", "cojoined": True}},
+        [], MetricsReport(), build_profile([]), _sliced_memory())
+    titles = re.search(r"MEM_CHART_TITLES=(\{.*?\});", full).group(1)
+
+    assert json.loads(titles) == {
+        "count": "Memory accesses over time — IBS, by source",
+        "latency": "Memory stall cycles over time — IBS, by source",
+    }
+    assert 'id="mem-chart-title"' in full
+    assert "MEM_CHART_TITLES[mode]" in _JS
 
 
 def test_every_tab_reads_the_selection():

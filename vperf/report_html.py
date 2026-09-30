@@ -76,6 +76,10 @@ select{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-
 .flame-head{margin-bottom:12px}
 .flame-foot{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
 .flame-head h3{margin:0}
+/* a panel whose chart is drawn by the browser: the title on the left, the
+   controls that choose what it plots on the right */
+.panel-head{display:flex;align-items:center;gap:8px;margin-bottom:12px}
+.panel-head h3{margin:0;flex:1}
 .note{color:var(--dim);font-size:12px}
 .flame-reset{color:var(--accent);cursor:pointer;font-size:12px;text-decoration:none}
 .flame-reset:hover{text-decoration:underline}
@@ -124,6 +128,7 @@ var SAMPLES=S[0],SYMS=S[1],DSOS=S[2],ROOTS=S[3];
 var NBUCKETS=120;                  /* buckets of the utilization curve */
 var keyCache=null,uniqCache=null;  /* per-sample folded key / deduped stack */
 var chartCache=null,chartCacheKey='';
+var memChartMode='count';             /* the Memory tab's own chart: accesses or latency */
 
 /* ---- one time<->pixel mapping, shared by the curve, the shade and the
    borders.  The borders used to be placed against the container width while
@@ -729,8 +734,13 @@ function renderMemChart(){
  var host=document.getElementById('mem-chart');
  if(!host||!MEM_ROWS.length) return;
  /* the same left margin as the utilization chart above, so the same instant
-    lands at the same x in both timelines, and a value axis like that one: the
-    y scale is accesses per time slice, which is the quantity the stack adds */
+    lands at the same x in both timelines, and a value axis like that one.  The
+    stack is the same shape either way and the rows already carry both numbers:
+    r[6] accesses and r[7] their summed access latency, so the mode decides what
+    the stack adds up - how much traffic, or the stall cycles it cost.  Latency
+    here is a sum, not an average: the terminal's average latency is the same
+    weight over the same count. */
+ var byLatency=memChartMode==='latency';
  var g=plotGeom(host,56),H=132,pad_t=8,pad_b=20,ph=H-pad_t-pad_b,W=g.W;
  var n=MEM_SLICES.length,levels=MEM_LEVELS.length-1;
  var series=[],li,i,bi;
@@ -739,7 +749,7 @@ function renderMemChart(){
   var r=MEM_ROWS[i];
   if(r[2]>=levels) continue;
   if(scopeSet!==null&&!scopeSet.has(r[1])) continue;
-  series[r[2]][r[0]]+=r[6];
+  series[r[2]][r[0]]+=byLatency?r[7]:r[6];
  }
  var totals=new Float64Array(n),peak=0;
  for(bi=0;bi<n;bi++){
@@ -774,7 +784,8 @@ function renderMemChart(){
    +'" fill-opacity="0.8" stroke="none"><title>'+escHtml(MEM_LEVELS[li])+'</title></polygon>';
  }
  svg+=timeLabels(g,H);
- svg+='<text x="'+(g.pad_l-44)+'" y="'+(pad_t+10)+'" fill="#bbb">accesses</text>';
+ svg+='<text x="'+(g.pad_l-44)+'" y="'+(pad_t+10)+'" fill="#bbb">'
+   +(byLatency?'cycles':'accesses')+'</text>';
  var lx=g.pad_l+2,ly=H-6;
  for(li=0;li<levels;li++){
   svg+='<rect x="'+lx+'" y="'+(ly-8)+'" width="9" height="9" fill="'+colors[li%colors.length]+'"/>';
@@ -784,6 +795,19 @@ function renderMemChart(){
  }
  svg+='</svg>';
  host.innerHTML=svg;}
+
+/* The Memory tab's chart has two readings of the same rows, and the title has to
+   follow the mode: "accesses" over a stack of stall cycles would be a lie.  The
+   buttons carry data-memmode, not data-mode, so the header's own mode switch -
+   which toggles every .mode-btn[data-mode] - cannot clear their active state. */
+function setMemChartMode(mode){
+ if(mode!=='count'&&mode!=='latency') return;
+ memChartMode=mode;
+ document.querySelectorAll('.mode-btn[data-memmode]').forEach(function(b){
+   b.classList.toggle('active',b.dataset.memmode===mode);});
+ var title=document.getElementById('mem-chart-title');
+ if(title&&MEM_CHART_TITLES&&MEM_CHART_TITLES[mode]) title.textContent=MEM_CHART_TITLES[mode];
+ renderMemChart();}
 
 /* ---- Call Tree: the same fold, laid out as nested details ---- */
 function renderTree(){
@@ -1710,11 +1734,19 @@ def _memory_content(mem: MemoryProfile | None, backend: str | None = "ibs",
 def _memory_tab(mem: MemoryProfile | None, backend: str | None = "ibs",
                 sliced: bool = False) -> str:
     # The timeline is drawn by the browser from the per-slice rows; a profile
-    # captured without them says so instead of showing an empty plot.
+    # captured without them says so instead of showing an empty plot.  Both modes
+    # come out of the same rows - r[6] accesses, r[7] summed access latency - so
+    # the choice is which of the two the stack adds up, not a second payload.
     chart = ""
     if mem is not None and mem.detail:
-        chart = ('<div class="panel"><h3>Memory accesses over time — '
-                 f'{esc(backend_label(backend))}, by source</h3>'
+        label = esc(backend_label(backend))
+        chart = ('<div class="panel"><div class="panel-head">'
+                 f'<h3 id="mem-chart-title">Memory accesses over time — {label}, by source</h3>'
+                 '<button class="mode-btn active" data-memmode="count" '
+                 'onclick="setMemChartMode(\'count\')">Accesses</button>'
+                 '<button class="mode-btn" data-memmode="latency" '
+                 'onclick="setMemChartMode(\'latency\')">Latency</button>'
+                 '</div>'
                  '<div class="memchart" id="mem-chart"></div></div>')
     return (f'<div id="mem" class="page">{chart}<div id="memory-body">'
             f'{_memory_content(mem, backend)}</div></div>')
@@ -2130,6 +2162,12 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
     mem_levels_json = json.dumps(list(_MEM_LEVELS)).replace("</", "<\\/")
     mem_bands_json = json.dumps(list(_MEM_BANDS)).replace("</", "<\\/")
     mem_backend_json = json.dumps(backend_label(memory_backend)).replace("</", "<\\/")
+    # the Memory tab's chart title per mode, so the switch cannot leave a heading
+    # that contradicts the stack under it
+    mem_chart_titles = json.dumps({
+        "count": f"Memory accesses over time — {backend_label(memory_backend)}, by source",
+        "latency": f"Memory stall cycles over time — {backend_label(memory_backend)}, by source",
+    }).replace("</", "<\\/")
 
     # ---- per-thread CPU time, so a scope's timeline is anchored to its own --
     # `perf stat --per-thread` already counted task-clock for every thread, and a
@@ -2254,6 +2292,7 @@ re-sliced per time selection.</span></div>
 S={samples_json};FREQ={freq_json};FREQ_T0={freq_t0_json};
 RSS={rss_json};RSS_T0={rss_t0_json};RSS_PEAK={rss_peak_json};
 MEM_BACKEND={mem_backend_json};MEM_ROWS={mem_rows_json};MEM_SYM={mem_sym_json};
+MEM_CHART_TITLES={mem_chart_titles};
 MEM_TLB={mem_tlb_json};
 MEM_SLICES={mem_slices_json};MEM_Q={mem_q};MEM_TRUNC={mem_trunc};
 MEMORY_HTML={memory_json};OVERVIEW_HTML={overview_json};
