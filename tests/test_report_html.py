@@ -532,6 +532,22 @@ def test_frequency_envelope_fills_between_the_min_and_max_curves():
     assert "svg+=polyFreq(env,X,Y,5,'1','2,3',0.4);" in _JS
 
 
+def test_the_header_is_a_title_and_a_fact_line():
+    """The header carries the title and what ran, nothing else: a 'CPU profiling
+    via Linux perf' subtitle repeated what the perf version on the right of the
+    same line already said, and cost a third of the header's height. The rule
+    that styled it goes with it rather than staying as dead CSS."""
+    html = build_html({"target": {"cmd": ["app"]}, "ncpus": 4, "started": "now",
+                       "host": "h", "perf_version": "perf version 7.0"}, [],
+                      MetricsReport(), build_profile([]))
+
+    assert "<header><h1>vperf report</h1>" in html
+    assert "CPU profiling via Linux perf" not in html
+    assert "h1 small" not in _CSS
+    # the line beside the title is the one that says what was profiled
+    assert "now on h" in html and "perf version 7.0" in html
+
+
 def test_the_chart_offers_three_modes_with_memory_in_the_middle():
     """CPU, then memory, then frequency: the modes read in the order the report
     explains them, and the utilization button is named for what it plots."""

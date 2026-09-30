@@ -47,7 +47,7 @@ body{margin:0;background:var(--bg);color:var(--fg);
 font:14px/1.45 -apple-system,'Segoe UI',Roboto,Arial,sans-serif}
 header{padding:18px 24px;border-bottom:1px solid var(--line);display:flex;
 justify-content:space-between;align-items:center}
-h1{font-size:18px;margin:0}h1 small{color:var(--dim);font-weight:normal;margin-left:10px}
+h1{font-size:18px;margin:0}
 .tabs{display:flex;gap:4px;padding:10px 24px 0;border-bottom:1px solid var(--line)}
 .tab{padding:8px 16px;cursor:pointer;color:var(--dim);border:1px solid transparent;border-bottom:none;border-radius:6px 6px 0 0}
 .tab.active{background:var(--panel);color:var(--fg);border-color:var(--line)}
@@ -2169,7 +2169,7 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
 <title>vperf report — {esc(' '.join(meta['target'].get('cmd') or []) or 'profile')}</title>
 <style>{_CSS}</style></head>
 <body>
-<header><h1>vperf report<small>CPU profiling via Linux perf</small></h1>
+<header><h1>vperf report</h1>
 <div style="color:var(--dim);font-size:12px">{meta_line}</div></header>
 
 <div id="chart-header">
