@@ -517,25 +517,41 @@ signature: ~2/3 of the window asleep).
 
 ## Profiling a whole ClickBench sweep
 
-`bench/clickbench_profiles.sh` profiles every ClickBench query with
-`clickhouse-local` and keeps one profile directory per query:
+`bench/clickbench_profiles.sh` profiles every ClickBench query with vperf and
+keeps one profile directory per query and engine:
 
 ```bash
-bench/clickbench_profiles.sh --dry-run          # show the commands first
-bench/clickbench_profiles.sh --from 18 --to 22  # a subset
-bench/clickbench_profiles.sh --resume           # skip queries already profiled
+bench/clickbench_profiles.sh --engine duckdb          # one engine
+bench/clickbench_profiles.sh --engine both            # clickhouse, then duckdb
+bench/clickbench_profiles.sh --dry-run                # print the real argv first
+bench/clickbench_profiles.sh --from 18 --to 22        # a subset
+bench/clickbench_profiles.sh --resume                 # skip what this engine has
 ```
 
-The schema and the queries come from the ClickBench checkout
-(`$CLICKBENCH_DIR/clickhouse-parquet/`), and the run is strictly sequential —
-concurrent profiling sessions multiplex the hardware counters. Every query is
-executed exactly once: nothing is repeated, retimed or retried, so a report
-describes the query as ClickBench defines it — where its CPU time goes and what
-its threads were doing over the query's timeline. Each profile keeps the exact
-statement it ran in `queries.sql` next to the usual artifacts, so
-`vperf report <dir>` can regenerate the HTML at any time. A query that finishes
-before the collectors can attach still gets a report, just without samples, and
-the run log names it.
+```
+.vperf/q00_clickhouse_20260926_120501/report.html
+.vperf/q00_duckdb_20260926_120501/report.html
+.vperf/clickbench_<engine>_<runid>.{log,tsv}          # progress + headline metrics
+```
+
+Each engine gets the schema and the query text from its own directory in the
+ClickBench checkout (`$CLICKBENCH_DIR/<engine>-parquet/`) — the two sets differ
+where the engines disagree on a function name — and is invoked the way its CLI
+wants it: `clickhouse-local --time --format=Null --query=<schema> <query>` and
+`duckdb -no-stdin -c .timer on -c <schema> -c <query>`. `--engine both` runs
+them in sequence, never side by side, since concurrent profiling sessions
+multiplex the hardware counters.
+
+Every query is executed exactly once: nothing is repeated, retimed or retried,
+so a report describes the query as ClickBench defines it — where its CPU time
+goes and what its threads were doing over the query's timeline. Each profile
+keeps the exact statement it ran in `queries.sql` next to the usual artifacts,
+so `vperf report <dir>` can regenerate the HTML at any time. A query that
+finishes before the collectors can attach still gets a report, just without
+samples, and the run log names it — which is why the startup grace is per
+engine: `clickhouse-local` needs ~90 ms to build its thread pool while its
+cheapest query takes 140 ms, and duckdb has its 16 threads up within 8 ms while
+its cheapest query takes 80 ms.
 
 ## Cycle mode: before/after comparisons with ministat
 
