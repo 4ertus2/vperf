@@ -100,6 +100,15 @@ _KV_RE = re.compile(r"(\w+)=(\S+)")
 _TASK_UNINTERRUPTIBLE = 2
 _TASK_INTERRUPTIBLE = 1
 
+# What the payload calls each state, in the order the report stacks them.  A
+# slice carries one of these codes, and a fold answers with their names.
+SLICE_STATES = ("unknown", "sleep", "blocked", "runnable", "stopped")
+_SLICE_CODES = {None: 0, "S": 1, "D": 2, "R": 3}
+# every field one thread's fold answers with, zeros included: the browser asks
+# for the same names, so both sides of the report agree on what a number means
+_FOLD_KEYS = (*SLICE_STATES, "on", "off", "sleep_count", "blocked_count",
+              "runnable_count")
+
 
 @dataclass
 class _Event:
@@ -131,7 +140,12 @@ class ThreadWait:
     runnable_count: int = 0
     preempted: int = 0              # R switch-outs: the count a scheduler calls preemption
     span_s: float = 0.0             # first to last accounting point, clamped at exit
+    lead_s: float = 0.0             # CPU the first point earned, before the span
+    skew_s: float = 0.0             # CPU its own accounting gives a gap too little room for
+    first_ts: float | None = None   # where those points stand, on the sample clock
+    last_ts: float | None = None
     exited_s: float | None = None   # when sched_process_exit saw the thread go
+    slices: list[tuple[float, float, str | None]] = field(default_factory=list)
 
     @property
     def off_cpu_s(self) -> float:
@@ -140,6 +154,44 @@ class ThreadWait:
     @property
     def accounted_s(self) -> float:
         return self.runtime_s + self.off_cpu_s + self.stopped_s
+
+    def fold(self, lo: float, hi: float) -> dict[str, float]:
+        """This thread's ledger inside [lo, hi], folded from its own slices.
+
+        On-CPU needs no slice of its own: the span is partitioned by the
+        off-CPU and stopped slices, so whatever of the covered part of the span
+        they leave was on-CPU.  That is the identity the whole module rests on,
+        and folding it here rather than only in the browser keeps the
+        arithmetic testable without one.
+        """
+        zero = dict.fromkeys(_FOLD_KEYS, 0.0)
+        a, b = self.first_ts, self.last_ts
+        if a is None or b <= lo or a >= hi:
+            return zero
+        out = zero
+        counts = {1: 0.0, 2: 0.0, 3: 0.0}
+        for start, end, state in self.slices:
+            if end <= start or end <= lo or start >= hi:
+                continue
+            share = (min(end, hi) - max(start, lo)) / (end - start)
+            out[SLICE_STATES[slice_code(state)]] += (end - start) * share
+            if state in ("S", "D", "R"):
+                counts[slice_code(state)] += share
+        out["off"] = out["sleep"] + out["blocked"] + out["runnable"] + out["unknown"]
+        covered = min(b, hi) - max(a, lo)
+        out["on"] = covered - out["off"] - out["stopped"]
+        if lo <= a:
+            # The lead sits just before the span opens, so no window that opens
+            # at or before the span can hold it.  The whole run does reach back
+            # that far, and charging it there is what keeps this fold and the
+            # server's own `runtime_s` the same number at the whole window.
+            out["on"] += self.lead_s
+        if self.span_s > 0.0:
+            out["on"] += self.skew_s * covered / self.span_s
+        out["sleep_count"] = counts[1]
+        out["blocked_count"] = counts[2]
+        out["runnable_count"] = counts[3]
+        return out
 
 
 @dataclass
@@ -226,6 +278,31 @@ class WaitProfile:
     def off_cpu_share_pct(self) -> float | None:
         return self._share(self.off_cpu_s)
 
+    def wait_window(self) -> tuple[float, float] | None:
+        """The span the scheduler's records cover, if any did."""
+        stamps = [t.first_ts for t in self.threads.values() if t.first_ts is not None]
+        ends = [t.last_ts for t in self.threads.values() if t.last_ts is not None]
+        if not stamps or not ends:
+            return None
+        return (min(stamps), max(ends))
+
+    def fold(self, lo: float, hi: float, tids: list[int] | None = None
+             ) -> dict[str, float]:
+        """The whole profile's ledger inside [lo, hi], folded per thread.
+
+        With *tids* the fold is one scope - one thread, or a name group - which
+        is what the run-level bar shows when the reader picks one.
+        """
+        wanted = set(tids) if tids is not None else None
+        out = dict.fromkeys(_FOLD_KEYS, 0.0)
+        for tid, thread in self.threads.items():
+            if wanted is not None and tid not in wanted:
+                continue
+            for key, value in thread.fold(lo, hi).items():
+                out[key] += value
+        out["threads"] = float(len(wanted) if wanted is not None else len(self.threads))
+        return out
+
     def top_threads(self, n: int = 12, min_cpu_s: float = 0.0) -> list[ThreadWait]:
         """The threads that spent the most time off-CPU.
 
@@ -271,6 +348,11 @@ def _state_of(raw: str) -> str | None:
     return None
 
 
+def slice_code(state: str | None) -> int:
+    """The payload's code for a task state; the stopped states share one."""
+    return _SLICE_CODES.get(state, 4)
+
+
 def _switch_line(kv: str, fields: dict[str, str]) -> tuple[int | None, str | None]:
     """(pid, state) of a sched_switch payload, in either perf rendering."""
     positional = _SWITCH_POSITIONAL_RE.match(kv)
@@ -286,20 +368,33 @@ def _switch_line(kv: str, fields: dict[str, str]) -> tuple[int | None, str | Non
     return pid, _state_of(fields["prev_state"])
 
 
-def _attribute(thread: ThreadWait, state: str | None, seconds: float) -> None:
-    """Charge an off-CPU slice to the state its thread was switched out in."""
-    if seconds <= 0.0:
-        return
+def _charge(prof: WaitProfile, thread: ThreadWait, start: float, end: float,
+            state: str | None, seconds: float) -> None:
+    """Record one off-CPU slice, and let that slice carry the totals.
+
+    The slice *is* the ledger: the seconds and the switch counts are read back
+    off it, so a report that ships the slices to the browser and one that
+    renders the sums on the server cannot drift apart.
+    """
+    thread.slices.append((start, end, state))
     if state == "S":
         thread.sleep_s += seconds
+        thread.sleep_count += 1
     elif state == "D":
         thread.blocked_s += seconds
+        thread.blocked_count += 1
     elif state == "R":
         thread.runnable_s += seconds
+        thread.runnable_count += 1
+        thread.preempted += 1
+        prof.preempted_total += 1
     elif state is None:
         thread.unknown_s += seconds
     else:
         thread.stopped_s += seconds
+    if state in ("S", "D"):
+        band = _band(seconds * 1000.0)
+        prof.bands[band] = prof.bands.get(band, 0) + 1
 
 
 def _fold_thread(tid: int, series: list[_Event], comm: str, prof: WaitProfile,
@@ -312,7 +407,12 @@ def _fold_thread(tid: int, series: list[_Event], comm: str, prof: WaitProfile,
     thread = ThreadWait(tid=tid, comm=comm, exited_s=exit_ts)
     if not series:
         return thread
-    thread.span_s = max(0.0, series[-1].ts - series[0].ts)
+    thread.first_ts, thread.last_ts = series[0].ts, series[-1].ts
+    thread.span_s = max(0.0, thread.last_ts - thread.first_ts)
+    # the CPU the first accounting point earned, which the thread banked before
+    # its own first event and so outside its span: a reader's window has to be
+    # able to hold it, or the whole run would lose it
+    thread.lead_s = series[0].delta_s
 
     off_start: str | None = None      # state the current off-CPU slice began in
     previous: _Event | None = None
@@ -320,25 +420,30 @@ def _fold_thread(tid: int, series: list[_Event], comm: str, prof: WaitProfile,
         if previous is not None:
             # a thread can only be on-CPU between two of its own events, so the
             # delta is exactly its on-CPU share of the gap and the rest was off
-            off = max(0.0, (event.ts - previous.ts) - event.delta_s)
-            if off > 0.0 and off_start in ("S", "D"):
-                band = _band(off * 1000.0)
-                prof.bands[band] = prof.bands.get(band, 0) + 1
-            _attribute(thread, off_start, off)
+            gap = event.ts - previous.ts
+            off = gap - event.delta_s
+            if off < 0.0:
+                # the accounting says the thread earned more CPU than the wall
+                # clock leaves between the two points.  That is a few ns of
+                # timestamp skew per point, and the accounting is the one that
+                # matches task-clock, so the excess is kept as on-CPU time
+                # rather than turned into a wait the thread never had.
+                thread.skew_s -= off
+                off = 0.0
+            # the wait opens the gap: the thread was switched in for the delta
+            # at its end, so the off-CPU part starts the gap.  A gap that came
+            # out of the subtraction below the clock's own resolution is not a
+            # wait, and adding it back would not move the timestamp anyway.
+            start = previous.ts
+            end = start + off
+            if end > start:
+                _charge(prof, thread, start, end, off_start, off)
             off_start = None
         if event.state is not None:
             # the state a task is switched out in describes the wait that
             # follows it, up to the task's next accounting point
             prof.states_seen += 1
             off_start = event.state
-            if event.state == "S":
-                thread.sleep_count += 1
-            elif event.state == "D":
-                thread.blocked_count += 1
-            elif event.state == "R":
-                thread.runnable_count += 1
-                thread.preempted += 1
-                prof.preempted_total += 1
         thread.runtime_s += event.delta_s
         previous = event
     # a thread switched out at the last event we have never comes back inside
@@ -425,4 +530,4 @@ def parse_wait_script(text: str) -> WaitProfile:
 
 
 __all__ = ["WaitProfile", "ThreadWait", "parse_wait_script",
-           "TRACEPOINT_EVENTS", "WAIT_BANDS_MS"]
+           "TRACEPOINT_EVENTS", "WAIT_BANDS_MS", "SLICE_STATES", "slice_code"]

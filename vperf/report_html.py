@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from .flamegraph import MAX_FLAME_DEPTH, render_flame_svg
 from .memory import LATENCY_BANDS, MemSymbol, MemoryProfile, backend_label
-from .wait import WAIT_BANDS_MS, WaitProfile
+from .wait import WAIT_BANDS_MS, WaitProfile, slice_code
 from .metrics import (
     MetricsReport,
     all_hints,
@@ -853,8 +853,63 @@ function renderTree(){
  }
  body.innerHTML=out.join('');}
 
-/* ---- Threads: the CPU columns follow the selection, the scheduler's do not
-   (its tracepoints are counted once, over the whole window) ---- */
+/* ---- the scheduler's timeline, folded over the selection.
+
+   WAIT[tid] is one flat row: [firstUs, lastUs, leadUs, skewUs, then triples of
+   startUs, lenUs, state] - every time in microseconds from T0, so it is the
+   same clock the borders are drawn on.  On-CPU is not in there: the off-CPU
+   and stopped slices partition the thread's span, so whatever is left of the
+   part of it the window covers was on-CPU.  That is the identity the server
+   folds the whole run with, and it is why a window answers these columns
+   exactly rather than approximately.  A slice is charged by the share of it
+   inside the window, the rule the Memory tab's own slices already use.
+
+   WAIT is null when the profile's scheduler records do not cover the sample
+   window - a wait pass collected separately describes another run - and then
+   these columns stay whole-run, which the note under the table says. ---- */
+var WAIT_STATE={1:'sleep',2:'blocked',3:'runnable',4:'stopped'};
+
+function waitThread(tid,lo,hi){
+ var out={on:0,sleep:0,blocked:0,runnable:0,unknown:0,stopped:0,off:0,
+          sleep_count:0,blocked_count:0,runnable_count:0};
+ var r=WAIT[tid];
+ if(!r) return out;
+ var a=T0+r[0]/1e6,b=T0+r[1]/1e6;
+ if(b<=lo||a>=hi) return out;
+ for(var i=4;i<r.length;i+=3){
+  var start=T0+r[i]/1e6,len=r[i+1]/1e6,end=start+len,state=r[i+2];
+  if(len<=0||end<=lo||start>=hi) continue;
+  var share=(Math.min(end,hi)-Math.max(start,lo))/len;
+  out[WAIT_STATE[state]||'unknown']+=len*share;
+  if(state===1) out.sleep_count+=share;
+  else if(state===2) out.blocked_count+=share;
+  else if(state===3) out.runnable_count+=share;
+ }
+ var covered=Math.min(b,hi)-Math.max(a,lo);
+ out.off=out.sleep+out.blocked+out.runnable+out.unknown;
+ out.on=covered-out.off-out.stopped;
+ /* the CPU the thread's first point earned before its span opens, which the
+    whole run reaches back far enough to hold, and the CPU its own accounting
+    gives the gaps too little room for: on-CPU time no slice can carry */
+ if(lo<=a) out.on+=r[2]/1e6;        /* the lead: CPU earned before the span */
+ if(b>a) out.on+=(r[3]/1e6)*covered/(b-a);
+ return out;}
+
+function waitScope(lo,hi){
+ var out={on:0,sleep:0,blocked:0,runnable:0,unknown:0,stopped:0,off:0,threads:0};
+ if(!WAIT) return out;
+ var tids=scopeTids===null?Object.keys(WAIT):scopeTids;
+ for(var i=0;i<tids.length;i++){
+  var f=waitThread(+tids[i],lo,hi);
+  out.on+=f.on;out.sleep+=f.sleep;out.blocked+=f.blocked;out.runnable+=f.runnable;
+  out.unknown+=f.unknown;out.stopped+=f.stopped;out.off+=f.off;out.threads++;}
+ return out;}
+
+function fmtSec(v){
+ return v.toLocaleString(undefined,{minimumFractionDigits:3,maximumFractionDigits:3})+' s';}
+
+/* ---- Threads: the CPU columns and the wait columns both follow the selection.
+   The wait half needs no samples: it folds the scheduler's own timeline. ---- */
 function renderThreads(){
  var body=document.getElementById('threads-body');
  if(!body) return;
@@ -873,7 +928,55 @@ function renderThreads(){
   var pct=cells[i].parentNode?cells[i].parentNode.querySelector('.cpu-share'):null;
   if(pct){pct.textContent=share.toFixed(1)+'%';pct.dataset.v=share.toFixed(3);}
  }
-}
+ if(WAIT){
+  var lo=selStart(),hi=selEnd(),win=hi-lo,cache={},wait=body.querySelectorAll('td[data-w]');
+  for(i=0;i<wait.length;i++){
+   var cell=wait[i],id=+cell.dataset.tid,field=cell.dataset.w;
+   if(!cache[id]) cache[id]=waitThread(id,lo,hi);
+   var f=cache[id],value=0,text='';
+   switch(field){
+    case 'runtime': value=f.on;text=fmtSec(f.on);break;
+    case 'sleep': value=f.sleep;text=fmtSec(f.sleep);break;
+    case 'blocked': value=f.blocked;text=fmtSec(f.blocked);break;
+    case 'runnable': value=f.runnable;text=fmtSec(f.runnable);break;
+    case 'off': value=f.off;text=fmtSec(f.off);break;
+    case 'offpct':
+     value=win>0?f.off/win*100:0;
+     text='<span class=bar style="width:'+Math.min(value*1.2,100).toFixed(1)+'px"></span> '
+      +value.toFixed(1)+'%';break;
+    case 'preempted': value=f.runnable_count;text=Math.round(value).toLocaleString();break;
+    case 'sleeps': value=f.sleep_count;text=Math.round(value).toLocaleString();break;
+    case 'blocks': value=f.blocked_count;text=Math.round(value).toLocaleString();break;
+    default: continue;}
+   cell.innerHTML=text;
+   cell.dataset.v=field==='offpct'?value.toFixed(3):value;
+  }
+ }
+ renderWaitBar();}
+
+/* ---- the run-level bar: the scope's split of the window the reader picked ---- */
+function renderWaitBar(){
+ var head=document.getElementById('wait-head');
+ if(!head||!WAIT) return;
+ var lo=selStart(),hi=selEnd(),win=hi-lo;
+ if(win<=0) return;
+ var s=waitScope(lo,hi),total=s.on+s.off+s.stopped;
+ if(!(total>0)) return;
+ var parts=[['On-CPU',s.on,'#59d499'],['Sleep',s.sleep,'#c792ea'],
+            ['Blocked/IO',s.blocked,'#ff6f7d'],['Runnable',s.runnable,'#82aaff']];
+ if(s.unknown>0.005*total) parts.push(['Unclassified',s.unknown,'#666666']);
+ var segs='',legend='';
+ for(var i=0;i<parts.length;i++){
+  var name=parts[i][0],colour=parts[i][2],v=parts[i][1]/total*100;
+  if(v<=0) continue;
+  segs+='<div title="'+name+' '+v.toFixed(1)+'%" style="width:'+Math.min(v,100).toFixed(2)
+   +'%;background:'+colour+'"></div>';
+  legend+='<span style="color:'+colour+'">■</span>'+name+' '+v.toFixed(0)+'% ';}
+ document.getElementById('wait-bar').innerHTML=segs;
+ document.getElementById('wait-legend').innerHTML=legend;
+ head.textContent='Where the time went ('+scopeLabel()+', window '+win.toFixed(2)+'s, '
+  +(s.on/win).toFixed(1)+' cores busy, '
+  +total.toLocaleString(undefined,{maximumFractionDigits:1})+'s of thread time)';}
 
 /* ---- Overview: whole-run PMU counters, scoped per thread, never per time.
    perf only counts --per-thread over the whole run, so the panels say so as
@@ -1548,7 +1651,7 @@ def _hotspots_table(prof: StackProfile) -> str:
             f"<tbody>{''.join(rows)}</tbody></table>")
 
 
-def _wait_note(wp: WaitProfile | None) -> str:
+def _wait_note(wp: WaitProfile | None, foldable: bool) -> str:
     """One line telling the reader what the wait half of the table is made of."""
     if wp is not None and wp.window_s and wp.threads:
         unknown = wp.unknown_s
@@ -1556,16 +1659,66 @@ def _wait_note(wp: WaitProfile | None) -> str:
         if unknown > 0.01 * max(wp.off_cpu_s, 1e-9):
             note = (f" {unknown / wp.off_cpu_s * 100:.0f}% of the off-CPU time has no"
                     " recorded switch state and counts only as Off-CPU.")
+        if not foldable:
+            return ("On-CPU is the CPU time the scheduler charged a thread, and"
+                    " the wait columns are the time between its accounting"
+                    " points, split by the state it was switched out in: S is a"
+                    " futex/condition-variable or other voluntary sleep, D is"
+                    " uninterruptible (disk I/O and page-fault waits), R is"
+                    " run-queue wait after a preemption. Off-CPU is all three,"
+                    " so On-CPU + Off-CPU is the thread's whole observed"
+                    " window. These columns are whole-run:" + note)
         return ("On-CPU is the CPU time the scheduler charged a thread, and the"
                 " wait columns are the time between its accounting points,"
                 " split by the state it was switched out in: S is a"
                 " futex/condition-variable or other voluntary sleep, D is"
                 " uninterruptible (disk I/O and page-fault waits), R is"
                 " run-queue wait after a preemption. Off-CPU is all three, so"
-                " On-CPU + Off-CPU is the thread's whole observed window."
-                + note)
+                " On-CPU + Off-CPU is the thread's whole observed window — and"
+                " every one of them follows the time selection, because the"
+                " scheduler's own timeline is in the report to fold." + note)
     return ("Wait columns are n/a: scheduler tracepoints were not collected "
             "(see vperf doctor for the required capability).")
+
+
+def _wait_payload(wp: WaitProfile | None, t0: float, t1: float) -> dict | None:
+    """The per-thread off-CPU timeline the browser folds a window over.
+
+    Every time is integer microseconds from *t0* - the sample clock the
+    selection is drawn on.  A thread is a flat row:
+
+        [firstUs, lastUs, leadUs, skewUs, startUs, lenUs, state, ...]
+
+    where *leadUs* is the CPU its first accounting point earned before that
+    point (outside the span, but inside a window that starts earlier), *skewUs*
+    is the CPU its own accounting gives a gap too little room for, and each
+    triple is one off-CPU slice with the state the thread was switched out in.
+    On-CPU is not shipped: it is what is left of the covered span once the
+    slices have taken their share, which is the same identity the server folds
+    the whole run with.
+    """
+    if wp is None or not wp.threads or not wp.window_s:
+        return None
+    window = wp.wait_window()
+    if window is None or window[1] <= t0 or window[0] >= t1:
+        # a wait pass collected separately describes another run of the target
+        return None
+    payload: dict[str, list[int]] = {}
+    for tid, thread in wp.threads.items():
+        if thread.first_ts is None:
+            continue
+        row = [int(round((thread.first_ts - t0) * 1e6)),
+               int(round((thread.last_ts - t0) * 1e6)),
+               int(round(thread.lead_s * 1e6)),
+               int(round(thread.skew_s * 1e6))]
+        for start, end, state in thread.slices:
+            # the length, and computed from the rounded ends so the browser's
+            # start + length is exactly the end this slice has here
+            begin = int(round((start - t0) * 1e6))
+            row += [begin, int(round((end - t0) * 1e6)) - begin,
+                    slice_code(state)]
+        payload[str(tid)] = row
+    return payload or None
 
 
 def _threads_table(prof: StackProfile, wp: WaitProfile | None = None) -> str:
@@ -1594,9 +1747,12 @@ def _threads_table(prof: StackProfile, wp: WaitProfile | None = None) -> str:
         sampled = cpu[tid].cycles if tid in cpu else 0.0
         return (1, sampled, observed(tid)) if sampled else (0, 0.0, observed(tid))
 
-    def wait_cell(body: str, sort_value: float | int | None = None) -> str:
+    def wait_cell(tid: int, field: str, body: str,
+                  sort_value: float | int | None = None) -> str:
+        # data-w names the field and data-tid the thread, so the browser can
+        # rewrite the cell for the selection without knowing the table's shape
         v = "" if sort_value is None else f" data-v='{sort_value}'"
-        return f"<td{v}>{body}</td>"
+        return f"<td data-tid='{tid}' data-w='{field}'{v}>{body}</td>"
 
     na = "<td class='na'>n/a</td>"
 
@@ -1619,16 +1775,23 @@ def _threads_table(prof: StackProfile, wp: WaitProfile | None = None) -> str:
             off_pct = off / window * 100 if window else 0.0
             bar = min(off_pct * 1.2, 100)
             cells += [
-                wait_cell(f"{t_wait.runtime_s:,.3f} s", f"{t_wait.runtime_s:.6f}"),
-                wait_cell(f"{t_wait.sleep_s:,.3f} s", f"{t_wait.sleep_s:.6f}"),
-                wait_cell(f"{t_wait.blocked_s:,.3f} s", f"{t_wait.blocked_s:.6f}"),
-                wait_cell(f"{t_wait.runnable_s:,.3f} s", f"{t_wait.runnable_s:.6f}"),
-                wait_cell(f"{off:,.3f} s", f"{off:.6f}"),
-                wait_cell(f"<span class='bar' style='width:{bar:.1f}px'></span> "
+                wait_cell(tid, "runtime", f"{t_wait.runtime_s:,.3f} s",
+                          f"{t_wait.runtime_s:.6f}"),
+                wait_cell(tid, "sleep", f"{t_wait.sleep_s:,.3f} s",
+                          f"{t_wait.sleep_s:.6f}"),
+                wait_cell(tid, "blocked", f"{t_wait.blocked_s:,.3f} s",
+                          f"{t_wait.blocked_s:.6f}"),
+                wait_cell(tid, "runnable", f"{t_wait.runnable_s:,.3f} s",
+                          f"{t_wait.runnable_s:.6f}"),
+                wait_cell(tid, "off", f"{off:,.3f} s", f"{off:.6f}"),
+                wait_cell(tid, "offpct",
+                          f"<span class='bar' style='width:{bar:.1f}px'></span> "
                           f"{off_pct:.1f}%", f"{off_pct:.3f}"),
-                wait_cell(f"{t_wait.preempted:,}", t_wait.preempted),
-                wait_cell(f"{t_wait.sleep_count:,}", t_wait.sleep_count),
-                wait_cell(f"{t_wait.blocked_count:,}", t_wait.blocked_count),
+                wait_cell(tid, "preempted", f"{t_wait.preempted:,}", t_wait.preempted),
+                wait_cell(tid, "sleeps", f"{t_wait.sleep_count:,}",
+                          t_wait.sleep_count),
+                wait_cell(tid, "blocks", f"{t_wait.blocked_count:,}",
+                          t_wait.blocked_count),
             ]
         else:
             # the sampler saw this thread but the scheduler recorded nothing
@@ -1910,8 +2073,10 @@ def _memory_html_map(mem: MemoryProfile | None, backend: str | None = "ibs",
 def _wait_panels(wp: WaitProfile | None) -> str:
     """Run-level wait content: where the thread time went and the delay spread.
 
-    Per-thread wait data lives in the merged Threads table, so this is only
-    the aggregate view. Returns '' when the tracepoints were not collected.
+    The bar follows the thread scope and the time selection, so the browser
+    rewrites it; the delay bands are whole-run and say so while a selection is
+    active. Per-thread wait data lives in the merged Threads table, so this is
+    only the aggregate view. Returns '' when the tracepoints were not collected.
     """
     if wp is None or wp.window_s is None or not wp.threads:
         return ""
@@ -1941,12 +2106,14 @@ def _wait_panels(wp: WaitProfile | None) -> str:
                 f"<tbody>{rows}</tbody></table>")
 
     bands = [(nm, wp.bands.get(nm, 0)) for nm, _lo, _hi in WAIT_BANDS_MS]
-    heading = (f"Where the thread time went (window {wp.window_s:.2f}s, "
+    heading = (f"Where the time went (all threads, window {wp.window_s:.2f}s, "
                f"{wp.util_cores or 0.0:.1f} cores busy, {total:,.1f}s of thread time)")
-    return f'''<div class="panel"><h3>{heading}</h3>
-<div style="display:flex;height:22px;border-radius:5px;overflow:hidden;margin-bottom:8px">{segs}</div>
-<div style="font-size:12px;color:var(--dim)">{legend}</div></div>
-<div class="panel"><h3>Sleep/block delay distribution</h3>{bars(bands)}</div>'''
+    return f'''<div class="panel"><h3 id="wait-head">{heading}</h3>
+<div id="wait-bar" style="display:flex;height:22px;border-radius:5px;overflow:hidden;margin-bottom:8px">{segs}</div>
+<div id="wait-legend" style="font-size:12px;color:var(--dim)">{legend}</div></div>
+<div class="panel"><h3>Sleep/block delay distribution</h3>{bars(bands)}
+<span class="whole-run-note">the delay bands are whole-run: they count the waits
+that started, and a wait is not cut in half by a selection the way a second is.</span></div>'''
 
 
 def _thread_options(prof: StackProfile, mem: MemoryProfile | None = None,
@@ -2202,6 +2369,14 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
         {tid: seconds for tid, seconds in thread_cpu.items() if seconds},
         separators=(",", ":")).replace("</", "<\\/")
 
+    # ---- the scheduler's own timeline, so the wait half folds a window too ----
+    # The counter panels cannot: perf counts --per-thread once. This is not a
+    # counter, it is a per-thread off-CPU timeline on the sample clock, and a
+    # window is a range on that clock.
+    wait_payload = _wait_payload(wp, t0, t1)
+    wait_json = json.dumps(wait_payload, separators=(",", ":")).replace(
+        "</", "<\\/") if wait_payload else "null"
+
     # ---- thread list for selector -------------------------------------------
     thread_opts = _thread_options(prof, group_mem, thread_metrics)
     group_opts = _group_options(groups, prof)
@@ -2300,9 +2475,7 @@ rows too thin to read, and anything past {MAX_FLAME_DEPTH} rows, fold into the l
 <div id="threads" class="page">
 {_wait_panels(wp)}
 <div class="panel"><h3>Threads — CPU samples and wait time</h3>
-<div class="note" style="margin-bottom:8px">{_wait_note(wp)}
-<span class="whole-run-note">the wait columns are whole-run: scheduler tracepoints are not
-re-sliced per time selection.</span></div>
+<div class="note" style="margin-bottom:8px">{_wait_note(wp, wait_payload is not None)}</div>
 <div id="threads-body">{_threads_table(prof, wp)}</div></div>
 </div>
 
@@ -2317,6 +2490,7 @@ MEM_SLICES={mem_slices_json};MEM_Q={mem_q};MEM_TRUNC={mem_trunc};
 MEMORY_HTML={memory_json};OVERVIEW_HTML={overview_json};
 THREAD_GROUPS={groups_json};THREAD_OPTS={thread_opts_js};GROUP_OPTS={group_opts_js};
 THREAD_CPU={thread_cpu_json};
+WAIT={wait_json};
 T0={t0};TSPAN={tspan};NCPU={ncpu};TOTAL_CYCLES={prof.total_cycles};CPU_TIME={m.cpu_time or 0};
 MAX_FLAME_DEPTH={MAX_FLAME_DEPTH};MEM_LEVELS={mem_levels_json};MEM_BANDS={mem_bands_json};
 </script>

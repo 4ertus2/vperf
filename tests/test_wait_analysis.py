@@ -106,9 +106,13 @@ class TestParseUnit:
         wp = parse_wait_script(L_RUN_SLEEP_RUN_BLOCK)
         t = wp.threads[4242]
         assert t.sleep_s == pytest.approx(0.6)      # 0.8 s gap, 0.2 s of it on-CPU
-        assert t.sleep_count == 2                   # the last one never comes back
+        assert t.sleep_count == 1
         assert t.runtime_s == pytest.approx(0.9)
         assert t.off_cpu_s == pytest.approx(0.8)
+        # the counts come off the slices, so a switch-out whose wait the window
+        # never showed (the last one, above) is not counted: a switch that cost
+        # no time is not what the column is about
+        assert t.preempted == 0
 
     def test_blocked_state_is_charged_to_dstate(self):
         wp = parse_wait_script(L_RUN_SLEEP_RUN_BLOCK)
@@ -143,18 +147,19 @@ class TestParseUnit:
         assert t.runnable_count == 1
         assert t.preempted == 1
         assert wp.preempted_total == 1
-        assert t.sleep_count == 1
+        # the S switch-out is the thread's last event: no slice, no count
+        assert t.sleep_count == 0
 
     def test_key_value_switch_is_understood_too(self):
         # prev_state printed as raw task-state bits: 0 runnable, 2 uninterruptible
         runnable = parse_wait_script(ops((100.0, 0.3, 0), (100.9, 0.1, 0),
                                          kv=True)).threads[4242]
         assert runnable.runnable_s == pytest.approx(0.8)
-        assert runnable.preempted == 2
+        assert runnable.preempted == 1
         blocked = parse_wait_script(ops((100.0, 0.3, 2), (100.9, 0.1, 2),
                                         kv=True)).threads[4242]
         assert blocked.blocked_s == pytest.approx(0.8)
-        assert blocked.blocked_count == 2
+        assert blocked.blocked_count == 1
 
     def test_comm_with_spaces_still_parses(self):
         # perf prints next_comm verbatim, and a C++ thread name has spaces in it
@@ -248,6 +253,107 @@ class TestParseUnit:
             "perf-exec 1234/1234 [001] 5.000000: task:task_newtask: x=1\n")
         assert wp.events_parsed == 0
         assert wp.threads == {}
+
+
+class TestFold:
+    """The window fold the report ships to the browser, in Python.
+
+    The browser has the same arithmetic in JS and there is no engine in this
+    suite to run it, so the reference lives here: the parser's own sums are
+    what it is checked against, at the whole window and inside one.
+    """
+
+    def test_the_whole_window_reproduces_the_ledger_exactly(self):
+        wp = parse_wait_script(L_RUN_SLEEP_RUN_BLOCK)
+        lo, hi = wp.wait_window()
+        folded = wp.fold(lo, hi)
+        for key, attr in (("on", "runtime_s"), ("sleep", "sleep_s"),
+                          ("blocked", "blocked_s"), ("runnable", "runnable_s"),
+                          ("off", "off_cpu_s"), ("sleep_count", "sleep_count"),
+                          ("blocked_count", "blocked_count"),
+                          ("runnable_count", "runnable_count")):
+            server = sum(getattr(t, attr) for t in wp.threads.values())
+            assert folded[key] == pytest.approx(server, abs=1e-9), key
+
+    def test_a_window_answers_the_columns(self):
+        # 0.4 s blocked, 0.1 s blocked, 0.1 s asleep, then 0.4 s of CPU
+        wp = parse_wait_script(ops((100.0, 0.3, "D"), (100.5, 0.1, "D"),
+                                   (100.7, 0.1, "S"), (101.0, 0.2, "S")))
+        lo, hi = wp.wait_window()
+        assert wp.fold(lo, hi)["blocked"] == pytest.approx(0.5)
+        # both windows open after the thread's first point, so neither holds
+        # the lead: inside the span, On-CPU + Off-CPU is the window
+        early = wp.fold(100.05, 100.6)      # most of the first D slice, all of the second
+        late = wp.fold(100.6, 100.95)       # the S slice and the CPU around it
+        assert early["blocked"] == pytest.approx(0.45)
+        assert early["sleep"] == pytest.approx(0.0)
+        assert late["blocked"] == pytest.approx(0.0)
+        assert late["sleep"] == pytest.approx(0.1)
+        assert early["on"] == pytest.approx(0.1)
+        assert late["on"] == pytest.approx(0.25)
+        assert early["on"] + early["off"] == pytest.approx(0.55)
+        assert late["on"] + late["off"] == pytest.approx(0.35)
+        # a count is pro-rated by the same share, so a wait that straddles the
+        # edge of a selection is neither all of it nor none of it
+        assert early["blocked_count"] == pytest.approx(1.875)
+        assert late["blocked_count"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_a_slice_is_charged_by_the_share_inside_the_window(self):
+        # a 0.3 s wait then a 0.4 s wait, and a window over the first of them
+        wp = parse_wait_script(ops((100.0, 0.3, "S"), (100.8, 0.5, "S"),
+                                   (101.3, 0.1, "S")))
+        whole = wp.fold(100.0, 101.3)
+        assert whole["sleep"] == pytest.approx(0.7)
+        assert whole["on"] == pytest.approx(0.9)      # the deltas, and the lead
+        part = wp.fold(100.1, 100.6)                 # 0.2 s of the wait, 0.3 s of CPU
+        assert part["sleep"] == pytest.approx(0.2)
+        assert part["off"] == pytest.approx(0.2)
+        assert part["on"] == pytest.approx(0.3)
+        assert part["on"] + part["off"] == pytest.approx(0.5)
+        # a count is pro-rated the same way, so a wait that straddles the edge
+        # of a selection is neither all of it nor none of it
+        assert wp.fold(100.0, 101.3)["sleep_count"] == 2.0
+        assert part["sleep_count"] == pytest.approx(2 / 3)
+
+    def test_a_thread_outside_the_window_is_zero_not_missing(self):
+        wp = parse_wait_script(ops((100.0, 0.3, "S"), (100.5, 0.2, "S")))
+        lo, hi = wp.wait_window()
+        late = wp.fold(hi, hi + 1.0)
+        assert late["on"] == 0.0
+        assert late["off"] == 0.0
+        assert late["sleep_count"] == 0.0
+
+    def test_a_scope_folds_to_its_own_threads(self):
+        text = "\n".join([
+            ops((100.0, 0.3, "S"), (100.5, 0.1, "S")),
+            ops((100.0, 0.2, "D"), (100.5, 0.1, "D"), pid=5555, comm="other")])
+        wp = parse_wait_script(text)
+        lo, hi = wp.wait_window()
+        one = wp.fold(lo, hi, tids=[4242])
+        assert one["sleep"] == pytest.approx(0.4)
+        assert one["blocked"] == 0.0
+        assert one["threads"] == 1
+        assert wp.fold(lo, hi)["blocked"] == pytest.approx(0.4)
+        assert wp.fold(lo, hi)["sleep"] == pytest.approx(0.4)
+
+    def test_the_slices_place_the_wait_at_the_start_of_its_gap(self):
+        """The delta is the CPU earned at the *end* of a gap, so the wait opens
+        it: a slice that covered the whole gap would hand the browser on-CPU
+        time the scheduler charged as a wait, and the fold would over-report
+        Off-CPU by every delta on the table."""
+        wp = parse_wait_script(ops((100.0, 0.3, "S"), (100.8, 0.2, "S")))
+        thread = wp.threads[4242]
+        start, end, state = thread.slices[0]
+        assert state == "S"
+        assert start == pytest.approx(100.0)
+        # the 0.8 s gap less the 0.2 s the next point earned at its end
+        assert end - start == pytest.approx(0.6)
+        assert thread.fold(100.0, 100.8)["sleep"] == pytest.approx(0.6)
+        # ... so only 0.2 s of that gap was on-CPU, and the 0.3 s the first
+        # point earned is the lead, outside the gap
+        assert thread.fold(100.0 + 1e-6, 100.8)["on"] == pytest.approx(0.2, abs=1e-6)
+        assert thread.fold(100.0, 100.8)["on"] == pytest.approx(0.5, abs=1e-6)
+        assert thread.lead_s == pytest.approx(0.3)
 
 
 # --------------------------------------------------- integration (caps)

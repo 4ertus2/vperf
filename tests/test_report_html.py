@@ -1,5 +1,7 @@
 import json
 import re
+
+import pytest
 from dataclasses import asdict
 
 from vperf.flamegraph import MAX_FLAME_DEPTH
@@ -20,6 +22,7 @@ from vperf.report_html import (
     _thread_groups,
     _ThreadGroup,
     _threads_table,
+    _wait_payload,
     build_html,
 )
 from vperf.stacks import StackProfile, ThreadInfo, build_profile
@@ -753,13 +756,36 @@ def _cpu_samples():
     ]
 
 
-def _wait_profile() -> WaitProfile:
+def _wait_profile(t0: float = 1.0) -> WaitProfile:
+    """A wait profile whose slices explain its own totals, on the sample clock.
+
+    Built the way the parser builds one - span, slices, then the sums the slices
+    imply - so the payload the report ships and the numbers it renders are the
+    same numbers the fold has to reproduce.  101 is a worker that runs most of
+    its 1.3 s and waits in three different states; 999 the sampler never saw.
+    """
     wp = WaitProfile(window_s=2.0)
-    wp.threads[101] = ThreadWait(tid=101, comm="worker", runtime_s=0.9, sleep_s=0.4,
-                                 blocked_s=0.02, runnable_s=0.01, sleep_count=12,
-                                 blocked_count=3, runnable_count=7, preempted=7)
-    # a thread the sampler never saw, but the scheduler did
-    wp.threads[999] = ThreadWait(tid=999, comm="ghost", sleep_s=1.2, sleep_count=3)
+    worker = ThreadWait(tid=101, comm="worker",
+                        slices=[(t0 + 0.30, t0 + 0.70, "S"),
+                                (t0 + 0.80, t0 + 0.82, "D"),
+                                (t0 + 0.90, t0 + 0.91, "R")],
+                        first_ts=t0, last_ts=t0 + 1.3, lead_s=0.0003,
+                        sleep_count=1, blocked_count=1, runnable_count=1,
+                        preempted=1)
+    worker.span_s = worker.last_ts - worker.first_ts
+    worker.sleep_s = 0.40
+    worker.blocked_s = 0.02
+    worker.runnable_s = 0.01
+    worker.runtime_s = worker.span_s - worker.off_cpu_s + worker.lead_s
+    ghost = ThreadWait(tid=999, comm="ghost",
+                       slices=[(t0 + 0.5, t0 + 1.7, "S")],
+                       first_ts=t0, last_ts=t0 + 1.7, skew_s=0.0002,
+                       sleep_count=1)
+    ghost.span_s = ghost.last_ts - ghost.first_ts
+    ghost.sleep_s = 1.2
+    ghost.runtime_s = ghost.span_s - ghost.off_cpu_s + ghost.skew_s
+    wp.threads[101] = worker
+    wp.threads[999] = ghost
     return wp
 
 
@@ -781,8 +807,8 @@ def test_threads_table_merges_cpu_and_wait_columns():
                     "Preempted", "Sleeps", "Blocks"):
         assert f">{heading}</th>" in html
     # worker: sleep 0.4 + blocked 0.02 + runnable 0.01 = 0.43 off-CPU, which
-    # is 21.5% of the 2.0s window - and of its 1.33s it is on screen
-    assert "0.900 s" in html
+    # is 21.5% of the 2.0s window; the other 0.87 of its 1.3s was on-CPU
+    assert "0.870 s" in html
     assert "0.400 s" in html
     assert "0.020 s" in html
     assert "0.010 s" in html
@@ -832,12 +858,13 @@ def test_wait_tab_is_folded_into_the_threads_tab():
     # the run-level wait content moved into the same page, and it leads it: the
     # graphics come first here as they do in every other tab, and the per-thread
     # table, with the note explaining its own wait columns, is last
-    assert "Where the thread time went" in page
+    assert "Where the time went (all threads, window" in page
     assert "Sleep/block delay distribution" in page
     table_at = page.index("Threads — CPU samples and wait time")
-    assert page.index("Where the thread time went") < table_at
+    assert page.index("Where the time went") < table_at
     assert page.index("Sleep/block delay distribution") < table_at
     assert page.index("On-CPU is the CPU time the scheduler charged") > table_at
+    assert page.index("follows the time selection") > table_at
 
 
 def test_threads_page_explains_missing_wait_data():
@@ -848,7 +875,7 @@ def test_threads_page_explains_missing_wait_data():
     page = _threads_page(html)
 
     assert "Wait columns are n/a: scheduler tracepoints were not collected" in page
-    assert "Where the thread time went" not in page
+    assert "Where the time went" not in page
 
 
 def test_threads_table_nas_a_thread_the_scheduler_never_saw():
@@ -866,7 +893,7 @@ def test_threads_table_nas_a_thread_the_scheduler_never_saw():
     assert io_row.count(">n/a<") == 9
     assert "<td></td>" not in html  # never a silently blank cell
     # the thread that does have wait data is unaffected
-    assert "0.900 s" in html
+    assert "0.870 s" in html
 
 
 # ---------------------------------------------------------------------------
@@ -1115,19 +1142,132 @@ def test_the_overview_says_it_is_whole_run_while_a_selection_is_active():
     assert "function renderBadges()" in _JS
 
 
-def test_the_threads_table_marks_the_wait_columns_whole_run():
+def test_the_wait_columns_follow_the_selection():
+    """The wait half is not a counter: it is the scheduler's own timeline, so a
+    range on the chart is a range on it.  The counter panels cannot do this - see
+    the Overview test - and that is why the payload ships the slices."""
     samples = _cpu_samples()
     prof = build_profile(samples)
     html = build_html({"target": {"cmd": ["app"]}, "mode": "run"}, samples,
                       MetricsReport(elapsed=2.0), prof, wp=_wait_profile())
 
-    # the CPU columns carry the tid the browser folds for; the wait columns do
-    # not, because scheduler tracepoints are not re-sliced per selection
+    # both halves of the table name the thread and the field they report, so
+    # one pass in the browser rewrites either
     assert "class='mono cpu-cycles'" in html
     assert "class='cpu-share'" in html
     assert "data-tid='101'" in html
-    assert "the wait columns are whole-run" in html
+    for field in ("runtime", "sleep", "blocked", "runnable", "off", "offpct",
+                  "preempted", "sleeps", "blocks"):
+        assert f"data-w='{field}'" in html
+    assert "the wait columns are whole-run" not in html
+    # the fold itself, and the loop that writes the cells
+    assert "function waitThread(tid,lo,hi)" in _JS
+    assert "var share=(Math.min(end,hi)-Math.max(start,lo))/len" in _JS
+    assert "body.querySelectorAll('td[data-w]')" in _JS
     assert "body.querySelectorAll('.cpu-cycles')" in _JS
+
+
+def test_the_run_level_wait_bar_follows_the_scope_and_the_window():
+    html = _threads_page(build_html(
+        {"target": {"cmd": ["app"]}, "mode": "run"}, _cpu_samples(),
+        MetricsReport(elapsed=2.0), build_profile(_cpu_samples()),
+        wp=_wait_profile()))
+
+    # the bar is the scope's split of the window, and says which
+    assert 'id="wait-head"' in html and 'id="wait-bar"' in html
+    assert 'id="wait-legend"' in html
+    assert "Where the time went (all threads, window" in html
+    assert "function renderWaitBar()" in _JS
+    assert "var tids=scopeTids===null?Object.keys(WAIT):scopeTids" in _JS
+    assert "renderWaitBar();" in _JS
+    # the delay bands count the waits that started, so they stay whole-run and
+    # say so while a selection is up
+    assert "Sleep/block delay distribution" in html
+    assert "the delay bands are whole-run" in html
+
+
+def test_the_wait_payload_is_the_timeline_the_browser_folds():
+    wp = _wait_profile()
+    payload = _wait_payload(wp, 1.0, 3.0)
+
+    assert payload is not None
+    row = payload["101"]
+    # first, last, lead, skew, then (start, len, state) per slice
+    assert row[:4] == [0, 1_300_000, 300, 0]
+    assert row[4:] == [300_000, 400_000, 1,         # 0.4 s asleep, state S
+                       800_000, 20_000, 2,          # 0.02 s blocked, state D
+                       900_000, 10_000, 3]          # 0.01 s run-queue, state R
+    assert payload["999"][4:] == [500_000, 1_200_000, 1]   # a length, not an end
+    assert "WAIT=" in build_html({"target": {"cmd": ["app"]}, "mode": "run"},
+                                _cpu_samples(), MetricsReport(elapsed=2.0),
+                                build_profile(_cpu_samples()), wp=wp)
+
+
+_WAIT_OFF_CODES = (0, 1, 2, 3)            # unattributed, S, D, R
+
+
+def _payload_off_cpu(row, lo: float, hi: float, want: int = 1) -> float:
+    """Seconds of one payload state inside [lo, hi) - the reference fold the
+    browser does in JS, with no engine in this suite to run it."""
+    total = 0.0
+    for i in range(4, len(row), 3):
+        start, length, code = row[i] / 1e6, row[i + 1] / 1e6, row[i + 2]
+        if code != want:
+            continue
+        end = start + length
+        if end <= lo or start >= hi:
+            continue
+        total += (min(end, hi) - max(start, lo)) / length * length
+    return total
+
+
+def test_a_folded_whole_window_reproduces_the_rendered_cells():
+    """At the whole window the fold has to land on the numbers the server
+    rendered, or dragging the borders away and back would shift the table."""
+    wp = _wait_profile()
+    payload = _wait_payload(wp, 1.0, 3.0)
+    html = _threads_table(build_profile(_cpu_samples()), wp)
+
+    for tid, thread in wp.threads.items():
+        row = payload[str(tid)]
+        covered = (row[1] - row[0]) / 1e6
+        off = sum(_payload_off_cpu(row, 0.0, covered, code)
+                  for code in _WAIT_OFF_CODES)
+        skew = row[3] / 1e6 * (covered / covered)
+        assert (covered - off + row[2] / 1e6 + skew
+                == pytest.approx(thread.runtime_s)), tid
+        assert off == pytest.approx(thread.off_cpu_s), tid
+        # and those are the numbers the reader sees
+        assert f"{thread.runtime_s:,.3f} s" in html
+        assert f"{thread.off_cpu_s:,.3f} s" in html
+
+    # a window over the sleep holds all of it, one before it holds none, and
+    # one over the middle of it holds a part
+    row = payload["101"]
+    assert _payload_off_cpu(row, 0.30, 0.70) == pytest.approx(0.4)
+    assert _payload_off_cpu(row, 0.0, 0.3) == pytest.approx(0.0)
+    assert _payload_off_cpu(row, 0.40, 0.50) == pytest.approx(0.1)
+    assert _payload_off_cpu(row, 0.80, 0.82, 2) == pytest.approx(0.02)
+
+
+def test_a_wait_pass_that_does_not_cover_the_window_keeps_the_columns_whole_run():
+    """A separately collected wait pass describes another run of the target, so
+    there is nothing to fold against the sample timeline - the same fallback the
+    Memory tab takes when it has no per-slice rows.  Without a payload the
+    columns keep the server's whole-run numbers and the note says so."""
+    wp = _wait_profile()
+    assert _wait_payload(wp, 5000.0, 5002.0) is None
+
+    # samples at 5000 s, scheduler records around 1 s: no overlap
+    late = [ScriptSample("worker", 100, 101, 5000.0, 10, "cycles:P",
+                         [("alpha", "app")])]
+    html = build_html({"target": {"cmd": ["app"]}, "mode": "run"}, late,
+                      MetricsReport(elapsed=2.0), build_profile(late), wp=wp)
+    assert "WAIT=null" in html
+    assert "These columns are whole-run" in html
+    # the browser leaves them alone when there is no timeline to fold
+    assert "if(WAIT){" in _JS
+    assert "if(!head||!WAIT) return;" in _JS
 
 
 def test_a_thread_or_group_timeline_is_capped_at_its_own_ceiling():
