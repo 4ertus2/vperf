@@ -49,7 +49,10 @@ CPU analyses on amd64 machine (AMD and Intel), with zero Python dependencies:
   thread's whole observed window, and the "where the time went" bar splits
   the same way. All of it follows the time selection, and the bar follows the
   thread selector too (see [Time selection](#time-selection) and
-  [Wait / off-CPU analysis](#wait--off-cpu-analysis)).
+  [Wait / off-CPU analysis](#wait--off-cpu-analysis)). Every column heading
+  carries a `?` that says what that column measures — hover it, or tab to it —
+  so the definitions sit on the columns they define rather than in a paragraph
+  above the table that has to be re-read on every report.
 
 Artifacts (`stat.csv` or `stat_threads.csv`, `perf.data`, `script.txt`,
 `mem_report.txt`, `freq.json`, `rss.json`, `meta.json`) are kept in the profile
@@ -143,7 +146,9 @@ are simply not built on some kernels: on 7.0.0-34-generic `perf list` names
 all four and then none of them ever fires (0 events system-wide while
 `sched_switch` counts ~12k/s), which is exactly how the Sleep and Blocked/IO
 columns used to come out permanently zero. `prev_state` is the state that
-cannot go missing, so it is the only source the report reads. It is read from
+cannot go missing, so it is the only source the report reads. The report puts
+these definitions on the columns themselves, one `?` per heading on the
+Threads tab, so a table can be read without this section. It is read from
 both renderings of the event — the positional `comm:pid [prio] STATE ==>
 comm:pid [prio]` that `perf script` prints, and the `prev_pid=`/`prev_state=`
 field form older perf produced.

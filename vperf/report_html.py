@@ -109,6 +109,20 @@ font-size:12px}
 .whole-run-note{display:none}
 body.sel-active .whole-run-note{display:inline-block;margin-top:6px;
  border-left:3px solid var(--warn);padding:4px 10px;color:var(--dim);font-size:12px}
+/* A column's meaning belongs to the column: the `?` next to its heading opens
+   it.  One shared element, positioned fixed, because the panel the table sits
+   in scrolls and would clip anything absolute. */
+th.plain{cursor:default}
+th.plain:hover{color:var(--dim)}
+.q{display:inline-block;width:13px;height:13px;line-height:12px;text-align:center;
+ border-radius:50%;background:#2c3852;color:var(--dim);font-size:10px;font-weight:700;
+ cursor:help;margin-left:5px;vertical-align:1px;user-select:none}
+.q:hover,.q:focus{background:var(--accent);color:#08111c;outline:none}
+#help-pop{position:fixed;z-index:60;max-width:320px;padding:9px 11px;border-radius:7px;
+ background:#111927;border:1px solid #2c3d58;color:var(--fg);font-size:12px;
+ line-height:1.45;box-shadow:0 8px 24px rgba(0,0,0,.55);pointer-events:none;
+ opacity:0;visibility:hidden;transition:opacity .12s ease}
+#help-pop.on{opacity:1;visibility:visible}
 .drag-handle::after{content:'';position:absolute;top:0;left:4px;width:4px;height:100%;background:var(--accent);border-radius:2px;opacity:0.7}
 .drag-handle:hover::after{opacity:1}
 .drag-overlay{position:absolute;top:0;height:100%;background:rgba(64,156,255,0.08);pointer-events:none;z-index:5}
@@ -908,6 +922,50 @@ function waitScope(lo,hi){
 function fmtSec(v){
  return v.toLocaleString(undefined,{minimumFractionDigits:3,maximumFractionDigits:3})+' s';}
 
+/* ---- a column heading's popup.  One element for the whole report: hovering
+   any `?` in a heading fills it with that cell's data-help and parks it above
+   the marker, or below it when the heading is near the top of the window. ---- */
+var helpEl=null;
+
+function helpPop(){
+ if(!helpEl){
+  helpEl=document.createElement('div');
+  helpEl.id='help-pop';
+  document.body.appendChild(helpEl);}
+ return helpEl;}
+
+function showHelp(elm,pending){
+ if(pending){clearTimeout(pending);pending=null;}
+ var th=elm.closest?elm.closest('th[data-help]'):null;
+ var text=th?th.getAttribute('data-help'):null;
+ var pop=helpPop();
+ if(!text){pop.classList.remove('on');return;}
+ pop.textContent=text;
+ pop.classList.add('on');
+ var r=elm.getBoundingClientRect(),w=pop.offsetWidth,h=pop.offsetHeight;
+ var left=Math.min(Math.max(8,r.left+r.width/2-w/2),window.innerWidth-w-8);
+ var top=r.top-h-9;
+ pop.style.left=left+'px';
+ pop.style.top=(top<8?r.bottom+9:top)+'px';}
+
+function hideHelp(){if(helpEl) helpEl.classList.remove('on');}
+
+function initHelp(){
+ var pending=null;
+ /* delegated, so a table rebuilt by renderThreads keeps its popups: the
+    headings are server-rendered once and the body pass never touches them */
+ document.addEventListener('mouseover',function(e){
+  var q=e.target.closest?e.target.closest('.q'):null;
+  if(q) showHelp(q,pending);else if(!pending) hideHelp();});
+ document.addEventListener('mouseout',function(e){
+  var q=e.target.closest?e.target.closest('.q'):null;
+  if(q){clearTimeout(pending);pending=setTimeout(hideHelp,120);}});
+ document.addEventListener('focusin',function(e){
+  if(e.target.closest&&e.target.closest('.q')) showHelp(e.target,pending);});
+ document.addEventListener('focusout',function(e){
+  if(e.target.closest&&e.target.closest('.q')) hideHelp();});
+ window.addEventListener('scroll',hideHelp,true);}
+
 /* ---- Threads: the CPU columns and the wait columns both follow the selection.
    The wait half needs no samples: it folds the scheduler's own timeline. ---- */
 function renderThreads(){
@@ -1398,6 +1456,7 @@ function onResize(){
 function init(){
  setScopeTids('');
  initSelection();
+ initHelp();
  window.addEventListener('resize',onResize);
  renderScoped();
  firstPaint=false;}
@@ -1652,7 +1711,13 @@ def _hotspots_table(prof: StackProfile) -> str:
 
 
 def _wait_note(wp: WaitProfile | None, foldable: bool) -> str:
-    """One line telling the reader what the wait half of the table is made of."""
+    """One line over the table; the per-column detail is a popup on each header.
+
+    A paragraph explaining fourteen columns is a paragraph nobody reads, and it
+    says the same thing the column it belongs to should say - so the table
+    carries a `?` per header and the note here only says what the two halves
+    are and what is left out.
+    """
     if wp is not None and wp.window_s and wp.threads:
         unknown = wp.unknown_s
         note = ""
@@ -1660,23 +1725,14 @@ def _wait_note(wp: WaitProfile | None, foldable: bool) -> str:
             note = (f" {unknown / wp.off_cpu_s * 100:.0f}% of the off-CPU time has no"
                     " recorded switch state and counts only as Off-CPU.")
         if not foldable:
-            return ("On-CPU is the CPU time the scheduler charged a thread, and"
-                    " the wait columns are the time between its accounting"
-                    " points, split by the state it was switched out in: S is a"
-                    " futex/condition-variable or other voluntary sleep, D is"
-                    " uninterruptible (disk I/O and page-fault waits), R is"
-                    " run-queue wait after a preemption. Off-CPU is all three,"
-                    " so On-CPU + Off-CPU is the thread's whole observed"
-                    " window. These columns are whole-run:" + note)
-        return ("On-CPU is the CPU time the scheduler charged a thread, and the"
-                " wait columns are the time between its accounting points,"
-                " split by the state it was switched out in: S is a"
-                " futex/condition-variable or other voluntary sleep, D is"
-                " uninterruptible (disk I/O and page-fault waits), R is"
-                " run-queue wait after a preemption. Off-CPU is all three, so"
-                " On-CPU + Off-CPU is the thread's whole observed window — and"
-                " every one of them follows the time selection, because the"
-                " scheduler's own timeline is in the report to fold." + note)
+            return ("Two measurements side by side: the profiler's sampled cycles, and"
+                    " the scheduler's own on/off-CPU accounting. Hover a column"
+                    " heading for what it measures. The wait columns are"
+                    " whole-run in this profile:" + note)
+        return ("Two measurements side by side: the profiler's sampled cycles, and"
+                " the scheduler's own on/off-CPU accounting, both scoped to the"
+                " selected window. Hover a column heading for what it measures."
+                + note)
     return ("Wait columns are n/a: scheduler tracepoints were not collected "
             "(see vperf doctor for the required capability).")
 
@@ -1719,6 +1775,68 @@ def _wait_payload(wp: WaitProfile | None, t0: float, t1: float) -> dict | None:
                     slice_code(state)]
         payload[str(tid)] = row
     return payload or None
+
+
+# What each column of the Threads table measures, in the reader's terms.  It
+# hangs off the header cell rather than sitting in a paragraph above the table,
+# because a column's meaning belongs to the column: the same three states split
+# the wait half in every report, and a reader who has learned them once should
+# not re-read them to learn them again.
+_THREAD_COLUMNS: list[tuple[int, str, str]] = [
+    (0, "Thread", "The name the sampler and the scheduler last saw for this "
+        "thread. The two halves of the table are joined on the TID, so the two "
+        "names can disagree for a thread that was renamed between them."),
+    (0, "PID", "The process the thread belongs to. A thread of the target and a "
+        "neighbouring process on the same core are different rows, and only the "
+        "target's own tree is recorded."),
+    (0, "TID", "The thread id both halves are joined on. It is the scheduler's "
+        "own identifier, so it survives a thread being renamed mid-run."),
+    (1, "Cycles", "CPU cycles the profiler sampled in this thread. perf charges "
+        "a sample to the thread that was running, weighted by the cycles that "
+        "passed since the last sample on that core, so it is an estimate of "
+        "work, not a count of instructions."),
+    (1, "% of sampled cycles",
+     "This thread's share of the sampled cycles in the current scope and "
+     "selection. The scope is the whole run until you pick a thread or a name "
+     "group, and the denominator follows the time selection with it."),
+    (1, "On-CPU", "CPU time the scheduler charged this thread. It is the time "
+        "between the thread's accounting points, less whatever the slices to "
+        "the right take, so On-CPU + Off-CPU is the thread's whole window."),
+    (1, "Sleep", "Off-CPU time the thread was switched out in S, which is "
+        "interruptible: a futex or condition-variable wait, a sleeping syscall, "
+        "a voluntary yield. Time the thread chose to give up."),
+    (1, "Blocked/IO", "Off-CPU time the thread was switched out in D, which is "
+        "uninterruptible: waiting for a disk read, or for a page the kernel has "
+        "to fetch first. A cold page cache shows up here twice over, once as "
+        "the read and once as the faults leading to it; the scheduler's records "
+        "cannot tell the two apart."),
+    (1, "Runnable", "Off-CPU time the thread was switched out in R: it was "
+        "still runnable and lost the CPU, so this is queueing for a core, not "
+        "waiting for anything. It is off-CPU, and it is not a sleep."),
+    (1, "Off-CPU", "Off-CPU is Sleep + Blocked/IO + Runnable: everything the "
+        "thread did not run for. A wait that straddles the edge of a selection "
+        "is charged by the share of it inside, so a cut slice contributes part "
+        "of its time."),
+    (1, "Off-CPU % of window",
+     "Off-CPU as a share of the selected window, or of the whole run when "
+     "nothing is selected. A thread that was not alive for the whole window "
+     "cannot reach 100%."),
+    (1, "Preempted", "Switch-outs that found the thread still runnable: the "
+        "count a scheduler calls a preemption. Distinct from Runnable, which "
+        "is the time those preemption waits cost."),
+    (1, "Sleeps", "Sleeping waits that started, read off the same slices as the "
+        "seconds above. A switch-out whose wait the window never showed owns no "
+        "time and is not counted."),
+    (1, "Blocks", "Uninterruptible waits that started. Counts the same waits "
+        "the Blocked/IO column measures, so the two are always consistent."),
+]
+
+
+def _help_marker() -> str:
+    """The `?` a reader hovers.  A click on it must not sort, hence the
+    stopPropagation: the header cell is the sort button."""
+    return ("<span class='q' tabindex='0' role='button' aria-label='what this"
+            " column measures' onclick='event.stopPropagation()'>?</span>")
 
 
 def _threads_table(prof: StackProfile, wp: WaitProfile | None = None) -> str:
@@ -1799,12 +1917,10 @@ def _threads_table(prof: StackProfile, wp: WaitProfile | None = None) -> str:
             cells += [na] * 9
         rows.append(f"<tr>{''.join(cells)}</tr>")
 
-    head = "".join(f"<th onclick='sortTable(this,{num})'>{t}</th>" for num, t in
-                   [(0, "Thread"), (0, "PID"), (0, "TID"), (1, "Cycles"),
-                    (1, "% of sampled cycles"), (1, "On-CPU"), (1, "Sleep"),
-                    (1, "Blocked/IO"), (1, "Runnable"),
-                    (1, "Off-CPU"), (1, "Off-CPU % of window"),
-                    (1, "Preempted"), (1, "Sleeps"), (1, "Blocks")])
+    head = "".join(
+        f"<th onclick='sortTable(this,{num})' data-help=\"{esc(help)}\">{label}"
+        f"{_help_marker()}</th>"
+        for num, label, help in _THREAD_COLUMNS)
     group = (
         "<tr><th colspan='5'>Profiler — CPU samples</th>"
         f"<th colspan='9'{' class=na' if not waits else ''}>"
@@ -2095,23 +2211,31 @@ def _wait_panels(wp: WaitProfile | None) -> str:
     legend = " ".join(f'<span style="color:{c}">■</span>{esc(n)} {v:.0f}%'
                       for n, v, c in parts if v > 0)
 
-    def bars(items):
+    def bars(items, count_label="Count", count_help=None):
         peak = max((v for _, v in items), default=1) or 1
         rows = "".join(
             f"<tr><td class='mono'>{esc(k)}</td>"
             f"<td data-v='{v}'><span class='bar' style='width:{v/peak*120:.0f}px'></span> "
             f"{v:,}</td></tr>"
             for k, v in items if v)
-        return (f"<table><thead><tr><th></th><th>Count</th></tr></thead>"
+        head = (f"<th data-help=\"{esc(count_help)}\" class='plain'>{count_label}"
+                f"{_help_marker()}</th>" if count_help
+                else f"<th>{count_label}</th>")
+        return (f"<table><thead><tr><th></th>{head}</tr></thead>"
                 f"<tbody>{rows}</tbody></table>")
 
     bands = [(nm, wp.bands.get(nm, 0)) for nm, _lo, _hi in WAIT_BANDS_MS]
     heading = (f"Where the time went (all threads, window {wp.window_s:.2f}s, "
                f"{wp.util_cores or 0.0:.1f} cores busy, {total:,.1f}s of thread time)")
+    bands_html = bars(
+        bands, "Waits",
+        "Sleeping and uninterruptible waits by how long they lasted, counted"
+        " whole-run: a wait is not cut in half by a selection the way a second"
+        " is, so this panel does not follow the time selection.")
     return f'''<div class="panel"><h3 id="wait-head">{heading}</h3>
 <div id="wait-bar" style="display:flex;height:22px;border-radius:5px;overflow:hidden;margin-bottom:8px">{segs}</div>
 <div id="wait-legend" style="font-size:12px;color:var(--dim)">{legend}</div></div>
-<div class="panel"><h3>Sleep/block delay distribution</h3>{bars(bands)}
+<div class="panel"><h3>Sleep/block delay distribution</h3>{bands_html}
 <span class="whole-run-note">the delay bands are whole-run: they count the waits
 that started, and a wait is not cut in half by a selection the way a second is.</span></div>'''
 

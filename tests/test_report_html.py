@@ -22,6 +22,8 @@ from vperf.report_html import (
     _thread_groups,
     _ThreadGroup,
     _threads_table,
+    _THREAD_COLUMNS,
+    _wait_panels,
     _wait_payload,
     build_html,
 )
@@ -805,7 +807,8 @@ def test_threads_table_merges_cpu_and_wait_columns():
     for heading in ("Cycles", "% of sampled cycles", "On-CPU", "Sleep",
                     "Blocked/IO", "Runnable", "Off-CPU", "Off-CPU % of window",
                     "Preempted", "Sleeps", "Blocks"):
-        assert f">{heading}</th>" in html
+        # every heading carries its own explanation, so it ends in the marker
+        assert f">{heading}<span class='q'" in html
     # worker: sleep 0.4 + blocked 0.02 + runnable 0.01 = 0.43 off-CPU, which
     # is 21.5% of the 2.0s window; the other 0.87 of its 1.3s was on-CPU
     assert "0.870 s" in html
@@ -863,8 +866,11 @@ def test_wait_tab_is_folded_into_the_threads_tab():
     table_at = page.index("Threads — CPU samples and wait time")
     assert page.index("Where the time went") < table_at
     assert page.index("Sleep/block delay distribution") < table_at
-    assert page.index("On-CPU is the CPU time the scheduler charged") > table_at
-    assert page.index("follows the time selection") > table_at
+    # the note over the table says what the two halves are and stops there:
+    # the per-column detail is a popup, not a paragraph
+    assert page.index("Two measurements side by side") > table_at
+    assert page.index("the scheduler's own on/off-CPU accounting, both scoped to the") > table_at
+    assert "On-CPU is the CPU time the scheduler charged" not in page
 
 
 def test_threads_page_explains_missing_wait_data():
@@ -1167,6 +1173,43 @@ def test_the_wait_columns_follow_the_selection():
     assert "body.querySelectorAll('.cpu-cycles')" in _JS
 
 
+def test_every_column_heading_explains_itself_in_a_popup():
+    """A paragraph about fourteen columns is a paragraph nobody reads, and it
+    repeats on every report.  The meaning hangs off the heading it belongs to."""
+    samples = _cpu_samples()
+    html = _threads_table(build_profile(samples), _wait_profile())
+
+    heads = re.findall(r"<th onclick='sortTable\(this,\d\)' data-help=\"(.*?)\">"
+                       r"(.*?)<span class='q'", html, re.S)
+    assert [label for _h, label in heads] == [c[1] for c in _THREAD_COLUMNS]
+    for text, _label in heads:
+        assert len(text) > 40, text          # a real sentence, not a label
+    # and the two the reader cannot guess, in the words the old note used
+    by_label = {label: text for text, label in heads}
+    assert "interrup" in by_label["Sleep"]
+    assert "uninterruptible" in by_label["Blocked/IO"]
+    assert "still runnable" in by_label["Runnable"]
+    assert "Off-CPU" in by_label["Off-CPU"]
+    # the popup itself: one shared element, positioned fixed so the scrolling
+    # panel the table lives in cannot clip it, and driven by delegation so a
+    # body pass that rewrites cells leaves the headings alone
+    assert "#help-pop{position:fixed" in _CSS
+    assert "function showHelp(" in _JS
+    assert "elm.closest('th[data-help]')" in _JS
+    assert "document.addEventListener('mouseover'" in _JS
+    assert "initHelp();" in _JS
+    # a popup that opened cannot be cut short by the hide the last mouseout
+    # armed, or moving between two markers blanks it
+    assert "clearTimeout(pending);pending=null;" in _JS
+    # and a click on the marker sorts nothing
+    assert "onclick='event.stopPropagation()'" in html
+    # the delay bands get the same treatment, and say they are whole-run
+    panel = _wait_panels(_wait_profile())
+    assert "Sleep/block delay distribution" in panel
+    assert panel.count("data-help=") == 1
+    assert "not cut in half by a selection" in panel
+
+
 def test_the_run_level_wait_bar_follows_the_scope_and_the_window():
     html = _threads_page(build_html(
         {"target": {"cmd": ["app"]}, "mode": "run"}, _cpu_samples(),
@@ -1264,7 +1307,7 @@ def test_a_wait_pass_that_does_not_cover_the_window_keeps_the_columns_whole_run(
     html = build_html({"target": {"cmd": ["app"]}, "mode": "run"}, late,
                       MetricsReport(elapsed=2.0), build_profile(late), wp=wp)
     assert "WAIT=null" in html
-    assert "These columns are whole-run" in html
+    assert "whole-run in this profile" in html
     # the browser leaves them alone when there is no timeline to fold
     assert "if(WAIT){" in _JS
     assert "if(!head||!WAIT) return;" in _JS
