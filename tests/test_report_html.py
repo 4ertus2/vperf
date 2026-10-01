@@ -756,8 +756,8 @@ def _cpu_samples():
 def _wait_profile() -> WaitProfile:
     wp = WaitProfile(window_s=2.0)
     wp.threads[101] = ThreadWait(tid=101, comm="worker", runtime_s=0.9, sleep_s=0.4,
-                                 blocked_s=0.02, iowait_s=0.01, sleep_count=12,
-                                 blocked_count=3, preempted=7)
+                                 blocked_s=0.02, runnable_s=0.01, sleep_count=12,
+                                 blocked_count=3, runnable_count=7, preempted=7)
     # a thread the sampler never saw, but the scheduler did
     wp.threads[999] = ThreadWait(tid=999, comm="ghost", sleep_s=1.2, sleep_count=3)
     return wp
@@ -777,13 +777,15 @@ def test_threads_table_merges_cpu_and_wait_columns():
     assert "Profiler — CPU samples" in html
     assert "Scheduler tracepoints — wait</th>" in html
     for heading in ("Cycles", "% of sampled cycles", "On-CPU", "Sleep",
-                    "Blocked/IO", "Off-CPU", "Off-CPU % of window",
+                    "Blocked/IO", "Runnable", "Off-CPU", "Off-CPU % of window",
                     "Preempted", "Sleeps", "Blocks"):
         assert f">{heading}</th>" in html
-    # worker: sleep 0.4 + blocked 0.03 = 0.43 off-CPU of a 2.0s window
+    # worker: sleep 0.4 + blocked 0.02 + runnable 0.01 = 0.43 off-CPU, which
+    # is 21.5% of the 2.0s window - and of its 1.33s it is on screen
     assert "0.900 s" in html
     assert "0.400 s" in html
-    assert "0.030 s" in html
+    assert "0.020 s" in html
+    assert "0.010 s" in html
     assert "0.430 s" in html
     assert "21.5%" in html
     # a thread only the scheduler saw keeps a row, with no PID to show
@@ -810,7 +812,7 @@ def test_threads_table_marks_wait_fields_na_without_wait_data():
     assert rows
     for row in rows:
         # one n/a per wait column, none of them carrying a sort value
-        assert row.count(">n/a<") == 8
+        assert row.count(">n/a<") == 9
         assert "data-v" not in row.split(">n/a<", 1)[1]
     # the CPU half still reports real numbers
     assert "worker" in html and "io-pool" in html
@@ -830,12 +832,12 @@ def test_wait_tab_is_folded_into_the_threads_tab():
     # the run-level wait content moved into the same page, and it leads it: the
     # graphics come first here as they do in every other tab, and the per-thread
     # table, with the note explaining its own wait columns, is last
-    assert "Where the time went" in page
+    assert "Where the thread time went" in page
     assert "Sleep/block delay distribution" in page
     table_at = page.index("Threads — CPU samples and wait time")
-    assert page.index("Where the time went") < table_at
+    assert page.index("Where the thread time went") < table_at
     assert page.index("Sleep/block delay distribution") < table_at
-    assert page.index("On-CPU / off-CPU come from scheduler tracepoints") > table_at
+    assert page.index("On-CPU is the CPU time the scheduler charged") > table_at
 
 
 def test_threads_page_explains_missing_wait_data():
@@ -846,7 +848,7 @@ def test_threads_page_explains_missing_wait_data():
     page = _threads_page(html)
 
     assert "Wait columns are n/a: scheduler tracepoints were not collected" in page
-    assert "Where the time went" not in page
+    assert "Where the thread time went" not in page
 
 
 def test_threads_table_nas_a_thread_the_scheduler_never_saw():
@@ -861,7 +863,7 @@ def test_threads_table_nas_a_thread_the_scheduler_never_saw():
     body = html.split("<tbody>")[1].split("</tbody>")[0]
     io_row = next(r for r in body.split("<tr>") if "io-pool" in r)
 
-    assert io_row.count(">n/a<") == 8
+    assert io_row.count(">n/a<") == 9
     assert "<td></td>" not in html  # never a silently blank cell
     # the thread that does have wait data is unaffected
     assert "0.900 s" in html

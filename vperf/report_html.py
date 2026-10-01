@@ -1549,10 +1549,21 @@ def _hotspots_table(prof: StackProfile) -> str:
 
 
 def _wait_note(wp: WaitProfile | None) -> str:
-    """One line telling the reader why the wait half of the table is n/a."""
+    """One line telling the reader what the wait half of the table is made of."""
     if wp is not None and wp.window_s and wp.threads:
-        return ("On-CPU / off-CPU come from scheduler tracepoints; cycles come "
-                "from the sampling profiler.")
+        unknown = wp.unknown_s
+        note = ""
+        if unknown > 0.01 * max(wp.off_cpu_s, 1e-9):
+            note = (f" {unknown / wp.off_cpu_s * 100:.0f}% of the off-CPU time has no"
+                    " recorded switch state and counts only as Off-CPU.")
+        return ("On-CPU is the CPU time the scheduler charged a thread, and the"
+                " wait columns are the time between its accounting points,"
+                " split by the state it was switched out in: S is a"
+                " futex/condition-variable or other voluntary sleep, D is"
+                " uninterruptible (disk I/O and page-fault waits), R is"
+                " run-queue wait after a preemption. Off-CPU is all three, so"
+                " On-CPU + Off-CPU is the thread's whole observed window."
+                + note)
     return ("Wait columns are n/a: scheduler tracepoints were not collected "
             "(see vperf doctor for the required capability).")
 
@@ -1573,13 +1584,15 @@ def _threads_table(prof: StackProfile, wp: WaitProfile | None = None) -> str:
         t = waits.get(tid)
         if t is None:
             return 0.0
-        return t.runtime_s + t.sleep_s + t.blocked_s + t.iowait_s
+        return t.runtime_s + t.off_cpu_s
 
-    def order(tid: int) -> tuple[float, int]:
-        # with wait data, order by how much wall time the thread accounts for;
-        # without it, fall back to sampled cycles
-        return (observed(tid), cpu[tid].cycles if tid in cpu else 0) if waits \
-            else (float(cpu[tid].cycles if tid in cpu else 0), 0)
+    def order(tid: int) -> tuple[int, float, float]:
+        # The hot threads lead, by sampled cycles, and the scheduler's wall
+        # time orders the threads the sampler never caught. Ranking by wall
+        # time instead would put a pool thread that slept through the run on
+        # top of the ones that actually burned the CPU this tab is about.
+        sampled = cpu[tid].cycles if tid in cpu else 0.0
+        return (1, sampled, observed(tid)) if sampled else (0, 0.0, observed(tid))
 
     def wait_cell(body: str, sort_value: float | int | None = None) -> str:
         v = "" if sort_value is None else f" data-v='{sort_value}'"
@@ -1602,14 +1615,14 @@ def _threads_table(prof: StackProfile, wp: WaitProfile | None = None) -> str:
                  f"<td data-v='{cycles}' data-tid='{tid}' class='mono cpu-cycles'>{_fmt_count(cycles)}</td>",
                  f"<td data-v='{share:.3f}' data-tid='{tid}' class='cpu-share'>{share:.1f}%</td>"]
         if t_wait is not None:
-            blocked = t_wait.blocked_s + t_wait.iowait_s
-            off = t_wait.sleep_s + blocked
+            off = t_wait.off_cpu_s
             off_pct = off / window * 100 if window else 0.0
             bar = min(off_pct * 1.2, 100)
             cells += [
                 wait_cell(f"{t_wait.runtime_s:,.3f} s", f"{t_wait.runtime_s:.6f}"),
                 wait_cell(f"{t_wait.sleep_s:,.3f} s", f"{t_wait.sleep_s:.6f}"),
-                wait_cell(f"{blocked:,.3f} s", f"{blocked:.6f}"),
+                wait_cell(f"{t_wait.blocked_s:,.3f} s", f"{t_wait.blocked_s:.6f}"),
+                wait_cell(f"{t_wait.runnable_s:,.3f} s", f"{t_wait.runnable_s:.6f}"),
                 wait_cell(f"{off:,.3f} s", f"{off:.6f}"),
                 wait_cell(f"<span class='bar' style='width:{bar:.1f}px'></span> "
                           f"{off_pct:.1f}%", f"{off_pct:.3f}"),
@@ -1620,17 +1633,18 @@ def _threads_table(prof: StackProfile, wp: WaitProfile | None = None) -> str:
         else:
             # the sampler saw this thread but the scheduler recorded nothing
             # for it, or no wait data was collected at all
-            cells += [na] * 8
+            cells += [na] * 9
         rows.append(f"<tr>{''.join(cells)}</tr>")
 
     head = "".join(f"<th onclick='sortTable(this,{num})'>{t}</th>" for num, t in
                    [(0, "Thread"), (0, "PID"), (0, "TID"), (1, "Cycles"),
                     (1, "% of sampled cycles"), (1, "On-CPU"), (1, "Sleep"),
-                    (1, "Blocked/IO"), (1, "Off-CPU"), (1, "Off-CPU % of window"),
+                    (1, "Blocked/IO"), (1, "Runnable"),
+                    (1, "Off-CPU"), (1, "Off-CPU % of window"),
                     (1, "Preempted"), (1, "Sleeps"), (1, "Blocks")])
     group = (
-        "<tr><th colspan='5'>Profiler — CPU samples</th><th colspan='8'"
-        f"<th colspan='8'{' class=na' if not waits else ''}>"
+        "<tr><th colspan='5'>Profiler — CPU samples</th>"
+        f"<th colspan='9'{' class=na' if not waits else ''}>"
         f"Scheduler tracepoints — wait{' (n/a: not collected)' if not waits else ''}"
         "</th></tr>")
     return (f"<table><thead>{group}<tr>{head}</tr></thead>"
@@ -1894,19 +1908,22 @@ def _memory_html_map(mem: MemoryProfile | None, backend: str | None = "ibs",
 
 
 def _wait_panels(wp: WaitProfile | None) -> str:
-    """Run-level wait content: where the window went and the delay spread.
+    """Run-level wait content: where the thread time went and the delay spread.
 
     Per-thread wait data lives in the merged Threads table, so this is only
     the aggregate view. Returns '' when the tracepoints were not collected.
     """
     if wp is None or wp.window_s is None or not wp.threads:
         return ""
-    w = max(wp.window_s, 1e-9)
+    total = max(wp.thread_s, 1e-9)
     parts = [
-        ("On-CPU", wp.runtime_s / w * 100, "#59d499"),
-        ("Sleep", wp.sleep_s / w * 100, "#c792ea"),
-        ("Blocked/IO", (wp.blocked_s + wp.iowait_s) / w * 100, "#ff6f7d"),
+        ("On-CPU", wp.runtime_s / total * 100, "#59d499"),
+        ("Sleep", wp.sleep_s / total * 100, "#c792ea"),
+        ("Blocked/IO", wp.blocked_s / total * 100, "#ff6f7d"),
+        ("Runnable", wp.runnable_s / total * 100, "#82aaff"),
     ]
+    if wp.unknown_s > 0.005 * total:
+        parts.append(("Unclassified", wp.unknown_s / total * 100, "#666666"))
     segs = "".join(
         f'<div title="{esc(n)} {v:.1f}%" style="width:{min(v,100):.2f}%;'
         f'background:{color}"></div>' for n, v, color in parts if v > 0)
@@ -1924,7 +1941,9 @@ def _wait_panels(wp: WaitProfile | None) -> str:
                 f"<tbody>{rows}</tbody></table>")
 
     bands = [(nm, wp.bands.get(nm, 0)) for nm, _lo, _hi in WAIT_BANDS_MS]
-    return f'''<div class="panel"><h3>Where the time went (window {wp.window_s:.2f}s)</h3>
+    heading = (f"Where the thread time went (window {wp.window_s:.2f}s, "
+               f"{wp.util_cores or 0.0:.1f} cores busy, {total:,.1f}s of thread time)")
+    return f'''<div class="panel"><h3>{heading}</h3>
 <div style="display:flex;height:22px;border-radius:5px;overflow:hidden;margin-bottom:8px">{segs}</div>
 <div style="font-size:12px;color:var(--dim)">{legend}</div></div>
 <div class="panel"><h3>Sleep/block delay distribution</h3>{bars(bands)}</div>'''
