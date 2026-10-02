@@ -39,6 +39,20 @@ CPU analyses on amd64 machine (AMD and Intel), with zero Python dependencies:
   The Threads tab merges the per-thread CPU and wait tables: each row
   carries sampled cycles next to on/off-CPU seconds, joined on tid, and the
   wait columns read `n/a` when scheduler tracepoints were not collected.
+  Its on/off-CPU half comes straight from the scheduler: **On-CPU** is the CPU
+  time it charged a thread, and every second between two of that thread's
+  accounting points that the charge does not explain is **Off-CPU**, split by
+  the state the thread was switched out in — **Sleep** (interruptible:
+  futexes, condition variables, sleeping syscalls), **Blocked/IO**
+  (uninterruptible: disk I/O *and* page-fault waits) and **Runnable**
+  (run-queue wait after a preemption). On-CPU + Off-CPU is therefore the
+  thread's whole observed window, and the "where the time went" bar splits
+  the same way. All of it follows the time selection, and the bar follows the
+  thread selector too (see [Time selection](#time-selection) and
+  [Wait / off-CPU analysis](#wait--off-cpu-analysis)). Every column heading
+  carries a `?` that says what that column measures — hover it, or tab to it —
+  so the definitions sit on the columns they define rather than in a paragraph
+  above the table that has to be re-read on every report.
 
 Artifacts (`stat.csv` or `stat_threads.csv`, `perf.data`, `script.txt`,
 `mem_report.txt`, `freq.json`, `rss.json`, `meta.json`) are kept in the profile
@@ -105,12 +119,78 @@ sudo sysctl kernel.perf_event_paranoid=1      # -1 also enables full kernel samp
 echo 'kernel.perf_event_paranoid=1' | sudo tee /etc/sysctl.d/99-perf.conf
 ```
 
-### Enable Wait / off-CPU analysis
+### Wait / off-CPU analysis
 
-The Wait report uses scheduler tracepoints, not only PMU counters. On systems
-where tracefs event files remain root-only, `kernel.perf_event_paranoid=0` and
-a tracefs remount may not be enough. Enable tracepoint access for the user who
-runs `vperf`:
+The Wait report uses scheduler tracepoints, not only PMU counters. It collects
+two, co-joined into the same recording as the CPU samples:
+
+| Event | What it contributes |
+|---|---|
+| `sched:sched_stat_runtime` | the CPU time a thread earned since its previous accounting point — reported when it is switched out, and on kernels with `CONFIG_SCHED_INFO` once per scheduler tick per CPU. Per thread the deltas sum to exactly that thread's `perf stat` `task-clock` |
+| `sched:sched_switch` | the switch-out instant and `prev_state`, the scheduler's own spelling of the state the task was switched out in |
+
+A thread can only be on-CPU between two of its own events, so the delta is
+exactly its on-CPU share of the gap between them and the rest of the gap was
+off-CPU; the state of the switch-out that opened the gap says what kind of
+wait it was. `sched:sched_process_exit` closes a thread's window when it
+leaves. Only the target's own process tree is recorded, so no `-a` is needed
+for the totals — but a thread's switch-*in* is only visible when the task that
+held the CPU was also in the tree, which is why the split rests on the single
+accounting stream rather than on paired switch events.
+
+**The delay-accounting tracepoints are deliberately not collected.** The
+scheduler's `sched_stat_wait` / `sched_stat_sleep` / `sched_stat_blocked` /
+`sched_stat_iowait` report the delay directly and would be the simpler
+source, but their call sites are gated on the scheduler's delay accounting and
+are simply not built on some kernels: on 7.0.0-34-generic `perf list` names
+all four and then none of them ever fires (0 events system-wide while
+`sched_switch` counts ~12k/s), which is exactly how the Sleep and Blocked/IO
+columns used to come out permanently zero. `prev_state` is the state that
+cannot go missing, so it is the only source the report reads. The report puts
+these definitions on the columns themselves, one `?` per heading on the
+Threads tab, so a table can be read without this section. It is read from
+both renderings of the event — the positional `comm:pid [prio] STATE ==>
+comm:pid [prio]` that `perf script` prints, and the `prev_pid=`/`prev_state=`
+field form older perf produced.
+
+Two more things the columns mean, so the numbers are not over-read:
+
+- **Blocked/IO is the `D` state**, which is every uninterruptible wait: disk
+  I/O *and* the page-fault waits a cold page cache causes. A query that scans
+  a file for the first time shows up here in both ways.
+- A thread that is still switched out when the recording ends is left
+  uncharged rather than guessed at, so a row's On-CPU + Off-CPU covers its
+  observed window (the tiny first delta was earned before the window opened).
+
+**The timeline goes into the report, so the browser can fold a window.** Each
+thread ships as one flat row — where its accounting points start and end, the
+CPU its first point earned before them, and every off-CPU slice as a start, a
+length and the state it was switched out in — in integer microseconds on the
+sample clock, which is the clock the chart's borders are drawn on. Nothing
+else: On-CPU is what is left of the covered span once the slices have taken
+their share, which is the identity above. That is why a selection answers
+these columns *exactly* rather than by resampling, and why the whole window
+folds back onto the numbers the server rendered — a profile whose scheduler
+records cannot be lined up with its samples (a wait pass collected separately,
+so the records describe another run of the target) keeps the columns whole-run
+and says so.
+
+It costs what the slices cost, and there is no cap on them: 22k slices for a
+1.2 s ClickBench profile, 269 KB, +2.6% of that report. Folding them is one
+linear pass, inside the 140 ms debounce the drag already uses. Two
+consequences worth stating:
+
+- The **counts** (Preempted, Sleeps, Blocks) are read off the slices, so they
+  count the switches that cost measurable time — a switch-out whose wait the
+  window never showed owns no slice and is not counted. That is also what
+  makes the server's count and the browser's the same number.
+- A wait that **straddles the edge** of a selection is charged by the share of
+  it inside, so a count can come out fractional (rounded for display) and a
+  slice cut in half contributes half its seconds.
+
+On systems where tracefs event files remain root-only,
+`kernel.perf_event_paranoid=0` and a tracefs remount may not be enough. Enable
+tracepoint access for the user who runs `vperf`:
 
 `CAP_DAC_READ_SEARCH` lets `perf` read root-owned tracefs event metadata when
 remounting the tracefs mount does not change the individual file permissions.
@@ -314,12 +394,20 @@ they scope every tab the profile holds the data for:
 - What follows the selection: **Hotspots** (self, inclusive and estimated CPU
   time, over the selection), the **Flame Graph**, the **Call Tree**, the
   **Memory** tab (all five panels, plus a memory-accesses-over-time chart with
-  the selection shaded) and the per-thread **cycles** in the Threads tab.
-- What cannot: the **Overview** metrics and the Threads tab's **wait** columns.
-  `perf stat --per-thread` counts once over the whole profile (perf refuses
-  `-I` together with `--per-thread`) and the scheduler tracepoints are counted
-  the same way, so those panels say *whole run* while a selection is active
-  instead of quietly reporting the run as if it were the window.
+  the selection shaded), and the whole Threads tab — the per-thread **cycles**
+  and the scheduler's **on-CPU, Sleep, Blocked/IO, Runnable, Off-CPU** columns
+  and counts, plus the "where the time went" bar over them. The wait half is
+  not a counter: it is a per-thread off-CPU timeline on the same clock the
+  borders are drawn on, so a range on the chart is a range on it, and it is
+  folded in the browser from the slices the report ships (see
+  [Wait / off-CPU analysis](#wait--off-cpu-analysis)). Two things in that tab
+  still do not move: the **Overview** metrics, and the delay-band histogram,
+  which counts the waits that *started* — a wait is not cut in half by a
+  selection the way a second is.
+- What cannot: the **Overview** metrics. `perf stat --per-thread` counts once
+  over the whole profile (perf refuses `-I` together with `--per-thread`), so
+  that panel says *whole run* while a selection is active instead of quietly
+  reporting the run as if it were the window.
 - While you drag, the chart and the counters follow the borders; the flame
   graph, the call tree and the memory panels are rebuilt once the drag settles,
   which keeps dragging smooth on a profile with 100k+ samples.
@@ -378,8 +466,11 @@ before is one line, not 54:
 - the flame graph of a group costs nothing extra in the report: only the
   whole-run graph is drawn into the file, and every other scope — one thread or
   a whole name group — is folded again in the browser from the same samples
-- the Threads tab's wait columns and the Frequency chart stay run-level, as they
-  were before grouping existed
+- the Threads tab's "where the time went" bar follows the scope — a group adds
+  its members' waits, the way it merges their samples — while the per-thread
+  table below it keeps listing every thread, because that is what a per-thread
+  table is. The Frequency chart stays run-level, as it was before grouping
+  existed
 
 `perf mem report` labels every thread of a process with the *process* name, so a
 thread is grouped under the name the sampler saw for it; only threads the
@@ -416,6 +507,10 @@ sampler never caught fall back to the coarser memory-report name.
 | DRAM access % high | true LLC misses; optimize data layout |
 | L1 access % ≈ 100% | working set fits in cache |
 | Avg latency > 200 cyc | deep memory stalls; prefetching or data restructuring needed |
+| **Wait / off-CPU (Threads tab)** | |
+| Blocked/IO ≫ On-CPU | the data is not in cache: the thread is waiting on the disk, not computing — the difference between a warm and a cold run shows up here and nowhere else |
+| Runnable high, On-CPU low | oversubscribed — more runnable threads than cores; use fewer threads or more work each |
+| Sleep high, On-CPU low | idle-waiting, not slow: a futex or condition variable, so the pipeline is starving its own workers |
 | **Hotspots** | |
 | Hotspots `[kernel]` heavy | syscalls/page faults; consider off-CPU analysis |
 | One function > 50% self | clear #1 target; optimize or vectorize that function |
@@ -582,6 +677,28 @@ samples, and the run log names it — which is why the startup grace is per
 engine: `clickhouse-local` needs ~90 ms to build its thread pool while its
 cheapest query takes 140 ms, and duckdb has its 16 threads up within 8 ms while
 its cheapest query takes 80 ms.
+
+`bench/clear-caches.py` evicts the dataset before a run and needs no root:
+`posix_fadvise(POSIX_FADV_DONTNEED)` on a clean file discards that file's
+pages, where `/proc/sys/vm/drop_caches` is `0600` root-only and a setuid bit on
+a script is ignored by the kernel anyway. It takes a path or a directory
+(`bench/clear-caches.py` alone does `$DATA_DIR`, else `~/data`) and measures
+every file with `mincore` afterwards, so the run is *known* to be cold rather
+than assumed to be — which matters, because a 14 GB file this box reads in
+about a second does not stay in the page cache on its own.
+
+```bash
+bench/clear-caches.py                      # evict $DATA_DIR, report residency
+bench/clickbench_profiles.sh --from 13 --to 13
+```
+
+That is how the I/O half of a query becomes visible. The same Q13 on the same
+machine with the same flags, the only difference being whether the 14 GB
+`hits.parquet` was resident: **1.3 s of Blocked/IO against 0.3 s**, all of it
+on the `ParquetDecoder` and `ParquetPrefetch` threads, and 10.5 cores busy
+against 12.7. CPU time moves with it — 12.3 s against 22.7 s — because the
+threads that would be decoding are blocked in `D` instead, so the utilization
+curve drops and the wait columns say exactly why.
 
 ## Cycle mode: before/after comparisons with ministat
 

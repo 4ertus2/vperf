@@ -93,28 +93,48 @@ def _wait_section(wp) -> list[str]:
     if wp is None or wp.window_s is None or not wp.threads:
         return out + [" (no data)"]
     w = wp.window_s
+    total = wp.thread_s
     rows = [
         ["Observation Window", f"{w:.3f} s"],
+        ["Thread Time (N threads)", f"{total:,.3f} s"],
         ["On-CPU (avg cores)", _fmt(wp.util_cores)],
+        ["On-CPU share", f"{_fmt(wp.runtime_share_pct, ' %')}"],
         ["Sleep (voluntary)", f"{_fmt(wp.sleep_s, ' s')}  ({_fmt(wp.sleep_share_pct, ' %')})"],
-        ["Blocked / IOwait", f"{_fmt(wp.blocked_s + wp.iowait_s, ' s')}  "
-                             f"({_fmt(wp.blocked_share_pct, ' %')})"],
+        ["Blocked / IO (D state)", f"{_fmt(wp.blocked_s, ' s')}  "
+                                   f"({_fmt(wp.blocked_share_pct, ' %')})"],
+        ["Runnable wait (preempted)", f"{_fmt(wp.runnable_s, ' s')}  "
+                                      f"({_fmt(wp.runnable_share_pct, ' %')})"],
+        ["Off-CPU (all of it)", f"{_fmt(wp.off_cpu_s, ' s')}  "
+                                f"({_fmt(wp.off_cpu_share_pct, ' %')})"],
         ["Preempted Switches", f"{wp.preempted_total:,}"],
     ]
     out.append(_table(rows, ["Metric", "Value"]))
+    out.append("  shares are of thread time (On-CPU + Off-CPU = the thread's window)")
 
     band_rows = [[name, f"{wp.bands.get(name, 0):,}"]
                  for name, _lo, _hi in WAIT_BANDS_MS]
     out.append("")
-    out.append(_table(band_rows, ["Delay Band", "Events"]))
+    out.append(_table(band_rows, ["Delay Band", "Sleep/Block Events"]))
 
     trows = []
-    for t in wp.top_threads(10):
+    # Only threads that were on a CPU at all: a background pool thread that
+    # slept through the run ranks top of an off-CPU list ten times over, and a
+    # row holding 40us of CPU says nothing about where the CPU time went.  The
+    # floor is 5% of the busiest thread, so the table is the workers.
+    floor = 0.05 * max((t.runtime_s for t in wp.threads.values()), default=0.0)
+    listed = wp.top_threads(10, min_cpu_s=floor)
+    for t in listed:
         trows.append([f"{t.comm} ({t.tid})", _fmt(t.runtime_s, " s"),
-                      _fmt(t.sleep_s, " s"), _fmt(t.blocked_s + t.iowait_s, " s"),
+                      _fmt(t.sleep_s, " s"), _fmt(t.blocked_s, " s"),
+                      _fmt(t.runnable_s, " s"), _fmt(t.off_cpu_s, " s"),
                       f"{t.preempted:,}"])
     out.append("")
-    out.append(_table(trows, ["Thread", "On-CPU", "Sleep", "Blocked/IO", "Preempted"]))
+    out.append(_table(trows, ["Thread", "On-CPU", "Sleep", "Blocked/IO",
+                              "Runnable", "Off-CPU", "Preempted"]))
+    if listed and len(listed) < len(wp.threads):
+        out.append(f"  by off-CPU, of the {len(listed)} threads holding at least"
+                   f" {floor * 1000:.0f} ms of CPU"
+                   f" ({len(wp.threads) - len(listed)} more not listed)")
     return out
 
 
