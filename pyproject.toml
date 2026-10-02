@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vperf"
 version = "0.1.0"
-description = "VTune-style CPU profiling on top of Linux perf"
+description = "VTune-style CPU profiling on top of Linux perf and macOS sample"
 requires-python = ">=3.10"
 
 [project.scripts]

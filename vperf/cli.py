@@ -27,6 +27,16 @@ def _default_outdir(mode: str) -> str:
 
 
 def _ensure_access() -> None:
+    if sys.platform == "darwin":
+        from .backends.macos import macos_available
+
+        if not macos_available():
+            print("ERROR: the `sample` command is required for macOS profiling.",
+                  file=sys.stderr)
+            print("Install Xcode Command Line Tools: xcode-select --install",
+                  file=sys.stderr)
+            raise SystemExit(2)
+        return
     ok, err = probe_stat(["-e", "task-clock"])
     if not ok:
         print("ERROR: cannot access PMU counters.", file=sys.stderr)
@@ -178,12 +188,13 @@ def cmd_attach(args: argparse.Namespace) -> int:
     except OSError as e:
         print(f"error: PID {args.pid}: {e}", file=sys.stderr)
         return 2
-    a_ok, a_err = probe_attach()
-    if not a_ok:
-        print("ERROR: this system does not allow attaching to existing processes.",
-              file=sys.stderr)
-        print(f"({a_err})", file=sys.stderr)
-        return 2
+    if sys.platform != "darwin":
+        a_ok, a_err = probe_attach()
+        if not a_ok:
+            print("ERROR: this system does not allow attaching to existing processes.",
+                  file=sys.stderr)
+            print(f"({a_err})", file=sys.stderr)
+            return 2
     _ensure_access()
     outdir = args.outdir or _default_outdir("attach")
     pd = collect(
@@ -241,6 +252,10 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 def cmd_cycle(args: argparse.Namespace) -> int:
+    if sys.platform == "darwin":
+        print("ERROR: `vperf cycle` needs hardware counters, which macOS does "
+              "not expose; it is Linux-only.", file=sys.stderr)
+        return 2
     import tempfile
     import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -332,6 +347,12 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(_args: argparse.Namespace) -> int:
+    if sys.platform == "darwin":
+        from .backends.macos import macos_doctor
+
+        rep = macos_doctor()
+        print(rep.render())
+        return 0 if rep.ok else 2
     if not perf_available():
         print("FAIL: perf not found in PATH")
         return 2

@@ -1,6 +1,7 @@
-# vperf — VTune-style CPU profiling on Linux
+# vperf — VTune-style CPU profiling on Linux and macOS
 
-`vperf` wraps the Linux `perf` tool to reproduce Intel VTune's most valuable
+`vperf` wraps the Linux `perf` tool (and macOS's `sample` command) to reproduce
+Intel VTune's most valuable
 CPU analyses on amd64 machine (AMD and Intel), with zero Python dependencies:
 
 - **Hotspots** — self/inclusive time per function with frame-pointer call
@@ -118,6 +119,43 @@ sudo sysctl kernel.perf_event_paranoid=1      # -1 also enables full kernel samp
 # persistent:
 echo 'kernel.perf_event_paranoid=1' | sudo tee /etc/sysctl.d/99-perf.conf
 ```
+
+### macOS
+
+vperf also runs on **macOS (Apple Silicon and Intel)** with a reduced feature
+set. macOS has no `perf` command and none of the PMU / tracepoint surface vperf
+relies on for its counting passes, so the macOS backend (`vperf/backends/
+macos.py`) collects what macOS does expose and drives the *same* reports:
+
+| Area | macOS backend | Availability |
+|---|---|---|
+| Hotspots, flame graph, call tree, per-thread breakdown | `sample <pid>` call-graph dumps, converted to the perf-script form the report pipeline reads | ✅ |
+| Memory usage over time (RSS) + peak | `ps -o rss=` polled on a background thread | ✅ |
+| CPU utilization timeline | `ps -o time=` deltas → the same busy-cores curve | ✅ |
+| Hardware counters, IPC/cache/pipeline metrics | — | ❌ reads `n/a` |
+| Memory-access (IBS/PEBS) | — | ❌ skipped |
+| Wait / off-CPU (sched tracepoints) | — | ❌ skipped |
+| CPU frequency | — | ❌ no frequency chart |
+| `vperf cycle` | — | ❌ needs hardware counters |
+
+Requirements: macOS with Xcode Command Line Tools (for `/usr/bin/sample`),
+Python ≥ 3.10.
+
+```bash
+vperf doctor                      # reports the macOS backend + what is missing
+vperf run -o baseline -- ./yourapp
+vperf attach -p 1234 --duration 10
+```
+
+A macOS profile is a normal vperf profile directory: `meta.json`, `script.txt`
+and `rss.json` are written, so `vperf report` regenerates the HTML report and
+`vperf diff` compares two macOS runs. The Overview shows `n/a` for everything
+that needs a hardware counter, exactly as a Linux profile would when the
+counter is missing.
+
+The macOS hotspot data comes from `sample`, whose per-thread call-graph dump is
+already symbolicated — so `--callgraph`, `--no-inline`, `--mem-period` and the
+frequency knobs are ignored there (they have no meaning without perf).
 
 ### Wait / off-CPU analysis
 
