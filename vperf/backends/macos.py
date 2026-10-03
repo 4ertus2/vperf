@@ -315,6 +315,12 @@ def _settle(pid: int, grace: float) -> None:
     while time.monotonic() < deadline:
         try:
             os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            # not ours to signal, but it is running - same distinction
+            # cmd_attach makes before it profiles another user's process
+            break
         except OSError:
             return
         time.sleep(0.002)

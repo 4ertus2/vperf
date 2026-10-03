@@ -3,10 +3,11 @@ import os
 import signal
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from vperf import collector
+from vperf import cli, collector
 from vperf.cli import _analyze, _thread_metrics_payload, build_parser
 from vperf.doctor import INTEL_LDLAT, VENDOR_AMD, VENDOR_INTEL
 from vperf.perf import PerfResult
@@ -148,7 +149,7 @@ class _FakeCollector:
     def result(self, timeout=None):
         return self._result
 
-    def stop(self):
+    def stop(self, grace: float = 2.0):
         return self._result
 
 
@@ -683,6 +684,290 @@ def test_attach_duration_signals_only_stop_and_continue(monkeypatch, tmp_path):
     assert signal.SIGTERM not in [sig for _pid, sig in signals]
     assert signal.SIGKILL not in [sig for _pid, sig in signals]
     assert profile.meta["mode"] == "attach"
+
+
+def test_attach_on_sigint_still_writes_the_profile(monkeypatch, tmp_path):
+    """An interrupted attach is a profile, not a crash.
+
+    This is how the ClickBench driver ends a query profile: it sends SIGINT the
+    moment the query returns, because the query's runtime is not knowable before
+    it runs and a fixed window either truncates it or pads it with idle.
+    """
+    outdir = tmp_path / "attach-interrupted"
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(collector, "_probe_capabilities",
+                        lambda: (["task-clock"], [], "cycles:P"))
+    monkeypatch.setattr(collector, "_memory_plan", lambda period: None)
+    monkeypatch.setattr(collector, "_process_state", lambda pid: "R")
+    monkeypatch.setattr(collector.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(collector, "_monitor_collectors", interrupted)
+    monkeypatch.setattr(collector, "start_perf", lambda args: _FakeCollector(args))
+    monkeypatch.setattr(collector, "run_perf",
+                        lambda args, timeout=None, stdout_file=None, defer=False:
+                        _defer(PerfResult(0, "", ""), defer))
+    monkeypatch.setattr(collector, "perf_version", lambda: "perf test")
+
+    profile = collector.collect(
+        target_cmd=None, pid=321, outdir=str(outdir),
+        duration=600.0, use_stat=True, use_record=True,
+        use_memory=False, use_wait=False, use_freq=False,
+    )
+
+    # the window it asked for and the window it collected are different numbers,
+    # and the report says so rather than pretending the duration elapsed
+    assert profile.meta["elapsed_wall"] < 600.0
+    assert any("SIGINT" in w for w in profile.warnings)
+    assert (outdir / "meta.json").exists()
+
+
+def test_the_sampler_clock_is_the_one_perf_timestamps_use(monkeypatch):
+    """perf's sample timestamps come from the kernel's clock, not userspace's.
+
+    Inside a time namespace the two disagree by however much the namespace is
+    offset - measured here as 13711 s against 39873 s - and the samplers' origins
+    are what place the RSS and Frequency curves on the sample timeline. Reading
+    CLOCK_BOOTTIME is what puts them on the same axis as perf.
+    """
+    monkeypatch.setattr(collector.time, "CLOCK_BOOTTIME", 7, raising=False)
+    monkeypatch.setattr(collector.time, "clock_gettime",
+                        lambda which: 39873.0 if which == 7 else 13711.0)
+
+    assert collector._sample_clock() == 39873.0
+
+    # and a platform without it falls back to what it always used
+    monkeypatch.delattr(collector.time, "CLOCK_BOOTTIME", raising=False)
+    monkeypatch.setattr(collector.time, "monotonic", lambda: 13711.0)
+
+    assert collector._sample_clock() == 13711.0
+
+
+def test_the_rss_sampler_takes_its_origin_from_the_sample_clock(monkeypatch):
+    monkeypatch.setattr(collector, "_sample_clock", lambda: 500.0)
+    monkeypatch.setattr(collector, "_read_rss", lambda pid: 1024)
+
+    sampler = collector._RssSampler(pid=1, interval=0.001)
+    sampler.start()
+    time.sleep(0.02)
+    samples = sampler.stop()
+
+    assert sampler.t0 == 500.0
+    assert samples and samples[0][1] == 1024
+
+
+def test_attach_profiles_a_pid_it_is_not_allowed_to_signal(monkeypatch):
+    """A systemd clickhouse-server belongs to another user.
+
+    Signal permission is not profile permission: `kill -0` comes back EPERM for
+    a process we may not signal, and refusing there made the one process the
+    ClickBench server mode profiles unprofileable. perf holds CAP_PERFMON through
+    file capabilities, which is the permission that actually matters.
+    """
+    calls: list[int] = []
+
+    class _Args:
+        pid = 4242
+        outdir = None
+        freq = 199
+        interval = None
+        duration = 5.0
+        no_stat = False
+        callgraph = "fp"
+        mem_period = 100003
+        mem_time_quantum = None
+        no_wait = False
+        no_rss = False
+        no_inline = False
+        startup_grace = 0.15
+
+    def fake_kill(pid, sig):
+        calls.append(sig)
+        if sig == 0:
+            raise PermissionError(1, "Operation not permitted")
+
+    profile = SimpleNamespace(
+        meta={}, warnings=[], stat=None, elapsed=1.0, script_path=None,
+        mem_report_path=None, wait_path=None, freq_timeline=None,
+        thread_stats=None, rss_timeline=None,
+    )
+    monkeypatch.setattr(cli.os, "kill", fake_kill)
+    monkeypatch.setattr(cli, "probe_attach", lambda: (True, ""))
+    monkeypatch.setattr(cli, "_ensure_access", lambda: None)
+    monkeypatch.setattr(cli, "_collect_attach", lambda args, outdir: profile)
+    monkeypatch.setattr(cli, "_finish", lambda *a, **k: None)
+
+    assert cli.cmd_attach(_Args()) == 0
+    assert 0 in calls, "it never got past the liveness probe"
+
+
+def test_attach_still_refuses_a_pid_that_does_not_exist(monkeypatch):
+    class _Args:
+        pid = 4242
+
+    def fake_kill(pid, sig):
+        raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(cli.os, "kill", fake_kill)
+    assert cli.cmd_attach(_Args()) == 2
+
+
+def test_an_interrupt_during_startup_does_not_orphan_a_collector(monkeypatch, tmp_path):
+    """A collector left running holds the PMU, and every later profile then fails.
+
+    perf's counters are a machine-wide resource: an orphaned `perf record` or
+    `perf stat` left attached makes the next run's events fail to open, which is
+    what an interrupt during vperf's startup window used to do - the collectors
+    were launched, the SIGINT arrived before the monitor loop, and nothing stopped
+    them.
+    """
+    stopped: list[str] = []
+    settled: list[object] = []
+
+    class _Tracked(_FakeCollector):
+        def stop(self, grace: float = 2.0):
+            stopped.append(self.args[0])
+            return self._result
+
+    def fake_start_perf(args, stdout_file=None):
+        return _Tracked(args)
+
+    def fake_settle(process, grace):
+        # the first settle is perf stat's; the second is perf record's, by which
+        # point both collectors exist
+        if settled:
+            raise KeyboardInterrupt
+        settled.append(process)
+
+    monkeypatch.setattr(collector, "_probe_capabilities",
+                        lambda: (["task-clock"], [], "cycles:P"))
+    monkeypatch.setattr(collector, "_memory_plan", lambda period: None)
+    monkeypatch.setattr(collector, "_process_state", lambda pid: "R")
+    monkeypatch.setattr(collector.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(collector, "start_perf", fake_start_perf)
+    monkeypatch.setattr(collector, "_settle_collector", fake_settle)
+    monkeypatch.setattr(collector, "run_perf",
+                        lambda args, timeout=None, stdout_file=None, defer=False:
+                        _defer(PerfResult(0, "", ""), defer))
+    monkeypatch.setattr(collector, "perf_version", lambda: "perf test")
+
+    # attach mode treats the interrupt as "stop now" and still writes the
+    # profile; what must not happen is a collector left running
+    profile = collector.collect(
+        target_cmd=None, pid=321, outdir=str(tmp_path / "orphan"),
+        duration=5.0, use_stat=True, use_record=True,
+        use_memory=False, use_wait=False, use_freq=False,
+    )
+
+    assert sorted(stopped) == ["record", "stat"], stopped
+    assert any("SIGINT" in w for w in profile.warnings)
+
+
+def test_collect_marks_the_instant_recording_started(monkeypatch, tmp_path):
+    """A driver needs to know when the workload it is profiling may begin.
+
+    It ends the profile with SIGINT, and a SIGINT that arrives before the
+    collectors are monitored ends the run with nothing collected. perf.data
+    cannot be that signal - it exists from the moment perf record opens, and the
+    collector-settle window and the samplers' start still have to pass after it.
+    """
+    outdir = tmp_path / "marker"
+
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
+        if args[:1] == ["script"] and stdout_file:
+            Path(stdout_file).write_text("worker 42 1.0: 100 cycles:P:\n", encoding="utf-8")
+        return _defer(PerfResult(0, "", ""), defer)
+
+    monkeypatch.setattr(collector, "_probe_capabilities",
+                        lambda: (["task-clock"], [], "cycles:P"))
+    monkeypatch.setattr(collector, "probe_ibs", lambda: False)
+    monkeypatch.setattr(collector, "probe_intel_mem", lambda: False)
+    monkeypatch.setattr(collector, "probe_wait", lambda: False)
+    monkeypatch.setattr(collector, "_process_state", lambda pid: "R")
+    monkeypatch.setattr(collector.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(collector, "start_perf", lambda args: _FakeCollector(args))
+    monkeypatch.setattr(collector, "run_perf", fake_run_perf)
+    monkeypatch.setattr(collector, "perf_version", lambda: "perf test")
+
+    collector.collect(
+        target_cmd=None, pid=321, outdir=str(outdir), duration=0.01,
+        use_stat=True, use_record=True, use_memory=False,
+        use_wait=False, use_freq=False,
+    )
+
+    marker = outdir / collector.RECORDING_MARKER
+    assert marker.exists()
+    assert marker.read_text(encoding="utf-8").strip()
+
+
+def test_collector_stop_gets_long_enough_to_flush_perf_data(monkeypatch):
+    """perf.data for a wide target is big, and a record killed mid-flush is a
+    record judged failed - which takes its samples with it.
+
+    Sampling a 359-thread server at 499 Hz with 16 KiB DWARF stacks writes ~140 MB
+    for one second of wall clock, so the 2 s stop grace escalated to SIGTERM while
+    perf was still writing, and every query came back with counters and no
+    samples.
+    """
+    graces: list[float] = []
+
+    class _Proc:
+        def stop(self, grace: float = 2.0):
+            graces.append(grace)
+            return PerfResult(0, "", "")
+
+    assert collector._finish_collector(_Proc()).ok
+    assert graces == [collector._COLLECTOR_STOP_GRACE]
+    assert collector._COLLECTOR_STOP_GRACE >= 30.0
+
+
+def test_attach_asks_for_sigint_even_when_it_arrives_ignored(monkeypatch):
+    """An attached profile has to be endable from outside the process.
+
+    The ClickBench driver ends each query's profile by sending SIGINT the moment
+    the query returns, and it launches vperf as a background job - which bash
+    starts with SIGINT ignored, because POSIX says so. CPython then installs no
+    KeyboardInterrupt handler at all, so the signal would be dropped and the
+    profile would run out to --duration instead of ending with the query.
+    """
+    asked = []
+
+    class Args:
+        pid = 2 ** 31 - 1        # no such process: cmd_attach bails out at once
+
+    monkeypatch.setattr(cli.signal, "signal",
+                        lambda signum, handler: asked.append((signum, handler)))
+    assert cli.cmd_attach(Args()) == 2
+    assert asked == [(signal.SIGINT, signal.default_int_handler)]
+
+
+def test_run_on_sigint_still_unwinds(monkeypatch, tmp_path):
+    """Run mode keeps Ctrl-C aborting: the target is ours to kill, not to watch."""
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    _amd_vendor(monkeypatch)
+    monkeypatch.setattr(collector, "_probe_capabilities",
+                        lambda: (["task-clock"], [], "cycles:P"))
+    monkeypatch.setattr(collector, "probe_ibs", lambda: False)
+    monkeypatch.setattr(collector, "probe_intel_mem", lambda: False)
+    monkeypatch.setattr(collector, "probe_wait", lambda: False)
+    monkeypatch.setattr(collector, "_monitor_collectors", interrupted)
+    monkeypatch.setattr(collector.subprocess, "Popen", lambda *args, **kwargs: _FakeTarget())
+    monkeypatch.setattr(collector.os, "killpg", lambda pid, sig: None)
+    monkeypatch.setattr(collector, "start_perf", lambda args: _FakeCollector(args))
+    monkeypatch.setattr(collector, "run_perf",
+                        lambda args, timeout=None, stdout_file=None, defer=False:
+                        _defer(PerfResult(0, "", ""), defer))
+    monkeypatch.setattr(collector, "perf_version", lambda: "perf test")
+
+    with pytest.raises(KeyboardInterrupt):
+        collector.collect(
+            target_cmd=["app"], pid=None, outdir=str(tmp_path / "run-interrupted"),
+            use_stat=True, use_record=True, use_memory=False,
+            use_wait=False, use_freq=False,
+        )
 
 
 def test_profile_commands_do_not_expose_record_or_memory_toggles():

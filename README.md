@@ -48,7 +48,14 @@ script. See [Development](#development).
 - **Wait / off-CPU** — per thread, On-CPU seconds next to Sleep, Blocked/IO and
   Runnable seconds, with a "where the time went" bar.
 - **Timelines** — CPU utilization, resident memory (with the run's peak) and
-  frequency, across the whole run.
+  frequency, across the whole run. The memory and frequency curves are placed on
+  the sample timeline by a clock origin each sampler records, which has to be the
+  clock perf prints its sample timestamps on — inside a Linux time namespace
+  those are not the clock userspace reads, so vperf reads `CLOCK_BOOTTIME` and,
+  for profiles collected before that or on a host where the clocks still differ,
+  re-aligns the origins when rendering and says so under the charts. Without that
+  both curves draw *empty* while their data sits in the file, which is invisible
+  rather than wrong-looking.
 - **Scoping** — a thread selector (with an optional group-by-name mode) and a
   time selection on the chart narrow every view that has the data for it.
 
@@ -206,3 +213,72 @@ hardware counters. `bench/clear-caches.py` makes a cold run *known* rather than
 assumed (`posix_fadvise(POSIX_FADV_DONTNEED)`, verified with `mincore`), which
 is how the I/O half of a query becomes visible: the same Q13 on the same machine
 spent 1.3 s in Blocked/IO cold against 0.3 s warm, 12.3 s of CPU against 22.7 s.
+
+### Against a running clickhouse-server
+
+`--mode server` runs the same 43 queries against a MergeTree `hits` table in a
+`clickhouse-server` rather than `clickhouse-local` reading the parquet, and
+profiles each one by attaching vperf to the server:
+
+```bash
+bench/clickbench_profiles.sh --mode server --load             # load, then profile all
+bench/clickbench_profiles.sh --mode server --from 18 --to 18  # one query, table reused
+bench/clickbench_profiles.sh --mode server --optimize-final   # merge every part first
+bench/clickbench_profiles.sh --mode server --private-server    # own server, own data dir
+```
+
+Loading takes no privileges at all. ClickHouse confines the `file()` function to
+its `user_files_path` (`/var/lib/clickhouse/user_files/`, inside a `700`
+clickhouse-owned `/var/lib`), so a server cannot read a parquet that sits
+anywhere else — ClickBench's own load works around that with a root-owned
+symlink. The driver streams the file's bytes in instead
+(`INSERT INTO hits FORMAT Parquet`, parsed by the server with parallel parsing),
+so nothing is installed, nothing is added to a group, and no `sudo` is involved.
+The dataset's columns are checked against the schema before the first byte is
+sent, because the Parquet reader matches columns *by name* and would otherwise
+fill a missing one with defaults.
+
+Credentials come from `~/.clickhouse-client/config.xml` (`<host>`, `<port>`,
+`<user>`, `<password>`) — the driver has no auth flags of its own, so the
+server's credentials stay in one place you control. `--load` drops and refills,
+`--skip-load` uses whatever is there, and the default loads only when `hits` is
+missing. Loading 100M rows into a table with `fsync_after_insert = 1` takes
+minutes, and the log carries the table's size as it fills. `--optimize` /
+`--optimize-final` are opt-in because ClickBench does not optimize, and because
+the schema has no `PARTITION BY`: a FINAL merges every part of the whole table.
+
+Two things to know about the reports:
+
+- **A profile is the whole server process**, not the query. A running
+  ClickHouse holds hundreds of background threads (164 `ThreadPool`, 16
+  `MergeMutate`, 16 `Fetch` and the `Bg*` pools on a stock 16-core box), so the
+  Overview counters and the utilization curve cover all of them — group or scope
+  to the query's threads in the Threads tab to read the query. `--private-server`
+  starts a dedicated server instead, which keeps those threads out of the
+  profile.
+- **Each profile covers exactly the query.** The runtime is not knowable in
+  advance (Q00 is ~0.1 s, Q35 ~90 s), so a fixed window would either truncate the
+  query or pad it with idle server; vperf ends the profile the moment the client
+  returns. `--max-duration` (300 s) is only the ceiling.
+
+Three things differ from a single-process target, all because sampling cost is
+per *thread* and a server has hundreds of them:
+
+- **Lower default rates.** `FREQ` defaults to 99 Hz here instead of 499, and
+  `MEM_PERIOD` to 4000003 instead of 1000003: a `clickhouse-server` runs 359
+  threads on a stock 16-core box (164 `ThreadPool`, 16 `MergeMutate`, 16
+  `Fetch`, the `Bg*` pools), and IBS samples every thread that retires cycles,
+  including background merges. Override with `FREQ=499 MEM_PERIOD=1000003`.
+- **No scheduler tracepoints** (`--wait` opts back in): a server switches
+  hundreds of background threads and their off-CPU time is not what a query
+  report is about.
+- **No freeze.** vperf cannot `SIGSTOP` a server it does not own — a systemd one
+  belongs to `clickhouse` — and does not need to: an already-running process has
+  no startup for the pause to protect. The profile starts when the collectors
+  open. Profiling still needs `perf` with `CAP_PERFMON`, which its file
+  capabilities usually carry; `vperf doctor` checks it and prints the `setcap`
+  line for your host if not.
+
+Expect a few seconds of post-processing per query on top of the query itself:
+`perf.data` for a one-second window over the whole server is ~100 MB, and both
+the flush and the `perf script` pass read all of it.

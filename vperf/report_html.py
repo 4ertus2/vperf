@@ -24,6 +24,37 @@ def esc(s) -> str:
     return html.escape(str(s), quote=True)
 
 
+# How far a sampler origin may sit from the first sample and still be believed:
+# generous enough for a sampler's lead-in and a collector's tail, far smaller than
+# any clock disagreement.
+_ORIGIN_SLACK_S = 10.0
+
+
+def _reanchor_origin(origin: float | None, t0: float, tspan: float) -> tuple[float | None, bool]:
+    """Put a sampler curve's origin on the sample timeline, if it is not.
+
+    Normally a no-op: the samplers take their origin on perf's clock precisely so
+    the RSS and Frequency curves can be placed against the sample times. It was
+    not always so, and a mismatch is invisible rather than wrong-looking - every
+    reading simply falls outside the window, both charts draw empty, and the data
+    sits in the file looking complete. Two ways to end up here: a profile
+    collected before the origins moved to perf's clock (and `vperf report`
+    re-renders those), and a host where the kernel's clock is not the one
+    userspace reads, as inside a time namespace.
+
+    The shift assumes the samplers start just before the collectors do, which is
+    what they do - they are started first and stopped last - so the first reading
+    belongs at the first sample. Only a gap larger than the window itself triggers
+    it: a curve that starts early or late by less than that is a lead-in or a
+    tail, not a different clock.
+    """
+    if origin is None:
+        return None, False
+    if abs(origin - t0) <= tspan + _ORIGIN_SLACK_S:
+        return origin, False
+    return t0, True
+
+
 def _fmt(v, suffix="", prec=2):
     if v is None:
         return "n/a"
@@ -488,7 +519,9 @@ function rssSvg(g,H,pad_t,ph){
   'Memory over time was not collected in this profile (--no-rss skips it).');
  var buckets=rssBuckets(),i,peak=RSS_PEAK||0;
  for(i=0;i<NBUCKETS;i++) if(buckets[i]>peak) peak=buckets[i];
- if(peak<=0) return rssEmpty(g,H,'No memory samples fall on this run\'s timeline.');
+ if(peak<=0) return rssEmpty(g,H,
+   'The memory sampler recorded nothing inside the measured window \u2014 check the '
+   +'"sample spread" line of vperf doctor.');
  var unit=rssUnit(peak),div=unit[0];
  /* the run's peak is the top of the plot, the way the utilization chart puts
     its ceiling there, so the marker line is the last thing the eye lands on */
@@ -525,9 +558,10 @@ function rssSvg(g,H,pad_t,ph){
  return svg;}
 
 function freqEnvelope(){
- /* the frequency sampler counts from its own origin, but it reads the same
-    CLOCK_MONOTONIC perf timestamps do, so FREQ_T0 puts the curve on the sample
-    timeline.  A profile without it keeps its own span. */
+ /* the frequency sampler counts from its own origin, taken on the clock perf
+    prints its sample timestamps on, so FREQ_T0 puts the curve on the sample
+    timeline (build_html re-anchors an origin that is on another clock).  A
+    profile without an origin keeps its own span. */
  var out=[],i,f,vals,n;
  for(i=0;i<FREQ.length;i++){
   f=FREQ[i];
@@ -543,9 +577,17 @@ function freqEnvelope(){
  return out;}
 
 function freqSvg(g,H,pad_t,ph){
- if(!FREQ.length) return '<svg xmlns="http://www.w3.org/2000/svg" width="'+g.W+'" height="'+H+'"></svg>';
+ if(!FREQ.length) return rssEmpty(g,H,'Frequency was not collected in this profile.');
  var env=freqEnvelope();
- if(!env.length) return '<svg xmlns="http://www.w3.org/2000/svg" width="'+g.W+'" height="'+H+'"></svg>';
+ /* An empty plot with no words on it is the one failure a reader cannot act on:
+    this curve is drawn from readings on the sampler's own clock, and when none of
+    them land inside the window the samples cover there is nothing to draw - while
+    the file says perfectly well which. So say it here, and point at the check
+    that tells the two causes apart (a sampler that ran, and a PMU that never
+    delivered samples inside the window). */
+ if(!env.length) return rssEmpty(g,H,
+   'The frequency sampler recorded nothing inside the measured window \u2014 check '
+   +'the "sample spread" line of vperf doctor.');
  var span=TSPAN,lo=env[0][0],hi=env[env.length-1][0];
  if(FREQ_T0===null) span=Math.max(hi-lo,1e-9);
  var ymax=0,i,e;
@@ -2451,17 +2493,33 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
         meta.get("cpu_vendor"))).replace("</", "<\\/")
 
     # ---- sampler curve origins, memory slice table, band/level names --------
-    # perf prints sample timestamps on CLOCK_MONOTONIC, the same clock the
-    # frequency and memory samplers read, so those origins are what line the
-    # three curves up.  rss_peak is the raw high-water mark the sampler saw: a
-    # spike shorter than a bucket is gone from the area, so the chart draws the
-    # peak as its own line and the terminal prints the same number.
-    freq_t0 = meta.get("freq_t0")
+    # The frequency and memory samplers record offsets from an origin on perf's
+    # own clock, so those origins are what line the three curves up.
+    # _reanchor_origin puts them on the sample timeline when they are not already
+    # - see its docstring for when that happens and what it costs.
+    # rss_peak is the raw high-water mark the sampler saw: a spike shorter than a
+    # bucket is gone from the area, so the chart draws the peak as its own line
+    # and the terminal prints the same number.
+    freq_t0, freq_shifted = _reanchor_origin(meta.get("freq_t0"), t0, tspan)
     freq_t0_json = "null" if freq_t0 is None else repr(float(freq_t0))
-    rss_t0 = meta.get("rss_t0")
+    rss_t0, rss_shifted = _reanchor_origin(meta.get("rss_t0"), t0, tspan)
     rss_t0_json = "null" if rss_t0 is None else repr(float(rss_t0))
     rss_peak = meta.get("rss_peak")
     rss_peak_json = "0" if rss_peak is None else repr(int(rss_peak))
+    shifted = [name for name, was in (("Frequency", freq_shifted),
+                                      ("Memory RSS", rss_shifted)) if was]
+    clock_note_html = ""
+    if shifted:
+        clock_note_html = (
+            '<div class="note" style="margin-top:6px">'
+            + esc(f"{' and '.join(shifted)} "
+                  "curve origin re-aligned to the sample timeline: the sampler read a "
+                  "clock that is not the one perf's sample timestamps use, and the two "
+                  "differed by more than this run is long - left alone, every reading "
+                  "would fall outside the window and the chart would draw empty. A "
+                  "profile collected on a host inside a time namespace, or before vperf "
+                  "read perf's clock, needs this; re-collecting it fixes the cause.")
+            + "</div>")
     mem_rows = _memory_rows_payload(mem, t0)
     mem_rows_json = json.dumps(mem_rows["rows"]).replace("</", "<\\/")
     mem_sym_json = json.dumps(mem_rows["sym"]).replace("</", "<\\/")
@@ -2560,6 +2618,7 @@ double-click to clear — tabs below follow it</span>
 <div class="drag-handle right" id="drag-right" style="left:100%"></div>
 </div>
 <div id="scope-line" class="mono"></div>
+{clock_note_html}
 </div>
 
 <div class="tabs">

@@ -7,7 +7,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 
-from .perf import perf_available, perf_version, run_perf
+from .perf import PerfError, perf_available, perf_version, run_perf, start_perf
 
 # CAP_PERFMON covers the PMU, CAP_SYS_PTRACE lets perf attach to and read other
 # processes, and CAP_DAC_READ_SEARCH is what gets past the root-only tracefs
@@ -280,6 +280,11 @@ def run_doctor() -> DoctorReport:
             break
     if precise:
         rep.add("record probe", "OK", f"sampling event: {precise}")
+        spread_ok, spread_detail = probe_sampling_spread(precise)
+        if spread_ok:
+            rep.add("sample spread", "OK", spread_detail)
+        else:
+            rep.add("sample spread", "WARN", spread_detail)
     else:
         rep.add("record probe", "FAIL", "no usable cycles event")
 
@@ -316,6 +321,55 @@ def probe_record(event: str) -> tuple[bool, str]:
     except OSError:
         pass
     return r.returncode == 0, ""
+
+
+def probe_sampling_spread(event: str, seconds: float = 6.0) -> tuple[bool, str]:
+    """Do samples arrive *over time*, or all at once?
+
+    `perf record` succeeding only proves the event opened. A host whose PMU is
+    not really there - a virtualised one, typically - opens the event, delivers a
+    single burst of samples seconds later, and then goes quiet, so every hotspot,
+    flame graph and timeline is computed from one instant while looking like a
+    profile of the whole run. Measured on such a host: a 28 s recording produced
+    15 samples, all within 5 ms of each other, at t+3.9 s.
+
+    Returns (spread, detail): a WARN rather than a FAIL, because the recording is
+    still a recording - it is just not a time series.
+    """
+    data = "/tmp/vperf-spread-probe.data"
+    placeholder = ["sleep", f"{seconds:.0f}"]
+    r = run_perf(["record", "-o", data, "-F", "199", "-e", event, "--", *placeholder],
+                 timeout=seconds + 30)
+    stamps: list[float] = []
+    try:
+        if r.ok:
+            sr = run_perf(["script", "-i", data], timeout=60)
+            if sr.ok:
+                for line in sr.stdout.splitlines():
+                    parts = line.split()
+                    # "<comm> <pid> <seconds>: ..." - comm may contain spaces,
+                    # so the timestamp is the last colon-bearing field before it
+                    for tok in reversed(parts[:6]):
+                        if tok.endswith(":") and tok[:-1].replace(".", "").isdigit():
+                            try:
+                                stamps.append(float(tok[:-1]))
+                            except ValueError:
+                                pass
+                            break
+    finally:
+        try:
+            os.unlink(data)
+        except OSError:
+            pass
+    if len(stamps) < 2:
+        return False, f"only {len(stamps)} sample(s) in {seconds:g}s"
+    spread = max(stamps) - min(stamps)
+    if spread < 0.25:
+        return False, (f"{len(stamps)} samples inside {spread * 1000:.0f} ms "
+                       f"of a {seconds:g}s window: the PMU is not delivering "
+                       f"samples over time, so profiles from this host are a "
+                       f"single instant")
+    return True, f"{len(stamps)} samples spanning {spread:.1f}s"
 
 
 def probe_wait() -> bool:
@@ -368,38 +422,39 @@ def probe_attach() -> tuple[bool, str]:
     Many kernels require CAP_PERFMON/CAP_SYS_PTRACE for -p attachment even
     when launch-mode profiling is allowed by paranoid settings.
     """
-    import signal
     import time as _t
 
-    p = subprocess.Popen(["sleep", "3"])
     csv = "/tmp/vperf-attach-probe.csv"
+    # perf either attaches to a pid or launches a workload, never both: asked to
+    # do both it prints its usage and exits non-zero, which is how this probe came
+    # to report "attach unavailable" on a host where attaching works perfectly.
+    # It also does not stop when the target does - a target that has exited but
+    # not been reaped still counts as alive to it - so waiting on a python-owned
+    # `sleep` hung this probe for its full timeout. What the collectors do is
+    # what this does: perf runs against a pid, and then it is stopped.
+    proc = start_perf(["stat", "-x,", "-o", csv, "-e", "task-clock", "-p", str(os.getpid())])
     try:
-        _t.sleep(0.2)
-        r = run_perf(["stat", "-x,", "-o", csv, "-e", "task-clock", "-p", str(p.pid),
-                      "--", "sleep", "1"], timeout=20)
-        if not r.ok:
-            return False, (r.stderr or "perf stat -p failed").strip().splitlines()[0][:160]
-        body = ""
+        _t.sleep(1.2)
+        r = proc.stop()
         try:
             with open(csv) as f:
                 body = f.read()
         except OSError:
-            pass
-        if "<not counted>" in body:
+            return False, "perf stat -p wrote no output"
+        if not r.ok and "<not counted>" not in body and r.stderr:
+            return False, r.stderr.strip().splitlines()[0][:160]
+        if "<not counted>" in body or not body.strip():
             return False, ("counts came back <not counted>: attach needs CAP_PERFMON/"
                            f"CAP_SYS_PTRACE ({setcap_command()})")
         return True, ""
+    except PerfError as exc:
+        return False, str(exc)[:160]
     finally:
+        proc.stop(grace=0.5)
         try:
             os.unlink(csv)
         except OSError:
             pass
-        try:
-            p.send_signal(signal.SIGKILL)
-            p.wait(timeout=5)
-        except Exception:
-            pass
-
 
 __all__ = [
     "AMD_ONLY_EVENTS",

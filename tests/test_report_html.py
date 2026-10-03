@@ -11,6 +11,7 @@ from vperf.parsers import ScriptSample, StatData
 from vperf.report_html import (
     _CSS,
     _JS,
+    _reanchor_origin,
     _memory_rows_payload,
     _sample_payload,
     _group_options,
@@ -625,8 +626,13 @@ def test_build_html_embeds_the_memory_timeline_and_its_origin():
     prints too, so the two never disagree."""
     meta = {"target": {"cmd": ["app"]}, "ncpus": 4,
             "rss_t0": 100.0, "rss_peak": 1073741824}
+    # the origin is on perf's clock, so the profile's own time range has to start
+    # there too - a sample at 100.0s, the way a real profile's first one does
+    prof = build_profile([
+        ScriptSample("worker", 42, 42, 100.0, 1, "cycles:P", [("worker", "app")]),
+    ])
 
-    html = build_html(meta, [], MetricsReport(), build_profile([]),
+    html = build_html(meta, [], MetricsReport(), prof,
                       rss_timeline=[[0.01, 536870912], [0.02, 1073741824]])
 
     assert "RSS=[[0.01, 536870912], [0.02, 1073741824]];" in html
@@ -1338,3 +1344,68 @@ def test_a_thread_or_group_timeline_is_capped_at_its_own_ceiling():
     assert "function ceilingNote(g)" in _JS
     assert "one thread can use one core" in _JS
     assert "of '+fmtCount(scopeCeiling())+' logical CPUs" in _JS
+
+
+class TestSamplerCurveOrigins:
+    """The RSS and Frequency curves are placed against perf's sample times.
+
+    Their samplers record offsets from an origin on perf's clock, and when that
+    origin is on a *different* clock every reading falls outside the window and
+    both charts draw empty - the data sits in the file looking complete. Inside a
+    time namespace that is exactly what happens: measured on a host whose shell
+    sits in one, time.monotonic() read 13711 s where perf and /proc/uptime read
+    39873 s.
+    """
+
+    def test_an_origin_on_the_sample_clock_is_left_alone(self):
+        origin, shifted = _reanchor_origin(1000.0, t0=1000.0, tspan=2.0)
+        assert origin == 1000.0
+        assert shifted is False
+
+    def test_a_lead_in_is_not_a_clock_mismatch(self):
+        # the samplers start before the collectors do, so an origin a little
+        # behind the first sample is normal and must not be "corrected"
+        origin, shifted = _reanchor_origin(996.0, t0=1000.0, tspan=2.0)
+        assert origin == 996.0
+        assert shifted is False
+
+    def test_an_origin_another_clock_away_is_moved_onto_the_window(self):
+        origin, shifted = _reanchor_origin(13711.0, t0=39590.0, tspan=1.5)
+        assert origin == 39590.0
+        assert shifted is True
+
+    def test_no_origin_stays_no_origin(self):
+        assert _reanchor_origin(None, t0=1.0, tspan=1.0) == (None, False)
+
+    def test_build_html_says_so_when_it_moves_one(self):
+        prof = build_profile([
+            ScriptSample("worker", 42, 42, 1000.5, 1, "cycles:P", [("worker", "app")]),
+        ])
+        meta = {
+            "target": {"cmd": ["app"]},
+            "mode": "attach",
+            "freq_t0": 4000.0,     # a different clock entirely
+            "rss_t0": 4000.0,
+        }
+
+        html = build_html(meta, [], MetricsReport(), prof, _profile(),
+                          freq_timeline=[[0.0, {"0": 3000000}]],
+                          rss_timeline=[[0.0, 1024]])
+
+        assert "curve origin re-aligned" in html
+        assert "FREQ_T0=1000.5" in html
+
+    def test_an_empty_curve_says_which_failure_it_is(self):
+        """A blank plot is the one failure a reader cannot act on.
+
+        Both header curves are drawn from readings on a sampler's own clock, so
+        they can be empty while the file is complete - and the report has to name
+        the cause instead of showing an empty box.
+        """
+        assert "The frequency sampler recorded nothing inside the measured window" in _JS
+        assert "The memory sampler recorded nothing inside the measured window" in _JS
+        assert "sample spread" in _JS
+        # and the frequency curve has an in-place empty state at all, rather than
+        # returning a bare <svg>
+        body = _JS.split("function freqSvg(")[1].split("\nfunction ")[0]
+        assert "rssEmpty(" in body
