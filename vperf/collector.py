@@ -1091,6 +1091,19 @@ def collect(
     startup_grace: float = DEFAULT_STARTUP_GRACE,
 ) -> ProfileData:
     """Profile either a new process (`target_cmd`) or an existing one (`pid`)."""
+    if sys.platform == "darwin":
+        from .backends.macos import collect_macos
+
+        return collect_macos(
+            target_cmd=target_cmd,
+            pid=pid,
+            outdir=outdir,
+            duration=duration,
+            use_rss=use_rss,
+            quiet_stdout=quiet_stdout,
+            startup_grace=startup_grace,
+        )
+
     os.makedirs(outdir, exist_ok=True)
     warnings: list[str] = []
 
