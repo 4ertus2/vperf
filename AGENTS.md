@@ -12,9 +12,10 @@ When a change alters observable behaviour, **both files may need updating**:
 
 | Change | Update |
 |---|---|
-| a metric, threshold, or the meaning of a report number | `README.md` (vendor table, VTune interpretation table, relevant section) **and** `AGENTS.md` if it touches a contract below |
-| a CLI flag or its default | `README.md` (Usage + Flags) **and** `AGENTS.md` flag table |
-| a new artifact in the profile directory | `README.md` (artifact paragraph) **and** `AGENTS.md` (artifact table) |
+| a metric, threshold, or the meaning of a report number | `AGENTS.md` — "Metric thresholds" (the README has no interpretation table; the report carries the hints itself via `metrics.all_hints`) |
+| a CLI flag or its default | `README.md` (Quick start + Options) **and** `AGENTS.md` flag table |
+| anything the reader sees in `report.html` | `AGENTS.md` — "The report UI contract" |
+| a new artifact in the profile directory | `AGENTS.md` artifact table (the README does not list artifacts) |
 | internals, tests, conventions | `AGENTS.md` only |
 
 ---
@@ -267,6 +268,168 @@ folded in the browser.**
 Tabs are `overview, hotspots, mem, flame, tree, threads`, switched by
 `showTab(btn, id)`; header chart modes `util`/`mem`/`freq` via `setChartMode`;
 the Memory tab has its own count/latency switch.
+
+---
+
+## The report UI contract
+
+What the HTML report does, stated as behaviour rather than as a tutorial — the
+README deliberately does not teach the UI, so this is the only place it is
+written down. Changing any of it changes what the reader sees.
+
+### Flame graph
+
+- Click a frame to zoom into its branch: the subtree is re-laid out to the full
+  width, the call path leading to it greyed underneath, the focused frame
+  outlined in yellow, and tooltip percentages made relative to the focused
+  frame. Click the focused frame again to go up one level; any greyed ancestor
+  band is clickable to jump straight to it.
+- `Reset zoom` in the bar under the graph returns to the full graph. Switching
+  thread in the header selector, or moving the time selection, also resets it.
+- The graph is exactly as tall as the rows it draws and **never renders a row of
+  hairlines over the flame**: it ends at the last row with a frame at least 2px
+  wide, or at 48 rows (`MAX_FLAME_DEPTH`), whichever comes first. The rows cut
+  off fold into the frame they hang off, keeping the width they gave it, and its
+  tooltip says how many rows it stands for. Zooming into a shallow branch raises
+  the bottom edge with it rather than leaving empty space above.
+- It scales to the panel width; a frame too narrow for a label gets one as soon
+  as it is zoomed into.
+- It follows the thread selector *and* the time selection, at no file-size cost —
+  the samples ship once and are folded again in the browser.
+
+### Time selection
+
+- Two movable borders on the header chart. **Drag inside the plot** to select,
+  **drag the selection** to move it, **double-click** or press `Reset Selection`
+  to clear. A range is picked on the chart, never typed. The label beside the
+  button and the scope line under the chart name the range in seconds, its share
+  of the run, the sample count and the cycles behind it.
+- The curve always shows the **whole run** with the out-of-selection parts
+  dimmed, so a selection keeps its context and the borders line up with the axis.
+  All three chart modes (utilization / RSS / frequency) share that axis and that
+  selection; the RSS and frequency curves are placed on the sample timeline by the
+  clock their samplers share with perf. Every time shown anywhere in the report
+  is seconds into the run — perf's raw `CLOCK_MONOTONIC` timestamps stay inside.
+- The utilization y axis is **busy cores in the current scope, capped at what
+  that scope could possibly use**: all threads at the machine's logical CPU
+  count, a name group at its own thread count, **a single thread at one core**.
+  Its average is that scope's own CPU time over the charted window (per-thread
+  `task-clock` `perf stat`, summed over a group) — so a thread that used half a
+  core reads 0.5, and the plot never puts a thread at 16.
+  The *shape* between those points is an estimate and the code says so: perf
+  attributes a sample the cycles its core ran since that core's previous sample,
+  which is whatever else ran in between, so sampled buckets are smoothed before
+  they are scaled. A curve resting on the ceiling means "all of them, saturated".
+- What follows the selection: **Hotspots** (self, inclusive, estimated CPU
+  time), the **Flame Graph**, the **Call Tree**, the **Memory** tab (all five
+  panels plus the accesses-over-time chart, which shades the selection), and the
+  whole Threads tab — per-thread **cycles** and the scheduler's **on-CPU, Sleep,
+  Blocked/IO, Runnable, Off-CPU** columns and counts, plus the "where the time
+  went" bar. The wait half is a per-thread off-CPU timeline on the same clock the
+  borders are drawn on, folded in the browser from the shipped slices.
+- While dragging, the chart and the counters follow the borders; the flame graph,
+  call tree and memory panels rebuild once the drag settles — this is what keeps
+  dragging smooth on a 100k+ sample profile.
+- Memory samples are only known to the `--time-quantum` slice they fell in
+  (default ~100 slices, clamped 25 ms–1 s), so a window cutting a slice in half
+  counts half of it. A profile collected before that existed — or on a perf that
+  rejected the `time` sort key — keeps a whole-run Memory tab and says so.
+
+### Memory usage over time
+
+- The **Memory RSS** chart sits in the header between Utilization and Frequency,
+  sampled every 10 ms from `/proc/<pid>/statm` — the same number `top` prints. It
+  is a measured value, not an estimate: bucketing only loses spikes shorter than
+  a bucket, so the run's peak is drawn as its own dashed line and labelled with
+  the same number the terminal summary quotes.
+- It is the **whole process and does not follow the thread selector.** A process
+  is one address space: `/proc/<pid>/task/<tid>/statm` and the per-thread
+  `RssAnon`/`RssFile` in `.../status` both report the process total, so procfs
+  has no per-thread footprint to plot anywhere (measured on a 4-thread process
+  with 300 MiB allocated on one thread: 312.4 MiB reported by all four). For
+  per-thread memory *behaviour*, the Memory tab follows the scope.
+- `--no-rss` removes the curve and the peak row, and a profile collected before
+  RSS sampling existed has neither and says so in place of the chart.
+
+### Grouping threads by name
+
+- A checkbox next to the thread selector replaces the thread list with one entry
+  per thread name — the entry that was `ThreadPool ×54` becomes one line.
+- The group covers *every* thread of that name the profile knows, not just the
+  hottest 20 the ungrouped list shows. Ordering matches the ungrouped list:
+  most of the run's sampled cycles first (share in the label), name breaking
+  ties, groups that sampled nothing last.
+- Hotspots, the utilization chart and the flame graph merge the members' samples;
+  the utilization curve is the pool's total busy cores, so a 16-thread pipeline
+  reads as up to 16.
+- Overview counters are **summed before anything is derived** from them, so the
+  group IPC is `Σinstructions / Σcycles` — not an average that would weigh a
+  thread which sampled 10 cycles like one that ran the whole window.
+- The Memory tab adds up the members' IBS/PEBS samples and the scope line says
+  how many of them had any (`QueryPipelineEx ×16 threads, memory from 12 of 16`).
+- A group whose threads have no per-thread counters — the usual case, since
+  `perf stat --per-thread` only reports threads alive when counting attaches —
+  falls back to what the sampler knows: thread count, cycle share of the run, and
+  the CPU time that share works out to.
+- Costs nothing extra in the file: only the whole-run graph is pre-rendered, every
+  other scope is folded in the browser from the same samples.
+- The "where the time went" bar adds the members' waits, while the per-thread
+  table below keeps listing every thread. The Frequency chart stays run-level.
+- `perf mem report` labels every thread of a process with the *process* name, so
+  a thread groups under the name the sampler saw; only threads the sampler never
+  caught fall back to the coarser memory-report name.
+
+### Wait / off-CPU columns
+
+- The Threads tab merges the per-thread CPU and wait tables: each row carries
+  sampled cycles next to on/off-CPU seconds, joined on tid, and the wait columns
+  read `n/a` when scheduler tracepoints were not collected.
+- **On-CPU + Off-CPU is exactly the thread's observed window**, and the "where
+  the time went" bar splits the same way. `prev_state` maps to columns as:
+
+  | Column | `prev_state` | Means |
+  |---|---|---|
+  | Sleep | `S` | interruptible — futexes, condition variables, sleeping syscalls |
+  | Blocked/IO | `D` | every uninterruptible wait: disk I/O **and** page-fault waits from a cold cache |
+  | Runnable | `R` | run-queue wait after a preemption |
+  | *stopped* / *unknown* | — | traced but not attributable to a wait class |
+
+- A thread still switched out when the recording ends is left **uncharged**, not
+  guessed at: the tiny first delta was earned before the window opened.
+- The counts (Preempted, Sleeps, Blocks) are read off the shipped intervals, so
+  they count the switches that cost measurable time — a switch-out whose wait the
+  window never showed owns no interval and is not counted. That is also what makes
+  the server's count and the browser's the same number.
+- A wait **straddling a selection edge** is charged by the share inside it: a
+  count can come out fractional (rounded for display), a halved slice contributes
+  half its seconds. The delay-band histogram does not move at all — it counts the
+  waits that *started*, so it stays whole-run.
+- Every column heading carries a `?` that says what that column measures, hover
+  or keyboard focusable, so the definitions sit on the columns they define rather
+  than in prose above the table.
+
+### Metric thresholds
+
+`metrics.all_hints` and the report's footnotes hang off these. Changing one is a
+behaviour change to both docs.
+
+| Signal | Threshold | Reading |
+|---|---|---|
+| Effective CPU Utilization ≪ cores | — | serial or I/O-bound; a threading opportunity |
+| IPC | ≥ 2 / < 0.5 | compute-bound and efficient / stalled, look at the bound split |
+| Backend Bound | high | memory-hierarchy limited → check the LLC / L1D / dTLB rates |
+| Frontend Bound | high | fetch/decode limited (i-cache, large code footprint) |
+| Bad Speculation | > 5% | branch mispredicts or machine clears wasting cycles |
+| Retiring | < 30% | most pipeline slots lost; deep stall or contention |
+| Branch mispredict | > 5% | unpredictable branches dominate |
+| LLC miss rate | > 30% | working set exceeds cache — DRAM-bound on AMD, but L1 misses that reached L3 on Intel, so cross-check the Memory tab there |
+| L1D miss rate | > 5% | data-cache thrashing; blocking/tiling opportunity |
+| dTLB miss rate | > 1% | page-table walks hurting latency |
+| Vectorization ratio | < 50% | scalar or mixed-width code |
+| Avg memory-access latency | > 200 cyc | deep memory stalls; prefetch or restructure |
+| Blocked/IO ≫ On-CPU | — | the data is not in cache: waiting on the disk, not computing — the warm-vs-cold difference shows up here and nowhere else |
+| Runnable high, On-CPU low | — | oversubscribed; fewer threads or more work each |
+| Sleep high, On-CPU low | — | idle-waiting (futex / condvar), the pipeline is starving its own workers |
 
 ---
 
