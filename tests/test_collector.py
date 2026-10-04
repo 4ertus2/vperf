@@ -1353,3 +1353,107 @@ def test_collect_records_the_quantum_it_used(monkeypatch, tmp_path):
     # the knob the report reads is the one the capture was actually made with
     assert profile.meta["memory"]["time_quantum_ms"] == 75
     assert profile.meta["freq_t0"] is None  # no frequency sampling in this profile
+
+
+def _wait_collect(monkeypatch, tmp_path, name, *, probe, use_wait, script_lines=None):
+    """A combined collect() whose script dump is *script_lines*, for the wait cases.
+
+    ``use_stat=True`` is what routes collect() to _collect_combined, the live
+    path, where the wait artifact is carved out of script.txt by
+    _wait_artifact - so a dump carrying no `sched:` line is exactly what a wait
+    pass that recorded its events and got nothing back looks like.  The legacy
+    non-combined path writes wait.txt from a dump of its own and never sees this
+    distinction.
+    """
+    _amd_vendor(monkeypatch)
+    _FakeRssSampler.pids = []
+    calls = []
+
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
+        calls.append(list(args))
+        if args[:1] == ["script"]:
+            Path(stdout_file).write_text(
+                script_lines or "worker 42/42 1.0: 100 cycles:P:\n", encoding="utf-8")
+        return _defer(PerfResult(0, "", ""), defer)
+
+    monkeypatch.setattr(collector, "_probe_capabilities", lambda: (["task-clock"], [], "cycles:P"))
+    monkeypatch.setattr(collector, "probe_ibs", lambda: False)
+    monkeypatch.setattr(collector, "probe_intel_mem", lambda: False)
+    monkeypatch.setattr(collector, "probe_wait", probe)
+    monkeypatch.setattr(collector.subprocess, "Popen", lambda *a, **k: _FakeTarget())
+    monkeypatch.setattr(collector.os, "killpg", lambda pid, sig: None)
+    monkeypatch.setattr(collector, "start_perf", lambda args: _FakeCollector(args))
+    monkeypatch.setattr(collector, "run_perf", fake_run_perf)
+    monkeypatch.setattr(collector, "perf_version", lambda: "perf test")
+    monkeypatch.setattr(collector, "_FreqSampler", _FakeSampler)
+    monkeypatch.setattr(collector, "_RssSampler", _FakeRssSampler)
+    return collector.collect(
+        target_cmd=["app"], pid=None, outdir=str(tmp_path / name),
+        freq=399, use_stat=True, use_record=True, use_memory=False,
+        use_wait=use_wait, use_freq=False, use_rss=False,
+    ), calls
+
+
+def test_wait_meta_says_the_pass_was_never_asked_for(monkeypatch, tmp_path):
+    """--no-wait is an absence with a cause, and it is not the host's fault.
+
+    The Threads tab reads n/a across nine columns either way, so a note that
+    blames the capability for a profile nobody asked to have scheduler records in
+    sends the reader after a setcap line they do not need.
+    """
+    profile, calls = _wait_collect(monkeypatch, tmp_path, "wait-off", probe=lambda: True,
+                                   use_wait=False)
+
+    assert profile.meta["wait"] == {"enabled": False, "reason": "disabled", "detail": None}
+    # and nothing asked perf for the events, which is what "disabled" claims
+    assert not [call for call in calls if any("sched:" in arg for arg in call)]
+
+
+def test_wait_meta_names_the_capability_the_host_is_missing(monkeypatch, tmp_path):
+    """The pass was asked for and the host said no: say what it needs.
+
+    The detail is the same text `vperf doctor` prints, so the profile carries its
+    own remedy and the reason names the real one - tracefs is root-only, which it
+    takes CAP_DAC_READ_SEARCH to read, not CAP_PERFMON and not a lower paranoid.
+    """
+    profile, calls = _wait_collect(monkeypatch, tmp_path, "wait-denied", probe=lambda: False,
+                                   use_wait=True)
+
+    wait = profile.meta["wait"]
+    assert wait["enabled"] is False
+    assert wait["reason"] == "unavailable"
+    assert wait["detail"], "a denial has to carry the reason it was denied"
+    assert wait["detail"] == collector.wait_denial_reason()
+    assert not [call for call in calls if any("sched:" in arg for arg in call)]
+    # the warning the run log already carried now names the same cause
+    assert any(wait["detail"] in warning for warning in profile.warnings)
+
+
+def test_wait_meta_tells_an_empty_dump_from_the_other_two(monkeypatch, tmp_path):
+    """Events recorded, nothing in the dump: the cause the reader least expects.
+
+    This is the case a bare `enabled: false` cannot express at all - the host
+    allowed the pass and it still produced nothing - so it gets its own reason
+    rather than being filed under either of the other two.
+    """
+    profile, _ = _wait_collect(monkeypatch, tmp_path, "wait-empty", probe=lambda: True,
+                               use_wait=True, script_lines="worker 42/42 1.0: 100 cycles:P:\n")
+
+    assert profile.meta["wait"] == {"enabled": False, "reason": "empty", "detail": None}
+
+
+def test_wait_meta_carries_no_reason_when_the_pass_produced_its_artifact(monkeypatch, tmp_path):
+    """The reason exists to explain an absence, so a profile with wait data has none.
+
+    A reason left set on a working profile would be a second, contradictory thing
+    for the report to read, and the note has to stay on the two-measurements
+    wording when there are two measurements.
+    """
+    sched = ("worker 42/42 1.0: 100 sched:sched_stat_runtime: comm=worker pid=42 runtime=7 [ns]\n"
+             "worker 42/42 1.1: 100 sched:sched_switch: worker:42 [120] R ==> other:9 [120]\n")
+    profile, _ = _wait_collect(
+        monkeypatch, tmp_path, "wait-on", probe=lambda: True, use_wait=True,
+        script_lines="worker 42/42 1.0: 100 cycles:P:\n" + sched)
+
+    assert profile.meta["wait"] == {"enabled": True, "reason": None, "detail": None}
+    assert profile.wait_path is not None

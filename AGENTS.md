@@ -266,10 +266,20 @@ stdout → `build_html` → `report.html`.
 host, cpu_vendor, kernel, ncpus, freq, interval_ms, events[], metrics[],
 precise_event, callgraph, inline, thread_stats{enabled,cojoined,file},
 memory{enabled,backend,period,ldlat,events,data_file,cojoined,time_quantum_ms},
-wait{enabled}, freq_t0, rss_t0, rss_peak, record_launch_t0, record_exit_t0,
-startup_grace, perf_version,
-elapsed_wall`. The macOS backend adds `backend: "macos"`, `callgraph: "sample"`,
-`cpu_vendor: "Apple"`, `interval_ms: 50`.
+wait{enabled,reason,detail}, freq_t0, rss_t0, rss_peak, record_launch_t0,
+record_exit_t0, startup_grace, perf_version, elapsed_wall`. The macOS backend
+adds `backend: "macos"`, `callgraph: "sample"`, `cpu_vendor: "Apple"`,
+`interval_ms: 50`.
+
+`wait.reason` is why the Threads tab's nine wait columns are empty, and there are
+four: `disabled` (`--no-wait`), `unavailable` (the probe failed — `detail` is
+`doctor.wait_denial_reason()`, which names the real cause, tracefs being root-only
+and `CAP_DAC_READ_SEARCH` the thing that reads it, plus the `setcap` line for the
+host's real perf binary), `empty` (the events were recorded and the dump held none)
+and `unsupported` (macOS). It is `None` when the pass produced `wait.txt`. **The
+report must read it with `.get()` and never index it**: `vperf report` re-renders
+profile directories written before the key existed, and those keep the older
+wording that is true of every cause.
 
 ---
 
@@ -467,7 +477,14 @@ written down. Changing any of it changes what the reader sees.
 
 - The Threads tab merges the per-thread CPU and wait tables: each row carries
   sampled cycles next to on/off-CPU seconds, joined on tid, and the wait columns
-  read `n/a` when scheduler tracepoints were not collected.
+  read `n/a` when scheduler tracepoints were not collected. **The note over the
+  table names which absence that is**, because only one of the four is the
+  reader's to fix: `--no-wait` is a choice the profile records, a denied probe
+  carries the `setcap` line that would fix it, an empty dump is neither, and
+  macOS has no such tracepoints to record. A profile written before
+  `meta.wait.reason` existed keeps the older wording, which is true of all four —
+  read it with `.get()` and never index it, or `vperf report` breaks on every
+  directory this version did not write.
 - **On-CPU + Off-CPU is exactly the thread's observed window**, and the "where
   the time went" bar splits the same way. `prev_state` maps to columns as:
 

@@ -444,7 +444,15 @@ def collect_macos(
             "events": [], "data_file": None, "cojoined": False,
             "time_quantum_ms": None,
         },
-        "wait": {"enabled": False},
+        # not "disabled" and not "unavailable": there is no kernel scheduler
+        # tracepoint to record here, and no capability that would provide one,
+        # so the note must not send the reader looking for a setcap line
+        "wait": {
+            "enabled": False,
+            "reason": "unsupported",
+            "detail": "the macOS backend samples with `sample` and has no "
+                      "scheduler tracepoints to record",
+        },
         "freq_t0": None,
         "rss_t0": sampler.t0,
         "rss_peak": rss_peak,

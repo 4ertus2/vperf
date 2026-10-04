@@ -1860,13 +1860,22 @@ def _hotspots_table(prof: StackProfile) -> str:
             f"<tbody>{''.join(rows)}</tbody></table>")
 
 
-def _wait_note(wp: WaitProfile | None, foldable: bool) -> str:
+def _wait_note(wp: WaitProfile | None, foldable: bool,
+               reason: str | None = None, detail: str | None = None) -> str:
     """One line over the table; the per-column detail is a popup on each header.
 
     A paragraph explaining fourteen columns is a paragraph nobody reads, and it
     says the same thing the column it belongs to should say - so the table
     carries a `?` per header and the note here only says what the two halves
     are and what is left out.
+
+    With no wait data the line says *why* there is none, because the nine empty
+    columns read as a broken report otherwise.  The causes are genuinely
+    different and only one of them is the reader's to fix: nobody asked for the
+    pass, the host could not give it, the pass ran and the dump came back empty,
+    or the platform has no such tracepoints at all.  *reason* is None in a
+    profile directory written before meta recorded it, and the fallback wording
+    is the one that was true then.
     """
     if wp is not None and wp.window_s and wp.threads:
         unknown = wp.unknown_s
@@ -1883,6 +1892,21 @@ def _wait_note(wp: WaitProfile | None, foldable: bool) -> str:
                 " the scheduler's own on/off-CPU accounting, both scoped to the"
                 " selected window. Hover a column heading for what it measures."
                 + note)
+    if reason == "disabled":
+        return ("Wait columns are n/a: this profile was collected with --no-wait, so"
+                " the scheduler tracepoints were never recorded. Drop --no-wait to"
+                " collect them.")
+    if reason == "unavailable":
+        because = f" {esc(detail)}" if detail else ""
+        return ("Wait columns are n/a: the scheduler tracepoints could not be"
+                f" collected.{because}")
+    if reason == "empty":
+        return ("Wait columns are n/a: the scheduler tracepoints were recorded but"
+                " the dump held no wait samples for them.")
+    if reason == "unsupported":
+        return f"Wait columns are n/a: {esc(detail)}." if detail else (
+            "Wait columns are n/a: this platform has no scheduler tracepoints to"
+            " record.")
     return ("Wait columns are n/a: scheduler tracepoints were not collected "
             "(see vperf doctor for the required capability).")
 
@@ -2682,6 +2706,12 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
     wait_payload = _wait_payload(wp, t0, t1)
     wait_json = json.dumps(wait_payload, separators=(",", ":")).replace(
         "</", "<\\/") if wait_payload else "null"
+    # why the nine wait columns are empty, when they are: meta records the cause
+    # so the note can name it instead of guessing, and a directory written before
+    # that key existed simply has none and gets the wording that fits all of them
+    wait_meta = meta.get("wait") or {}
+    wait_note = _wait_note(wp, wait_payload is not None,
+                           wait_meta.get("reason"), wait_meta.get("detail"))
 
     # ---- thread list for selector -------------------------------------------
     thread_opts = _thread_options(prof, group_mem, thread_metrics)
@@ -2782,7 +2812,7 @@ rows too thin to read, and anything past {MAX_FLAME_DEPTH} rows, fold into the l
 <div id="threads" class="page">
 {_wait_panels(wp)}
 <div class="panel"><h3>Threads — CPU samples and wait time</h3>
-<div class="note" style="margin-bottom:8px">{_wait_note(wp, wait_payload is not None)}</div>
+<div class="note" style="margin-bottom:8px">{wait_note}</div>
 <div id="threads-body">{_threads_table(prof, wp)}</div></div>
 </div>
 

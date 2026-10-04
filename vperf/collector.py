@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 
 from . import doctor
-from .doctor import probe_ibs, probe_intel_mem, probe_wait
+from .doctor import probe_ibs, probe_intel_mem, probe_wait, wait_denial_reason
 from .memory import parse_mem_report
 from .parsers import (
     StatData,
@@ -112,6 +112,24 @@ def _memory_meta(*, enabled: bool, backend: str | None, period: int,
         # None when memory analysis did not run
         "time_quantum_ms": time_quantum_ms if enabled else None,
     }
+
+
+def _wait_meta(*, enabled: bool, reason: str | None = None,
+               detail: str | None = None) -> dict:
+    """Metadata for the wait pass, carrying *why* it produced nothing.
+
+    The Threads tab reads n/a across nine columns when there are no scheduler
+    records, and the reader has no way to tell a pass nobody asked for from one
+    the host could not give: the note above the table used to blame the
+    capability for both, which is wrong whenever --no-wait was the reason.  So the
+    cause travels in meta.json and the report words the one that applies.
+
+    *reason* is None whenever the pass ran, whatever it found, and *detail* is the
+    host-specific explanation only the "unavailable" case has - a report
+    re-rendered from a profile directory written before this key existed simply
+    has neither, and the report falls back to wording that is true of all of them.
+    """
+    return {"enabled": enabled, "reason": reason, "detail": detail}
 
 
 DEFAULT_CALLGRAPH = "fp"
@@ -808,15 +826,23 @@ def _collect_combined(
     stat_path = os.path.abspath(os.path.join(outdir, "stat_threads.csv"))
     data_path = os.path.join(outdir, "perf.data")
     wait_events: list[str] = []
+    # which of the two absences this is: nobody asked for the pass, or the host
+    # could not give it.  Recorded because the report cannot tell them apart
+    # from wait.txt's absence alone, and a note that blames the capability for a
+    # --no-wait profile sends the reader after a problem they do not have.
+    wait_reason = "disabled" if not use_wait else None
+    wait_detail: str | None = None
     if use_wait:
         if probe_wait():
             from .wait import TRACEPOINT_EVENTS
             wait_events = list(TRACEPOINT_EVENTS)
         else:
-            warnings.append(
-                "Wait analysis skipped: scheduler tracepoints need "
-                "CAP_PERFMON or kernel.perf_event_paranoid<=0."
-            )
+            # the denial names the real cause - tracefs is root-only and it takes
+            # CAP_DAC_READ_SEARCH, not CAP_PERFMON or paranoid, to read it - and
+            # prints the setcap line for this host's real perf binary
+            wait_reason = "unavailable"
+            wait_detail = wait_denial_reason()
+            warnings.append("Wait analysis skipped: " + wait_detail)
 
     target: subprocess.Popen | None = None
     target_pid = int(pid) if pid is not None else 0
@@ -1102,6 +1128,10 @@ def _collect_combined(
             if wait_events:
                 wait_path = _wait_artifact(script_path, outdir, wait_events)
                 if wait_path is None:
+                    # the events were in the recording and none of them came back
+                    # out of the dump: a third cause, neither "not asked for" nor
+                    # "the host said no", and the one the reader least suspects
+                    wait_reason = "empty"
                     warnings.append("Wait events recorded but script contained no wait samples.")
         else:
             error_lines = (script_result.stderr or "").strip().splitlines()
@@ -1171,7 +1201,12 @@ def _collect_combined(
                        if record_ok and active_memory_plan is not None else None),
             cojoined=memory_cojoined, time_quantum_ms=quantum_ms,
         ),
-        "wait": {"enabled": wait_path is not None},
+        "wait": _wait_meta(
+            enabled=wait_path is not None,
+            # None once the pass has produced its artifact, whatever it found
+            reason=None if wait_path is not None else wait_reason,
+            detail=wait_detail,
+        ),
         "freq_t0": getattr(freq_sampler, "t0", None),
         "record_launch_t0": record_launch_t0,
         "record_exit_t0": record_exit_t0,
@@ -1416,6 +1451,8 @@ def collect(
     from .wait import TRACEPOINT_EVENTS
     wait_path = None
     wait_enabled = False
+    wait_reason = "disabled" if not use_wait else None
+    wait_detail: str | None = None
     if use_wait:
         w_ok = probe_wait()
         if w_ok:
@@ -1436,14 +1473,19 @@ def collect(
                     wait_path = os.path.join(outdir, "wait.txt")
                     wait_enabled = True
                 else:
+                    wait_reason = "empty"
                     warnings.append("Wait events recorded but script dump failed.")
             else:
+                # the recording itself never happened, so there is no dump to be
+                # empty: left unset, which keeps the generic wording rather than
+                # claiming the tracepoints were collected and came back bare
                 wait_error = (r.stderr or "").strip().splitlines()
                 warnings.append("Wait pass failed: "
                                 + (wait_error[-1][:160] if wait_error else "wait pass failed"))
         else:
-            warnings.append("Wait analysis skipped: scheduler tracepoints need "
-                            "CAP_PERFMON or kernel.perf_event_paranoid<=0.")
+            wait_reason = "unavailable"
+            wait_detail = wait_denial_reason()
+            warnings.append("Wait analysis skipped: " + wait_detail)
 
     memory_pass_plan = fallback_memory_plan or (requested_memory_plan if not use_record else None)
     if use_memory and memory_pass_plan:
@@ -1518,7 +1560,11 @@ def collect(
             data_file=os.path.basename(memory_data_path) if memory_data_path else None,
             cojoined=memory_cojoined, time_quantum_ms=quantum_ms,
         ),
-        "wait": {"enabled": wait_enabled},
+        "wait": _wait_meta(
+            enabled=wait_enabled,
+            reason=None if wait_enabled else wait_reason,
+            detail=wait_detail,
+        ),
         "freq_t0": getattr(freq_sampler, "t0", None),
         "record_launch_t0": record_launch_t0,
         "record_exit_t0": record_exit_t0,
