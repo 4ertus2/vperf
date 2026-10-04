@@ -94,6 +94,7 @@ noise. Everything else is collected and reported identically on both.
 | `--no-inline` | a huge C++ binary spends most of the run expanding DWARF inlines (measured: a 4.9 GB ClickHouse debug build, ~80 s per `perf` call with inlines, ~2 s without) |
 | `--no-stat` / `--no-wait` / `--no-rss` | skip a pass you don't need — each one removes its panel from the report |
 | `--mem-time-quantum MS` | finer or coarser Memory-tab slices (default ~100 over the run, clamped 25 ms–1 s) |
+| `--keep-perf-data` | you want the raw `perf.data` left in the profile directory — it is removed by default once the dumps have been taken from it, and it is ~100 MB per second of a wide target |
 
 `--startup-grace` is worth calibrating against your target: measured on
 `clickhouse-local`, the thread pool goes 1 thread at 0 ms, 3 at 11 ms, 25 at
@@ -109,6 +110,11 @@ vperf attach -p 1234 --duration 10          # profile a running process (needs C
 vperf report .vperf/run_20260824_021912      # regenerate report.html from a saved profile
 vperf diff .vperf/before .vperf/after        # compare two profiles
 ```
+
+`vperf report` replays the text artifacts in the profile directory, so it works on
+a directory the raw recording has been removed from. Pass `--keep-perf-data` when
+you want to re-derive the dumps yourself — `perf script` with the DWARF inlines
+left in, `perf report`, `perf archive`, or a different tool entirely.
 
 A single profile is noisy, so `vperf cycle` repeats a target N times and writes a
 TSV matrix of metrics — one row per run — which `ministat` (from the BSD
@@ -135,8 +141,9 @@ need, so `vperf` there runs a **sample-based** backend: hotspots, flame graph,
 call tree, RSS and a utilization timeline, all in the same report; every
 counter-driven metric reads `n/a`. Requires Xcode Command Line Tools (for
 `/usr/bin/sample`). `vperf doctor` reports what is available. The counter flags
-(`--callgraph`, `--no-inline`, `--mem-period`, `--freq`) are ignored there, and
-`vperf cycle` is unavailable.
+(`--callgraph`, `--no-inline`, `--mem-period`, `--freq`) are ignored there, as is
+`--keep-perf-data` — there is no `perf.data` to retire — and `vperf cycle` is
+unavailable.
 
 ## Caveats
 
@@ -166,7 +173,9 @@ counter-driven metric reads `n/a`. Requires Xcode Command Line Tools (for
    samples from the same workload lifetime, with the scheduler tracepoints
    co-joined into the same recording.
 3. After the target exits, `perf script` and `perf mem report` read `perf.data`
-   in parallel, then the dumps are parsed in pure Python.
+   in parallel, then the dumps are parsed in pure Python. The recording is
+   removed once both are done — `vperf report` never needs it — unless
+   `--keep-perf-data` was passed.
 4. Metrics are derived and `report.html` is rendered as a single file.
 
 [AGENTS.md](AGENTS.md) documents the pipeline, the artifacts and the internal
@@ -309,4 +318,5 @@ per *thread* and a server has hundreds of them:
 
 Expect a few seconds of post-processing per query on top of the query itself:
 `perf.data` for a one-second window over the whole server is ~100 MB, and both
-the flush and the `perf script` pass read all of it.
+the flush and the `perf script` pass read all of it. It is deleted afterwards, so
+a sweep does not leave it behind; `--keep-perf-data` keeps it.

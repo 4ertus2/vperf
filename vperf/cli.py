@@ -173,6 +173,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         use_rss=not args.no_rss,
         inline=not args.no_inline,
         startup_grace=args.startup_grace,
+        keep_perf_data=args.keep_perf_data,
     )
     _finish(outdir, pd.meta, pd.warnings, pd.stat, pd.elapsed, pd.script_path,
             pd.mem_report_path, pd.wait_path, pd.freq_timeline, pd.thread_stats,
@@ -259,6 +260,7 @@ def _collect_attach(args: argparse.Namespace, outdir: str):
         use_rss=not args.no_rss,
         inline=not args.no_inline,
         startup_grace=args.startup_grace,
+        keep_perf_data=args.keep_perf_data,
     )
 
 
@@ -437,6 +439,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="dump stacks without DWARF inline expansion; hotspot "
                              "self time then lands on the enclosing function "
                              "(default: expand inlines)")
+        sp.add_argument("--keep-perf-data", action="store_true",
+                        help="keep the raw perf recording (perf.data) in the profile "
+                             "directory; by default it is removed once every dump has "
+                             "been taken from it, because it is ~100 MB per second of "
+                             "a wide target. `vperf report` never needs it — pass this "
+                             "to re-derive the dumps by hand (`perf script` with the "
+                             "DWARF inlines left in, `perf report`, `perf archive`) or "
+                             "to feed another tool")
         sp.add_argument("--startup-grace", type=float, default=DEFAULT_STARTUP_GRACE,
                         metavar="SECONDS",
                         help=f"seconds to let the target settle before the counting "
@@ -461,7 +471,7 @@ def build_parser() -> argparse.ArgumentParser:
     patt.set_defaults(func=cmd_attach)
 
     prep = sub.add_parser("report", help="regenerate reports from a profile directory")
-    prep.add_argument("dir", help="profile directory containing meta.json/perf.data")
+    prep.add_argument("dir", help="profile directory containing meta.json")
     prep.set_defaults(func=cmd_report)
 
     pcyc = sub.add_parser("cycle", help="repeat profiling N times; TSV output for ministat")

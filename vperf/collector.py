@@ -799,6 +799,66 @@ def _wait_artifact(script_path: str, outdir: str, events: list[str]) -> str | No
     return None
 
 
+def _fmt_size(nbytes: int) -> str:
+    """A size with the unit that fits it.
+
+    A recording is 100 MB for a wide target and 40 KB for a single-threaded one,
+    and "0.0 MiB" for the second reads as a bug rather than as "it was small".
+    Same unit ladder as `report_terminal._fmt_bytes`, deliberately a copy rather
+    than an import - the collector has no business depending on a report renderer
+    - and one decimal rather than two, because this goes in a sentence and that
+    goes in an aligned column.
+    """
+    for div, suffix in ((1 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")):
+        if nbytes >= div:
+            return f"{nbytes / div:,.1f} {suffix}"
+    return f"{nbytes:,.0f} B"
+
+
+def _retire_raw(outdir: str, names: list[str], keep: bool) -> dict:
+    """Drop the raw perf recordings once every dump has been taken from them.
+
+    The recording is not an input to anything vperf does again: script.txt,
+    mem_report.txt and wait.txt are all it feeds, `load_profile` reads only
+    those, and `vperf report` replays them without ever opening perf.data. What
+    it is worth is re-deriving the dumps by hand - `perf script` with the DWARF
+    inlines left in, `perf report`, `perf archive`, `perf convert` - and that is
+    a per-profile decision rather than a default: a one-second window over a wide
+    target writes ~100 MB (measured 94 MB for one ClickBench query against a
+    359-thread clickhouse-server), so a sweep leaves tens of GB behind.
+
+    So the recordings go, and `--keep-perf-data` keeps them. The sizes are
+    recorded either way, because meta.json is what tells a later `vperf report`
+    what the directory held and why the raw file is not there.
+
+    Only the names this run recorded are considered, never a directory listing:
+    `-o` reuses an existing outdir, so a perf.data left by an earlier run into
+    the same directory must not be deleted by this one.
+    """
+    total = 0
+    found: list[str] = []
+    for name in names:
+        try:
+            total += os.path.getsize(os.path.join(outdir, name))
+        except OSError:
+            continue
+        found.append(name)
+    if not keep:
+        for name in found:
+            try:
+                os.unlink(os.path.join(outdir, name))
+            except OSError:
+                pass
+        if found:
+            # a deliberate default, so it is a line of its own rather than a
+            # warning: under a "Warnings:" header every run would carry one and
+            # the header would stop meaning anything
+            print(f"Removed raw recording {', '.join(found)} ({_fmt_size(total)}). "
+                  "Pass --keep-perf-data to keep it for `perf script` / "
+                  "`perf report` / `perf archive`.")
+    return {"kept": keep, "bytes": total or None}
+
+
 def _collect_combined(
     target_cmd: list[str] | None,
     pid: int | None,
@@ -821,6 +881,7 @@ def _collect_combined(
     warnings: list[str],
     startup_grace: float = DEFAULT_STARTUP_GRACE,
     mem_time_quantum: int | None = None,
+    keep_perf_data: bool = False,
 ) -> ProfileData:
     started = time.strftime("%Y-%m-%d %H:%M:%S")
     stat_path = os.path.abspath(os.path.join(outdir, "stat_threads.csv"))
@@ -1155,6 +1216,12 @@ def _collect_combined(
         memory_enabled = mem_report_path is not None
         memory_cojoined = memory_enabled
 
+    # The last read of perf.data is the final `perf mem report` attempt above,
+    # and both deferred children have been joined by now, so this is the earliest
+    # point past it: retiring it here frees the space before the parse and the
+    # HTML render rather than after them.
+    raw_meta = _retire_raw(outdir, ["perf.data"], keep_perf_data)
+
     if freq_timeline:
         with open(os.path.join(outdir, "freq.json"), "w", encoding="utf-8") as destination:
             json.dump(freq_timeline, destination)
@@ -1207,6 +1274,7 @@ def _collect_combined(
             reason=None if wait_path is not None else wait_reason,
             detail=wait_detail,
         ),
+        "perf_data": raw_meta,
         "freq_t0": getattr(freq_sampler, "t0", None),
         "record_launch_t0": record_launch_t0,
         "record_exit_t0": record_exit_t0,
@@ -1251,6 +1319,7 @@ def collect(
     inline: bool = True,
     quiet_stdout: bool = False,
     startup_grace: float = DEFAULT_STARTUP_GRACE,
+    keep_perf_data: bool = False,
 ) -> ProfileData:
     """Profile either a new process (`target_cmd`) or an existing one (`pid`)."""
     if sys.platform == "darwin":
@@ -1302,6 +1371,7 @@ def collect(
             memory_plan=memory_plan,
             warnings=warnings,
             startup_grace=startup_grace,
+            keep_perf_data=keep_perf_data,
         )
 
     # ---- freq sampler (background thread) -----------------------------------
@@ -1383,8 +1453,13 @@ def collect(
         elapsed or (duration or None))
     record_launch_t0 = None
     record_exit_t0 = None
+    # the raw recordings this path creates, retired in one go once every dump
+    # has read them (perf.data here, the wait pass and a standalone memory
+    # recording below) - see _retire_raw
+    raw_names: list[str] = []
     if use_record:
         data_path = os.path.join(outdir, "perf.data")
+        raw_names.append(os.path.basename(data_path))
         if memory_plan:
             args = ["record", "-q", "-d", "-W", "-o", data_path]
             args += _callgraph_args(callgraph_mode)
@@ -1456,7 +1531,9 @@ def collect(
     if use_wait:
         w_ok = probe_wait()
         if w_ok:
-            args = ["record", "-q", "-o", os.path.join(outdir, "perf_wait.data"),
+            wait_data_path = os.path.join(outdir, "perf_wait.data")
+            raw_names.append(os.path.basename(wait_data_path))
+            args = ["record", "-q", "-o", wait_data_path,
                     "-e", ",".join(TRACEPOINT_EVENTS)]
             if pid is not None:
                 args += ["-p", str(pid)]
@@ -1490,6 +1567,10 @@ def collect(
     memory_pass_plan = fallback_memory_plan or (requested_memory_plan if not use_record else None)
     if use_memory and memory_pass_plan:
         memory_data_path = os.path.join(outdir, memory_pass_plan.data_file)
+        # the co-joined case aliases memory_data_path onto data_path above, so
+        # dedupe rather than let _retire_raw count the same file twice
+        if os.path.basename(memory_data_path) not in raw_names:
+            raw_names.append(os.path.basename(memory_data_path))
         if memory_pass_plan.backend == "ibs":
             args = ["record", "-q", "-d", "-W", "-o", memory_data_path,
                     "-e", "ibs_op//p", "-c", str(mem_period)]
@@ -1518,6 +1599,11 @@ def collect(
             memory_error = (r.stderr or "").strip().splitlines()
             warnings.append(f"{mem_backend.upper()} memory pass failed: "
                             + (memory_error[-1][:160] if memory_error else "memory pass failed"))
+
+    # last read of every raw recording above has happened by now: perf.data at the
+    # `perf mem report`, perf_wait.data at its own `perf script`, the standalone
+    # memory recording at its report
+    raw_meta = _retire_raw(outdir, raw_names, keep_perf_data)
 
     # ---- stop freq sampler and save -----------------------------------------
     freq_timeline: list | None = None
@@ -1565,6 +1651,7 @@ def collect(
             reason=None if wait_enabled else wait_reason,
             detail=wait_detail,
         ),
+        "perf_data": raw_meta,
         "freq_t0": getattr(freq_sampler, "t0", None),
         "record_launch_t0": record_launch_t0,
         "record_exit_t0": record_exit_t0,

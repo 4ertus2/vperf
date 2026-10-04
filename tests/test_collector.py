@@ -1457,3 +1457,258 @@ def test_wait_meta_carries_no_reason_when_the_pass_produced_its_artifact(monkeyp
 
     assert profile.meta["wait"] == {"enabled": True, "reason": None, "detail": None}
     assert profile.wait_path is not None
+
+
+RAW_RECORDING = b"perf-data" * 100  # 900 B, and the same for every raw file
+
+
+def _sized_collector(made):
+    """A `_FakeCollector` that writes a known-size recording and notes its name.
+
+    The combined path launches `perf record` through start_perf and the legacy
+    one through run_perf, so the recordings arrive by two routes and both have to
+    land on disk for a test to be able to ask what is left there.
+    """
+    def build(args):
+        collector = _FakeCollector(args)
+        # _FakeCollector writes its own 9-byte payload; overwrite it so every raw
+        # file in a test has the same known size
+        if args[0] == "record":
+            path = args[args.index("-o") + 1]
+            Path(path).write_bytes(RAW_RECORDING)
+            made.append(os.path.basename(path))
+        return collector
+
+    return build
+
+
+def _raw_collect(monkeypatch, tmp_path, name, *, keep, use_stat=True, use_memory=False,
+                 use_wait=False, probe=lambda: False, legacy_wait=False,
+                 cojoin_fails=False):
+    """A collect() that writes a real file for every raw perf recording it makes."""
+    _amd_vendor(monkeypatch)
+    _FakeRssSampler.pids = []
+    made = []
+
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
+        if args[:1] == ["record"]:
+            # the co-joined record is the one carrying the sampled IBS period; the
+            # standalone memory recording names the raw event instead, so failing
+            # on the period is what drives the fallback this path otherwise takes
+            events = [args[i + 1] for i, a in enumerate(args) if a == "-e" and i + 1 < len(args)]
+            if cojoin_fails and any("ibs_op/period=" in e for e in events):
+                return _defer(PerfResult(1, "co-joined record rejected", ""), defer)
+            path = Path(args[args.index("-o") + 1])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(RAW_RECORDING)
+            made.append(path.name)
+        elif args[:1] == ["script"]:
+            if legacy_wait:
+                Path(stdout_file).write_text(
+                    "worker 42/42 1.0: 100 sched:sched_switch: "
+                    "worker:42 [120] R ==> other:9 [120]\n", encoding="utf-8")
+            else:
+                Path(stdout_file).write_text(
+                    "worker 42/42 1.0: 100 cycles:P:\n", encoding="utf-8")
+        return _defer(PerfResult(0, "", ""), defer)
+
+    monkeypatch.setattr(collector, "_probe_capabilities",
+                        lambda: (["task-clock", "cycles"], [], "cycles:P"))
+    monkeypatch.setattr(collector, "probe_ibs", lambda: use_memory)
+    monkeypatch.setattr(collector, "probe_intel_mem", lambda: False)
+    monkeypatch.setattr(collector, "probe_wait", probe)
+    monkeypatch.setattr(collector.subprocess, "Popen", lambda *a, **k: _FakeTarget())
+    monkeypatch.setattr(collector.os, "killpg", lambda pid, sig: None)
+    monkeypatch.setattr(collector, "start_perf", _sized_collector(made))
+    monkeypatch.setattr(collector, "run_perf", fake_run_perf)
+    monkeypatch.setattr(collector, "perf_version", lambda: "perf test")
+    monkeypatch.setattr(collector, "_FreqSampler", _FakeSampler)
+    monkeypatch.setattr(collector, "_RssSampler", _FakeRssSampler)
+
+    outdir = tmp_path / name
+    profile = collector.collect(
+        target_cmd=["app"], pid=None, outdir=str(outdir),
+        use_stat=use_stat, use_record=True, use_memory=use_memory,
+        use_wait=use_wait, use_freq=False, use_rss=False, keep_perf_data=keep,
+    )
+    return profile, outdir, made
+
+
+def test_the_raw_recording_is_removed_once_every_dump_has_been_taken(monkeypatch, tmp_path,
+                                                                     capsys):
+    """perf.data is not an input to anything vperf does again.
+
+    load_profile reads only the text and JSON artifacts, so `vperf report`
+    regenerates from script.txt and mem_report.txt without ever opening the
+    recording - which makes the raw file ~100 MB per second of a wide target of
+    dead weight in every profile directory by default.
+    """
+    profile, outdir, made = _raw_collect(monkeypatch, tmp_path, "dropped", keep=False)
+
+    assert "perf.data" in made
+    assert not (outdir / "perf.data").exists()
+    # and it is gone before the parse and the render, which is where the space
+    # matters: _retire_raw is called ahead of freq.json/meta.json
+    assert (outdir / "script.txt").is_file()
+    assert profile.meta["perf_data"] == {"kept": False, "bytes": 900}
+    assert "--keep-perf-data" in capsys.readouterr().out
+
+
+def test_keep_perf_data_retains_the_recording_and_says_nothing(monkeypatch, tmp_path, capsys):
+    """The flag is the whole of the opt-in: the file stays, and a run that asked
+    for it has nothing to be told."""
+    profile, outdir, _ = _raw_collect(monkeypatch, tmp_path, "kept", keep=True)
+
+    assert (outdir / "perf.data").is_file()
+    assert profile.meta["perf_data"] == {"kept": True, "bytes": 900}
+    assert capsys.readouterr().out == ""
+
+
+def test_nothing_reads_the_recording_after_it_has_been_retired(monkeypatch, tmp_path):
+    """The invariant that makes the default safe: perf.data outlives every read.
+
+    Deleting it early takes the samples with it, and the reads are not all at one
+    point - `perf script` and `perf mem report` run concurrently, and the memory
+    report's sort-key ladder re-reads the file up to four more times. So this
+    asserts on the *reads* rather than on ordering in the source: every
+    invocation that names `-i <the recording>` must find it still there.
+    """
+    _amd_vendor(monkeypatch)
+    _FakeRssSampler.pids = []
+    reads = []
+    outdir = tmp_path / "ordering"
+
+    def fake_run_perf(args, timeout=None, stdout_file=None, defer=False):
+        if "-i" in args:
+            reads.append(args[args.index("-i") + 1])
+            assert Path(args[args.index("-i") + 1]).exists(), (
+                f"{' '.join(args[:2])} read a recording that was already retired")
+        if args[:1] == ["script"]:
+            Path(stdout_file).write_text("worker 42/42 1.0: 100 cycles:P:\n", encoding="utf-8")
+        elif args[:2] == ["mem", "report"]:
+            # empty output makes the ladder retry, which is what produces the
+            # reads after the first one; the last attempt has to have the file
+            Path(stdout_file).write_text("", encoding="utf-8")
+        return _defer(PerfResult(0, "", ""), defer)
+
+    monkeypatch.setattr(collector, "_probe_capabilities",
+                        lambda: (["task-clock", "cycles"], [], "cycles:P"))
+    monkeypatch.setattr(collector, "probe_ibs", lambda: True)
+    monkeypatch.setattr(collector, "probe_intel_mem", lambda: False)
+    monkeypatch.setattr(collector, "probe_wait", lambda: False)
+    monkeypatch.setattr(collector.subprocess, "Popen", lambda *a, **k: _FakeTarget())
+    monkeypatch.setattr(collector.os, "killpg", lambda pid, sig: None)
+    monkeypatch.setattr(collector, "start_perf", lambda args: _FakeCollector(args))
+    monkeypatch.setattr(collector, "run_perf", fake_run_perf)
+    monkeypatch.setattr(collector, "perf_version", lambda: "perf test")
+    monkeypatch.setattr(collector, "_FreqSampler", _FakeSampler)
+    monkeypatch.setattr(collector, "_RssSampler", _FakeRssSampler)
+
+    collector.collect(target_cmd=["app"], pid=None, outdir=str(outdir),
+                      use_stat=True, use_record=True, use_memory=True,
+                      use_wait=False, use_freq=False, use_rss=False)
+
+    # both dumps, and the memory ladder's retries, all read the live recording
+    assert len(reads) > 2
+    assert set(reads) == {str(outdir / "perf.data")}
+    assert not (outdir / "perf.data").exists()
+
+
+def test_the_legacy_path_retires_every_recording_it_made(monkeypatch, tmp_path, capsys):
+    """The non-combined path writes three raw files and leaked all three.
+
+    perf.data plus the wait pass's own recording plus, when the co-joined record
+    failed, a standalone memory recording - none of which anything reads again,
+    since wait.txt and mem_report.txt are both derived from them.
+    """
+    profile, outdir, made = _raw_collect(
+        monkeypatch, tmp_path, "legacy", keep=False, use_stat=False,
+        use_memory=True, use_wait=True, probe=lambda: True, legacy_wait=True,
+        cojoin_fails=True)
+
+    assert set(made) == {"perf.data", "perf_wait.data", "perf_ibs.data"}
+    for name in made:
+        assert not (outdir / name).exists(), name
+    # the co-joined recording was reused for the memory report, so it is counted
+    # once: 3 x 900 bytes, not 4
+    assert profile.meta["perf_data"] == {"kept": False, "bytes": 2700}
+    out = capsys.readouterr().out
+    assert "perf.data, perf_wait.data, perf_ibs.data" in out
+
+
+def test_report_replays_a_profile_whose_recording_was_retired(monkeypatch, tmp_path):
+    """`vperf report` on a directory with no perf.data in it is the default case.
+
+    Everything the report needs was dumped before the recording went, so this is
+    the load_profile -> analyze path the `report` subcommand runs, not a special
+    one: samples, hotspots and the memory profile all come back.
+    """
+    profile, outdir, _ = _raw_collect(monkeypatch, tmp_path, "replay", keep=False)
+    assert not (outdir / "perf.data").exists()
+
+    loaded = collector.load_profile(str(outdir), include_threads=True)
+    assert loaded[0]["perf_data"]["kept"] is False
+    samples, prof, m = _analyze(
+        loaded[1], loaded[0].get("elapsed_wall"), loaded[2],
+        loaded[0].get("ncpus", 1), loaded[0].get("interval_ms"),
+        set(loaded[0].get("memory", {}).get("events", [])), loaded[0].get("cpu_vendor"),
+    )
+
+    assert samples, "the replay found no samples"
+    assert prof.total_cycles > 0
+    assert m is not None
+
+
+def test_the_removal_reports_a_size_in_a_unit_that_fits_it(monkeypatch, tmp_path, capsys):
+    """"0.0 MiB" reads as a bug rather than as "it was small".
+
+    A recording is ~100 MB for a wide target and a few tens of KB for a
+    single-threaded one, and the message is the only place the reader learns what
+    the default just gave back, so it has to be legible at both ends.
+    """
+    assert collector._fmt_size(0) == "0 B"
+    assert collector._fmt_size(900) == "900 B"
+    assert collector._fmt_size(38_509) == "37.6 KiB"
+    assert collector._fmt_size(94_234_688) == "89.9 MiB"
+    assert collector._fmt_size(5 * (1 << 30)) == "5.0 GiB"
+    # the unit has to be the one the terminal summary picks, or the same size is
+    # quoted two ways in one run's output
+    from vperf.report_terminal import _fmt_bytes
+    for nbytes in (0, 900, 4096, 38_509, 94_234_688):
+        assert collector._fmt_size(nbytes).split()[-1] == _fmt_bytes(nbytes).split()[-1]
+
+    profile, outdir, made = _raw_collect(monkeypatch, tmp_path, "sized", keep=False)
+    assert "900 B" in capsys.readouterr().out
+
+
+def test_keep_perf_data_is_a_flag_on_both_collection_modes():
+    parser = build_parser()
+    # `run` takes the target as a REMAINDER after `--`, so the flag has to be in
+    # front of it or argparse reads it as part of the command
+    assert parser.parse_args(["run", "--", "app"]).keep_perf_data is False
+    assert parser.parse_args(
+        ["run", "--keep-perf-data", "--", "app"]).keep_perf_data is True
+    assert parser.parse_args(["attach", "-p", "1"]).keep_perf_data is False
+    assert parser.parse_args(
+        ["attach", "-p", "1", "--keep-perf-data"]).keep_perf_data is True
+
+
+def test_attach_forwards_keep_perf_data_to_the_collector(monkeypatch):
+    """The flag reaches collect() on the attach path too - a driver profiling a
+    long query is exactly the run whose recording is worth 100 MB."""
+    seen = {}
+
+    def fake_collect(**kwargs):
+        seen.update(kwargs)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(cli, "_ensure_access", lambda: None)
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(cli, "collect", fake_collect)
+
+    args = build_parser().parse_args(
+        ["attach", "-p", "4242", "--keep-perf-data", "--duration", "3"])
+    with pytest.raises(SystemExit):
+        cli._collect_attach(args, str(Path.cwd() / "unused"))
+
+    assert seen["keep_perf_data"] is True

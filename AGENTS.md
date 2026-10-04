@@ -51,7 +51,9 @@ When a change alters observable behaviour, **both files may need updating**:
    proportional to `perf.data`, and a record escalated to SIGTERM mid-flush is a
    record judged *failed*, which takes its samples with it — a 100 MB recording
    discarded because the stop was impatient. Perf that truly hangs still gets
-   escalated; it just gets to finish first.
+   escalated; it just gets to finish first. The same file is *deliberately*
+   deleted afterwards (step 9) — that is disk space, not a discarded recording,
+   and it happens only once every dump has been read out of it.
 8. **The samplers stop after the collectors, not with the monitor** (step 6,
    `_finish_collector` then `_FreqSampler.stop()`). Their curves are placed
    against the *sample* times, and perf's first sample is not the moment it was
@@ -72,6 +74,18 @@ When a change alters observable behaviour, **both files may need updating**:
    inherited `SIG_IGN`) — and `wait`ing for the client is the driver's job, not
    vperf's. A driver that sends `SIGINT` gets `elapsed_wall` = the time observed,
    plus a warning saying the rest of `--duration` was not collected.
+9. **The raw perf recordings are retired unless `--keep-perf-data`.** Nothing
+   reads them after `_retire_raw` — `load_profile` opens only the text and JSON
+   artifacts — so they are transient by default and the flag is the whole opt-in.
+   Two things make it safe: the call sits at the earliest point past the last read
+   (the `_memory_report` sort-key ladder's final attempt), and it takes the names
+   *this run recorded* rather than listing the directory, because `-o` reuses an
+   existing outdir and a `perf.data` left by an earlier run into the same
+   directory must not be deleted by this one. Pinned by
+   `test_nothing_reads_the_recording_after_it_has_been_retired`, which asserts on
+   the reads rather than on the source's ordering. The removal is **not** routed
+   through the `warnings` accumulator: it is the default, so every run would
+   carry a `Warnings:` header and the header would stop meaning anything.
 
 ---
 
@@ -157,6 +171,7 @@ Subcommands: **run, attach, report, cycle, diff, doctor**.
 | `--mem-period` | int / 100003 | AMD IBS sampling period (cycles) |
 | `--mem-time-quantum` | ms / ~100 slices, clamped 25 ms–1 s | Memory-tab slice width |
 | `--no-inline` | flag | drop DWARF inline expansion |
+| `--keep-perf-data` | flag / off | keep the raw perf recordings after the dumps instead of deleting them |
 | `--startup-grace` | float s / 0.15 | settle window before freezing the target (ignored by `attach`) |
 
 ### Per subcommand
@@ -199,11 +214,12 @@ Subcommands: **run, attach, report, cycle, diff, doctor**.
 
 | File | Written by | Phase |
 |---|---|---|
-| `perf.data` | `perf record -q -d -W -o` (+ co-joined memory and `sched:` events) | during measurement |
+| `perf.data` | `perf record -q -d -W -o` (+ co-joined memory and `sched:` events) | during measurement — **retired** after the post-target dumps unless `--keep-perf-data` |
 | `recording.started` | `_write_recording_marker`, the instant before the collectors are monitored — a driver's cue to start the workload | during measurement |
 | `stat_threads.csv` | `perf stat -x, --per-thread` | during measurement |
 | `stat.csv` | `perf stat -x,` — legacy non-combined path only | during measurement |
-| `perf_ibs.data` / `perf_mem.data` | standalone memory record, only when the co-joined record failed | fallback only |
+| `perf_ibs.data` / `perf_mem.data` | standalone memory record, only when the co-joined record failed | fallback only — **retired** like `perf.data` |
+| `perf_wait.data` | legacy non-combined path's scheduler-tracepoint recording — read only by the `perf script` that becomes `wait.txt` | fallback only — **retired** like `perf.data` |
 | `script.txt` | `perf script -i perf.data [--no-inline]` | post-target |
 | `wait.txt` | `_wait_artifact` splits the `sched:*` lines **out of** `script.txt` and rewrites it without them; deleted if empty | after `script.txt` |
 | `mem_report.txt` | `perf mem report -i perf.data --stdio --field-separator=\t --show-total-period [--sort …] [--time-quantum Nms]` | post-target, concurrent with `perf script` |
@@ -250,8 +266,14 @@ Subcommands: **run, attach, report, cycle, diff, doctor**.
    before either is joined** (`collector.py:952`) so the phase costs `max()` of
    the two rather than their sum. Pinned by `test_post_target_dumps_overlap`.
    Do not "tidy" this into a sequential block.
-9. `freq.json`, `rss.json`, then `meta.json`; `ProfileData` returns to
-   `cli._finish`.
+9. **The raw recordings are retired here** — `_retire_raw` (`collector.py:802`),
+   the earliest point past the last read of each: both deferred children are
+   joined and `_memory_report`'s sort-key ladder is exhausted. Nothing after this
+   line opens `perf.data`, so the space is freed before the parse and the render
+   rather than after them. `meta.perf_data = {kept, bytes}` records what the
+   directory held, `bytes` being `None` when no recording was ever made.
+10. `freq.json`, `rss.json`, then `meta.json`; `ProfileData` returns to
+    `cli._finish`.
 
 ### Report pipeline (`cli._analyze` → `cli._finish`)
 
@@ -266,10 +288,19 @@ stdout → `build_html` → `report.html`.
 host, cpu_vendor, kernel, ncpus, freq, interval_ms, events[], metrics[],
 precise_event, callgraph, inline, thread_stats{enabled,cojoined,file},
 memory{enabled,backend,period,ldlat,events,data_file,cojoined,time_quantum_ms},
-wait{enabled,reason,detail}, freq_t0, rss_t0, rss_peak, record_launch_t0,
-record_exit_t0, startup_grace, perf_version, elapsed_wall`. The macOS backend
-adds `backend: "macos"`, `callgraph: "sample"`, `cpu_vendor: "Apple"`,
-`interval_ms: 50`.
+wait{enabled,reason,detail}, perf_data{kept,bytes}, freq_t0, rss_t0, rss_peak,
+record_launch_t0, record_exit_t0, startup_grace, perf_version, elapsed_wall`. The
+macOS backend adds `backend: "macos"`, `callgraph: "sample"`, `cpu_vendor: "Apple"`,
+`interval_ms: 50`, and no `perf_data` — there is no recording to retire, so read
+that key with `.get()` for the same reason as `wait.reason`.
+
+`perf_data` says what the profile directory held of the raw perf recordings and
+whether `--keep-perf-data` left them there. `bytes` is their combined size at the
+moment they were retired, `None` when no recording was ever made (the record
+failed, `--no-record`, `cycle`). It is not an input to anything: `load_profile`
+reads only the text and JSON artifacts, so `vperf report` and `vperf diff`
+regenerate byte-identically from a directory the recordings are gone from
+(verified).
 
 `wait.reason` is why the Threads tab's nine wait columns are empty, and there are
 four: `disabled` (`--no-wait`), `unavailable` (the probe failed — `detail` is
@@ -826,7 +857,10 @@ parts of it worth knowing before changing it:
   a sub-second query's SIGINT lands in one of those gaps and ends the run with
   nothing collected. `kill -0` is how the driver decides which path to take
   — **not** as a liveness test, since a systemd server is another user's process
-  and `kill -0` on it returns EPERM (use `/proc`, as `pid_alive()` does).
+  and `kill -0` on it returns EPERM (use `/proc`, as `pid_alive()` does). The
+  reasoning about `perf.data` existing mid-run is unaffected by the recording
+  being retired at the end of it (step 9 of the collection order): retirement is
+  post-target, and no driver here watches for the file.
 - **The pid `--private-server` profiles is the port's owner, never `$!`.**
   `clickhouse server` **forks**: the pid the shell hands back is a supervisor
   whose main thread is named `ClickHouseWatch`, running 7 threads and *zero*
