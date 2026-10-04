@@ -6,6 +6,7 @@ import glob
 import json
 import os
 import platform
+import re
 import signal
 import socket
 import subprocess
@@ -769,21 +770,133 @@ def _cleanup_run_target(target: subprocess.Popen | None, warnings: list[str]) ->
         return target.wait()
 
 
+# perf prints a frame it could not symbolize as "<addr> [unknown] ([unknown])",
+# and _frame() (parsers.py) rewrites that pair into the single tag [kernel] for
+# an address in the kernel's space or [unresolved] for anything else - deciding
+# on the `ff` prefix alone and throwing the address away.  So the whole line
+# collapses from 39 bytes to 20 and the profile keeps none of the difference -
+# 801,888 of them on one ClickBench query.  On a host with
+# kernel.kptr_restrict=1 they are *every* kernel frame, and measured across five
+# ClickBench/duckdb profiles that was 2.7M lines, a fifth of script.txt.
+# Writing the tag the parser would have produced anyway makes the rewrite
+# provably parse-identical rather than merely equivalent-looking.
+#
+# The address must be at least 4 hex digits for a second reason: a null frame
+# prints a bare "0", which _FRAME_RE's `addr` group also refuses, so `sym`
+# swallows the run and the report shows a frame named "0 [unknown]".  Rewriting
+# that line would change what the reader sees, so this pattern leaves it alone -
+# and so it leaves the symbol-unknown-but-dso-known shape (`[heap]`, `//anon`),
+# whose dso the profile does keep.
+_UNRESOLVED_FRAME_RE = re.compile(r"^\s+(?P<addr>[0-9a-f]{4,}) \[unknown\] \(\[unknown\]\)\s*$")
+
+
+def _split_line_ending(line: str) -> tuple[str, str]:
+    """A line and its own terminator, so a rewrite cannot eat the newline.
+
+    The file is read in text mode, so a CRLF is already a `\\n` by the time it
+    gets here and one suffix test covers every ending there is.  Stripping a
+    cell can take the line's own `\\n` with it, and a memory report that lost the
+    newline after its column header parses as header-and-first-row fused into one
+    line - which took the whole report to zero samples.
+    """
+    if line.endswith("\n"):
+        return line[:-1], "\n"
+    return line, ""
+
+
+def _compact_script(source, destination, markers: tuple[str, ...] = (), wait_output=None) -> bool:
+    """Copy *source* to *destination*, shrinking the two kinds of line it can.
+
+    An unresolved frame becomes the tag `_frame` derives from it.  A line
+    carrying any of *markers* is the wait carve-out and goes to *wait_output*
+    instead, which is what lets the two rewrites share the single pass this dump
+    already costs rather than adding a second one.  Returns whether any marker
+    hit, so the caller knows whether a wait half exists at all.
+    """
+    found = False
+    for line in source:
+        if markers and any(marker in line for marker in markers):
+            found = True
+            if wait_output is not None:
+                wait_output.write(line)
+            continue
+        body, ending = _split_line_ending(line)
+        match = _UNRESOLVED_FRAME_RE.match(body)
+        if match is not None:
+            tag = "[kernel]" if match.group("addr").startswith("ff") else "[unresolved]"
+            body = f"\t{tag} ({tag})"
+        destination.write(body + ending)
+    return found
+
+
+def _compact_script_file(script_path: str) -> None:
+    """Rewrite a `perf script` dump in place with its unresolved frames compacted.
+
+    A dump perf reported success on but never wrote is nothing to compact, and
+    the caller has already decided what to make of it - only its absence is
+    absorbed here, so a real I/O failure still surfaces rather than leaving a
+    profile whose dump silently kept the weight it was meant to shed.
+    """
+    if not os.path.exists(script_path):
+        return
+    compacted_path = script_path + ".compacted"
+    try:
+        with open(script_path, encoding="utf-8", errors="replace") as source, \
+                open(compacted_path, "w", encoding="utf-8") as destination:
+            _compact_script(source, destination)
+        os.replace(compacted_path, script_path)
+    finally:
+        try:
+            os.unlink(compacted_path)
+        except OSError:
+            pass
+
+
+def _compact_mem_report(report_path: str) -> None:
+    """Strip `perf report`'s column padding out of a memory report, in place.
+
+    We ask for `--field-separator=\t` but perf still right-pads every cell to
+    the width of the column, and that width is set by the longest symbol in the
+    report: a ClickHouse template instantiation runs to several hundred
+    characters, so on the five profiles measured here 87% of mem_report.txt was
+    spaces - 104 MB of padding around 11 MB of report, and the largest artifact
+    in the directory.
+
+    `_split_cells` (memory.py) splits on the tab and strips each cell, so the
+    padding is gone the moment the file is read: re-joining stripped cells with
+    the tab it already used cannot change a single parsed field.  Only
+    tab-bearing lines are rewritten, leaving the `#` preamble and the "Kernel
+    address can't be resolved" prose alone - they are matched by prefix and
+    never split.
+    """
+    if not os.path.exists(report_path):
+        return
+    compacted_path = report_path + ".compacted"
+    try:
+        with open(report_path, encoding="utf-8", errors="replace") as source, \
+                open(compacted_path, "w", encoding="utf-8") as destination:
+            for line in source:
+                body, ending = _split_line_ending(line)
+                if "\t" in body:
+                    body = "\t".join(cell.strip() for cell in body.split("\t"))
+                destination.write(body + ending)
+        os.replace(compacted_path, report_path)
+    finally:
+        try:
+            os.unlink(compacted_path)
+        except OSError:
+            pass
+
+
 def _wait_artifact(script_path: str, outdir: str, events: list[str]) -> str | None:
     markers = tuple(f"{event}:" for event in events)
     wait_path = os.path.join(outdir, "wait.txt")
     filtered_path = script_path + ".filtered"
-    found = False
     try:
         with open(script_path, encoding="utf-8", errors="replace") as source, \
                 open(wait_path, "w", encoding="utf-8") as wait_output, \
                 open(filtered_path, "w", encoding="utf-8") as script_output:
-            for line in source:
-                if any(marker in line for marker in markers):
-                    wait_output.write(line)
-                    found = True
-                else:
-                    script_output.write(line)
+            found = _compact_script(source, script_output, markers, wait_output)
         os.replace(filtered_path, script_path)
     finally:
         try:
@@ -1194,6 +1307,10 @@ def _collect_combined(
                     # "the host said no", and the one the reader least suspects
                     wait_reason = "empty"
                     warnings.append("Wait events recorded but script contained no wait samples.")
+            else:
+                # No carve-out to share a pass with - --no-wait, or a host the
+                # wait probe refused - so the dump is compacted on its own.
+                _compact_script_file(script_path)
         else:
             error_lines = (script_result.stderr or "").strip().splitlines()
             warnings.append(
@@ -1215,6 +1332,10 @@ def _collect_combined(
                 mem_proc.close()
         memory_enabled = mem_report_path is not None
         memory_cojoined = memory_enabled
+    if mem_report_path is not None:
+        # Past the sort-key ladder, so no attempt can still be writing it, and
+        # inside the deferred window, so it overlaps the tail of the dump.
+        _compact_mem_report(mem_report_path)
 
     # The last read of perf.data is the final `perf mem report` attempt above,
     # and both deferred children have been joined by now, so this is the earliest
@@ -1509,6 +1630,9 @@ def collect(
                       stdout_file=os.path.join(outdir, "script.txt"))
         if sr.ok:
             script_path = os.path.join(outdir, "script.txt")
+            # No wait carve-out on this path to share a pass with, so the dump
+            # is compacted on its own.
+            _compact_script_file(script_path)
         else:
             script_error = (sr.stderr or "").strip().splitlines()
             warnings.append("Could not dump samples via perf script: "
@@ -1521,6 +1645,8 @@ def collect(
                 time_quantum_ms=quantum_ms)
             memory_enabled = mem_report_path is not None
             memory_cojoined = memory_enabled
+            if mem_report_path is not None:
+                _compact_mem_report(mem_report_path)
 
     # ---- pass 3: wait/off-CPU via scheduler tracepoints ----------------------
     from .wait import TRACEPOINT_EVENTS
