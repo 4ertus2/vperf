@@ -228,7 +228,7 @@ spent 1.3 s in Blocked/IO cold against 0.3 s warm, 12.3 s of CPU against 22.7 s.
 profiles each one by attaching vperf to the server:
 
 ```bash
-bench/clickbench_profiles.sh --mode server --load             # load, then profile all
+bench/clickbench_profiles.sh --mode server --load             # load once, then profile all
 bench/clickbench_profiles.sh --mode server --from 18 --to 18  # one query, table reused
 bench/clickbench_profiles.sh --mode server --optimize-final   # merge every part first
 bench/clickbench_profiles.sh --mode server --private-server    # own server, own data dir
@@ -247,12 +247,26 @@ fill a missing one with defaults.
 
 Credentials come from `~/.clickhouse-client/config.xml` (`<host>`, `<port>`,
 `<user>`, `<password>`) — the driver has no auth flags of its own, so the
-server's credentials stay in one place you control. `--load` drops and refills,
-`--skip-load` uses whatever is there, and the default loads only when `hits` is
-missing. Loading 100M rows into a table with `fsync_after_insert = 1` takes
-minutes, and the log carries the table's size as it fills. `--optimize` /
-`--optimize-final` are opt-in because ClickBench does not optimize, and because
-the schema has no `PARTITION BY`: a FINAL merges every part of the whole table.
+server's credentials stay in one place you control; `--private-server` is the
+exception it has to spell out, and passes its own `--port`.
+
+**Loading is opt-in: `--load` is the only thing that loads.** Everything else
+reuses the `hits` table the server already has, and errors naming `--load` if it
+has none. Loading is 100M rows and about 200 s, the table is reusable
+afterwards, and it is never the thing being measured — a sweep that quietly
+refilled it every run looked identical to one that never did. `--load` drops and
+refills, so it is also how you pick up a changed schema. Loading 100M rows into a
+table with `fsync_after_insert = 1` takes minutes, and the log carries the table's
+size as it fills. `--optimize` / `--optimize-final` are opt-in because ClickBench
+does not optimize, and because the schema has no `PARTITION BY`: a FINAL merges
+every part of the whole table.
+
+With `--private-server` the table outlives the run: its data directory
+(`.vperf/_private-clickhouse`) is reused rather than recreated, so the second
+sweep finds the loaded table already there. `rm -rf` it to start over, or to
+reclaim the parts a killed server leaves un-merged — a server stopped the moment
+the sweep ends never gets to merge them, and that measured 30 GB on disk for a
+9.1 GiB table.
 
 Two things to know about the reports:
 
@@ -263,6 +277,13 @@ Two things to know about the reports:
   to the query's threads in the Threads tab to read the query. `--private-server`
   starts a dedicated server instead, which keeps those threads out of the
   profile.
+- **The private server is the forked child, not the one you launched.**
+  `clickhouse server` starts a lightweight supervisor and forks the real server
+  into a second process, so the pid the driver is handed has 7 threads and no
+  `ThreadPool` workers while the server has 318. The driver profiles the process
+  that owns the port the query goes to — profiling the supervisor instead yields
+  a near-empty report (measured: 0.03 s of CPU against 7.45 s, 62 samples
+  against 1.25K) that looks like a broken profiler rather than a wrong pid.
 - **Each profile covers exactly the query.** The runtime is not knowable in
   advance (Q00 is ~0.1 s, Q35 ~90 s), so a fixed window would either truncate the
   query or pad it with idle server; vperf ends the profile the moment the client

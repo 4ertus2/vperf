@@ -827,6 +827,33 @@ parts of it worth knowing before changing it:
   nothing collected. `kill -0` is how the driver decides which path to take
   — **not** as a liveness test, since a systemd server is another user's process
   and `kill -0` on it returns EPERM (use `/proc`, as `pid_alive()` does).
+- **The pid `--private-server` profiles is the port's owner, never `$!`.**
+  `clickhouse server` **forks**: the pid the shell hands back is a supervisor
+  whose main thread is named `ClickHouseWatch`, running 7 threads and *zero*
+  `ThreadPool` workers, while the server that answers queries is its child with
+  318 of them. Profiling the supervisor profiles an idle process, and it fails
+  quietly: measured on a 4 s window covering a 1.3 s query, 27 samples against
+  the supervisor (every one `AsyncLogger`) against 733 across `ThreadPool`,
+  `MergeMutate` and `TCPHandler` against the server. The profile that results
+  reads as a broken profiler rather than as a wrong pid — 0.03 s of CPU, no
+  `QueryPipelineEx`, a 223 KB report — so `start_private_server` resolves the pid
+  by asking **which process listens on `$PRIVATE_PORT`**
+  (`port_owner_pid`: the LISTEN socket's inode from `/proc/net/tcp{,6}`, matched
+  against `/proc/<pid>/fd` for `$!` and its `children`), and **refuses to
+  profile** if it cannot tell. `stop_private_server` still signals the
+  supervisor, which owns the child's lifecycle. This is the same hazard
+  `discover_server_pid` already dodges for the systemd server (a pid file, and
+  `clickhouse-watchdog` excluded); the private path had no equivalent.
+  **Do not "simplify" this to `pgrep -P "$PRIVATE_PID"`** — by port is the only
+  statement that is true by construction, and the port is what the query uses.
+- **`perf record -p <pid>` does not follow threads created after it opens** (no
+  `--inherit`), and for ClickHouse that is usually harmless: the pools exist from
+  server start, and the per-query `QueryPipelineEx` threads are *reused* from a
+  pool after the first query, so a sweep's second query onwards captures them.
+  Only the very first query of a freshly started server runs on pipeline threads
+  that did not exist at attach. Measured, adding `-i` is **not** the fix — a
+  second query captured 667 `QueryPipelineEx` samples with or without it — so
+  leave it off unless a measurement says otherwise.
 - **Sampling rates are per mode.** `FREQ`/`MEM_PERIOD` default to 499 Hz /
   1000003 for a local engine and 99 Hz / 4000003 for a server: cost is per thread,
   and 499 Hz × 359 threads × 16 KiB DWARF stacks is ~140 MB for a one-second
@@ -856,7 +883,29 @@ parts of it worth knowing before changing it:
   before a byte is sent.
 - **Auth is the client's, not the driver's.** Host, port, user and password come
   from `~/.clickhouse-client/config.xml`; the only credentials the driver ever
-  passes are the empty password and `--port` of `--private-server`.
+  passes are the empty password and `--port` of `--private-server`. **Every
+  `clickhouse-client` invocation has to carry `${CONN_ARGS[@]}`, the query
+  included.** `ch_plain` and `run_logged` always went through `conn_args`; the
+  query itself did not, so a `--private-server` run sent the query to the
+  client's default port 9000 — measured: the query ran against the shared server
+  while vperf profiled the private one, so the report described a process that
+  never saw the query, and with nothing on 9000 it failed `Code: 210` and the
+  profile covered an idle server. A private server whose port is ignored is not
+  the server being profiled.
+- **Loading is opt-in (`LOAD="skip"` by default) and the private data dir is
+  reused, never wiped.** Loading `hits` is 100M rows and ~200 s; measured here,
+  an `rm -rf "$PRIVATE_DIR"` on start made two consecutive 9 GiB loads of 208 s
+  and 198 s for the same rows, because a fresh server has no `hits` and the load
+  is the only thing that makes one. `OUT_ROOT/_private-clickhouse` therefore
+  outlives the run and the second sweep reuses the table — `LOAD="skip"` now
+  means *reuse, and error naming `--load` if there is nothing to reuse*, so the
+  folder reuse and the default are one change and neither works alone. Keep
+  `--load` as the `DROP`+`CREATE`+`INSERT` it is: it is also how a changed schema
+  is picked up. Two costs to know: the failed-load path must stop the private
+  server (`load_table || exit 1` used to orphan it holding its port, and skip-by-
+  default makes that the *ordinary* first run), and a server killed the moment
+  the sweep ends never merges its parts — 30 GB of `store/` for a 9.1 GiB table,
+  reclaimed with `rm -rf` on the dir or by `--optimize`.
 
 ---
 

@@ -60,7 +60,11 @@ VPERF="${VPERF:-}"
 ENGINE="clickhouse"
 MODE="local"
 PRIVATE=0
-LOAD="auto"          # auto | force | skip
+# skip is the default, not auto: loading hits is 100M rows and ~200 s, and the
+# table is the one artifact of a sweep that is expensive, reusable and never the
+# thing being measured.  A run that quietly refilled it every time was
+# indistinguishable from one that never did.  --load asks for it once, by name.
+LOAD="skip"           # skip | force
 OPTIMIZE="none"      # none | merge | final
 SERVER_PID=""
 MAX_DURATION="${MAX_DURATION:-300}"
@@ -145,6 +149,52 @@ discover_server_pid() {
     pgrep -f 'clickhouse-server --config' 2>/dev/null | head -1 || true
 }
 
+# Every pid below $1, read out of /proc/<pid>/task/<pid>/children.
+descendant_pids() {  # <pid>
+    local pid="$1" child
+    for child in $(cat "/proc/$pid/task/$pid/children" 2>/dev/null); do
+        printf '%s\n' "$child"
+        descendant_pids "$child"
+    done
+}
+
+# The pid listening on TCP *port*, looked for only among *root* and its
+# descendants.  Fails when nobody in that tree holds the port.
+#
+# This exists because `clickhouse server` forks, and `$!` is the parent: a
+# supervisor whose main thread is named ClickHouseWatch, running 7 threads and
+# no ThreadPool workers at all, while the server that answers queries is its
+# child with 318 of them.  So the pid the shell hands back is not the process
+# doing the work, and profiling it profiles an idle process.  Measured on a 4 s
+# window covering a 1.3 s query: 27 samples against the supervisor, every one of
+# them AsyncLogger, against 733 spread over ThreadPool, MergeMutate and
+# TCPHandler against the server.  A report that empty reads as a broken profiler
+# rather than as a wrong pid, which is why this identifies the process by the
+# port it serves - the thing the query is about to use - and not by its name.
+# Searching only our own tree keeps a server left over from an earlier run from
+# being adopted as if it were this one's.
+port_owner_pid() {  # <port> <root-pid>
+    local port="$1" root="$2" nets="" inode pid fd
+    [ -r /proc/net/tcp ] && nets="/proc/net/tcp"
+    [ -r /proc/net/tcp6 ] && nets="$nets /proc/net/tcp6"
+    [ -n "$nets" ] || return 1
+    # field 2 is local_address (host:port, port last), field 4 the state (0A is
+    # LISTEN) and field 10 the socket inode the owning process holds open
+    inode="$(awk -v want="$(printf '%04X' "$port")" \
+        '{ n = split($2, a, ":"); if ($4 == "0A" && a[n] == want) { print $10; exit } }' \
+        $nets 2>/dev/null || true)"
+    [ -n "$inode" ] || return 1
+    for pid in "$root" $(descendant_pids "$root"); do
+        for fd in "/proc/$pid/fd/"*; do
+            if [ "$(readlink "$fd" 2>/dev/null)" = "socket:[$inode]" ]; then
+                printf '%s' "$pid"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
 usage() {
     cat <<EOF
 Usage: clickbench_profiles.sh [options]
@@ -157,9 +207,13 @@ Options:
   --mode M      local (default) runs clickhouse-local over hits.parquet;
                 server profiles a running clickhouse-server instead
   --private-server  with --mode server, start a dedicated clickhouse-server for
-                the run (own config + data dir, no sudo) and attach to that
-  --load        (re)load hits from DATA_DIR/hits.parquet before the sweep
-  --skip-load   never load; use the hits table the server already has
+                the run (own config + data dir, no sudo) and attach to that.
+                The data dir, OUT_ROOT/_private-clickhouse, is REUSED across runs
+                so its hits table survives: rm -rf it to start over or to reclaim
+                the parts an un-merged table leaves behind
+  --load        create and fill hits from DATA_DIR/hits.parquet before the sweep
+                (drops and refills an existing table). This is the only thing that
+                loads: 100M rows, about 200 s, reusable afterwards
   --optimize    OPTIMIZE TABLE hits after loading (ClickBench does not)
   --optimize-final  ... FINAL, which merges every part into one
   --server-pid N  clickhouse-server to attach to   (default: discovered)
@@ -204,6 +258,8 @@ while [ $# -gt 0 ]; do
         --mode) shift; MODE="$1" ;;
         --private-server) PRIVATE=1 ;;
         --load) LOAD=force ;;
+        # no longer a mode one can select: skipping is the default, so this is
+        # accepted and does nothing, for a script that still passes it
         --skip-load) LOAD=skip ;;
         --optimize) OPTIMIZE=merge ;;
         --optimize-final) OPTIMIZE=final ;;
@@ -243,8 +299,10 @@ else
     esac
     command -v clickhouse-client >/dev/null 2>&1 || {
         echo "ERROR: clickhouse-client not in PATH (needed for --mode server)" >&2; exit 1; }
+    # only a run that will actually load needs the parquet: the default reuses
+    # the server's table and never opens the file
     [ "$LOAD" = skip ] || [ -f "$PARQUET" ] || {
-        echo "ERROR: $PARQUET not found (needed to load hits; --skip-load to use the table already there)" >&2
+        echo "ERROR: $PARQUET not found, and --load was given" >&2
         exit 1; }
     [ -f "$BENCH_DIR/clickhouse/create.sql" ] || {
         echo "ERROR: $BENCH_DIR/clickhouse/create.sql not found (the MergeTree schema)" >&2; exit 1; }
@@ -599,7 +657,15 @@ query_id() {  # <token> <label>
 
 start_private_server() {
     PRIVATE_DIR="$OUT_ROOT/_private-clickhouse"
-    rm -rf "$PRIVATE_DIR"
+    # The data dir is REUSED, never wiped.  Measured here: wiping it cost two
+    # consecutive 9 GiB loads of 208 s and 198 s for the same 100M rows, because
+    # a fresh server has no `hits` and the load is the only thing that makes one.
+    # So the table outlives the run, and a sweep that only profiles queries finds
+    # it already there.  `rm -rf "$PRIVATE_DIR"` is how you start over, or
+    # reclaim the un-merged store/ parts a killed server leaves behind (measured:
+    # 30 GB on disk for a 9.1 GiB table, because nothing ever got to merge them).
+    local fresh=0
+    [ -d "$PRIVATE_DIR/data" ] || fresh=1
     mkdir -p "$PRIVATE_DIR/data" "$PRIVATE_DIR/tmp" "$PRIVATE_DIR/user_files"
     # A server of our own needs no privileges: its own config, its own data dir,
     # and caches capped so it cannot crowd a shared instance out of RAM.  The
@@ -607,7 +673,8 @@ start_private_server() {
     # already owns 8123 and 9009.  user_files_path is a scratch dir this run never
     # reads: the load streams the parquet in rather than asking the server to
     # open it, which is what lets the same config work for a private server as
-    # for a shared one.
+    # for a shared one.  Rewritten every run - `cat >` truncates - so the config
+    # can still be changed here without a stale copy surviving in the dir.
     cat >"$PRIVATE_DIR/config.xml" <<XMLCONFIG
 <clickhouse>
     <logger>
@@ -638,7 +705,11 @@ start_private_server() {
     <quotas><default/></quotas>
 </clickhouse>
 XMLCONFIG
-    say "private server: starting on port $PRIVATE_PORT (data $PRIVATE_DIR)"
+    if [ "$fresh" = 1 ]; then
+        say "private server: starting on port $PRIVATE_PORT (new data dir $PRIVATE_DIR)"
+    else
+        say "private server: starting on port $PRIVATE_PORT (reusing $PRIVATE_DIR - its hits table survives this run)"
+    fi
     clickhouse server --config-file="$PRIVATE_DIR/config.xml" >>"$PRIVATE_DIR/stdout.log" 2>&1 &
     PRIVATE_PID=$!
     local deadline=$((SECONDS + 90))
@@ -647,8 +718,26 @@ XMLCONFIG
             echo "ERROR: the private server exited during startup (see $PRIVATE_DIR/error.log)" >&2
             return 1; }
         if clickhouse-client --port "$PRIVATE_PORT" --password '' --query "SELECT 1" >/dev/null 2>&1; then
-            SERVER_PID="$PRIVATE_PID"
-            say "private server: ready as pid $PRIVATE_PID"
+            # Readiness only proves *something* is serving the port, and the thing
+            # the shell started is not it: `$!` is the supervisor this binary
+            # forks, so the pid to profile is whichever process of ours holds the
+            # port the query is about to use.  Asking for it by port rather than
+            # by process name is what makes the profile and the query the same
+            # process - the mistake this whole function exists to prevent.
+            SERVER_PID="$(port_owner_pid "$PRIVATE_PORT" "$PRIVATE_PID" || true)"
+            if [ -z "$SERVER_PID" ]; then
+                echo "ERROR: port $PRIVATE_PORT is answering, but no process under" >&2
+                echo "ERROR: $PRIVATE_PID owns it - cannot tell which one is the server." >&2
+                echo "ERROR: refusing to profile $PRIVATE_PID: it is the supervisor," >&2
+                echo "ERROR: and a profile of it describes an idle process." >&2
+                return 1
+            fi
+            if [ "$SERVER_PID" = "$PRIVATE_PID" ]; then
+                say "private server: ready as pid $PRIVATE_PID"
+            else
+                say "private server: ready as pid $SERVER_PID"
+                say "private server:   (supervisor $PRIVATE_PID forked it; the child is the server and the one profiled)"
+            fi
             return 0
         fi
         sleep 0.2
@@ -659,6 +748,8 @@ XMLCONFIG
 
 stop_private_server() {
     [ -n "${PRIVATE_PID:-}" ] || return 0
+    # the supervisor, which is the process that owns the child's lifecycle: the
+    # server is not signalled directly, and it does not need to be
     say "private server: stopping pid $PRIVATE_PID"
     kill -TERM "$PRIVATE_PID" 2>/dev/null || return 0
     local deadline=$((SECONDS + 60))
@@ -732,12 +823,22 @@ fmt_bytes() {  # <bytes> -> "8.4 GiB"
 load_table() {
     local create="$BENCH_DIR/clickhouse/create.sql" have rows parts ddl_file rc t0
     local describe="$OUT_ROOT/.hits-describe.tsv" free_bytes watcher=0
+    # the hint has to name the same server the failed attempt would have loaded:
+    # a private server's table lives in its own reused data dir, so telling
+    # someone to drop --private-server would point the load at another server
+    local hint=""
+    [ "$PRIVATE" = 1 ] && hint="--private-server "
 
     if [ "$DRY_RUN" = 1 ]; then
-        say "load (dry run): clickhouse-client < $create"
-        say "load (dry run): clickhouse-client --query 'INSERT INTO hits FORMAT Parquet' < $PARQUET"
-        if [ "$OPTIMIZE" != none ]; then
-            say "load (dry run): OPTIMIZE TABLE hits$( [ "$OPTIMIZE" = final ] && printf ' FINAL')"
+        if [ "$LOAD" = force ]; then
+            say "load (dry run): clickhouse-client < $create"
+            say "load (dry run): clickhouse-client --query 'INSERT INTO hits FORMAT Parquet' < $PARQUET"
+            if [ "$OPTIMIZE" != none ]; then
+                say "load (dry run): OPTIMIZE TABLE hits$( [ "$OPTIMIZE" = final ] && printf ' FINAL')"
+            fi
+        else
+            say "load (dry run): skipped (the default) - would reuse the server's hits table, or fail if it has none"
+            say "load (dry run): $hint--load to create and fill it"
         fi
         return 0
     fi
@@ -756,11 +857,19 @@ NOCONN
 
     have="$(ch_plain "SELECT count() FROM system.tables WHERE database=currentDatabase() AND name='hits'")"
     if [ "$LOAD" = skip ] && [ "$have" = 0 ]; then
-        echo "ERROR: --skip-load, but the server has no hits table in $(ch_plain 'SELECT currentDatabase()')" >&2
+        # the common first run, not a mistake: loading is off unless asked for,
+        # so say what to ask for rather than naming a flag nobody passed
+        cat >&2 <<NOLOAD
+ERROR: no hits table in $(ch_plain 'SELECT currentDatabase()'), and loading is off by
+default: it is 100M rows and about 200 s, and the table is reusable.
+
+  load it once:  $(basename "$0") --mode server --load $hint
+  then profile:  $(basename "$0") --mode server $hint
+NOLOAD
         return 1
-    elif [ "$LOAD" = skip ]; then
-        say "load: skipped (--skip-load)"
-    elif [ "$have" = 0 ] || [ "$LOAD" = force ]; then
+elif [ "$LOAD" = skip ]; then
+        say "load: skipped (the default) - reusing the hits table already in the server"
+elif [ "$have" = 0 ] || [ "$LOAD" = force ]; then
         say "load: creating hits from $create"
         ddl_file="$(mktemp "$OUT_ROOT/.hits-ddl.XXXXXX.sql")"
         { printf 'DROP TABLE IF EXISTS hits SYNC;\n'; cat "$create"; } >"$ddl_file"
@@ -883,6 +992,15 @@ sweep_server() {
     token="$(target_token clickhouse)"
     wait_flag="--no-wait"
     [ "$WAIT" = 1 ] && wait_flag=""
+    # The query has to reach the same server vperf attaches to.  Without this the
+    # client falls back to ~/.clickhouse-client/config.xml, and with
+    # --private-server that is a different server on port 9000: measured here, the
+    # query ran against the shared instance while vperf profiled the private one,
+    # so the report described a process that never saw the query, and with nothing
+    # on 9000 the query failed with Code: 210 and the profile covered an idle one.
+    # conn_args is what names the private port; ch_plain and run_logged already
+    # went through it, this was the one call site that did not.
+    conn_args
 
     [ -f "$src/queries.sql" ] || { echo "ERROR: $src/queries.sql not found" >&2; return 1; }
     mapfile -t queries < "$src/queries.sql"
@@ -917,8 +1035,8 @@ sweep_server() {
             printf '   %s attach -p %s --duration %s -f %s --mem-period %s %s %s -o %s   (ended by SIGINT when the query returns)\n' \
                 "$VPERF" "$SERVER_PID" "$MAX_DURATION" "$FREQ" "$MEM_PERIOD" \
                 "$INLINE_FLAG" "$wait_flag" "$dir"
-            printf '   (cd %s && clickhouse-client --time --query-id %s --query %q) 2> %s/query.stderr\n' \
-                "$DATA_DIR" "$(query_id "$token" "$label")" "$q" "$dir"
+            printf '   (cd %s && clickhouse-client %s --time --query-id %s --query %q) 2> %s/query.stderr\n' \
+                "$DATA_DIR" "${CONN_ARGS[*]:-}" "$(query_id "$token" "$label")" "$q" "$dir"
             continue
         fi
 
@@ -945,7 +1063,7 @@ sweep_server() {
             wait_for_recording "$dir" "$vp" \
                 || say "$label WARNING: the collectors never reported ready; the query may start before they are up"
         fi
-        ( cd "$DATA_DIR" && clickhouse-client --time --query-id "$qid" --query "$q" \
+        ( cd "$DATA_DIR" && clickhouse-client "${CONN_ARGS[@]}" --time --query-id "$qid" --query "$q" \
             </dev/null >"$dir/query.out" 2>"$dir/query.stderr" ) &
         cpid=$!
         wait "$cpid"
@@ -1015,7 +1133,16 @@ if [ "$MODE" = server ]; then
             SERVER_PID="(the private server started for this run)"
         fi
     fi
-    load_table || exit 1
+    if ! load_table; then
+        # The load failing is the ordinary outcome of the default skip on a server
+        # with no hits table, so this path is not exceptional - and exiting here
+        # used to leave the private server running, holding its port and its 8 GB
+        # memory cap, with nothing left to stop it.
+        if [ "$PRIVATE" = 1 ] && [ "$DRY_RUN" = 0 ]; then
+            stop_private_server
+        fi
+        exit 1
+    fi
     sweep_server
     if [ "$PRIVATE" = 1 ] && [ "$DRY_RUN" = 0 ]; then
         stop_private_server
