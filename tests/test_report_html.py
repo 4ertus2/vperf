@@ -1690,3 +1690,79 @@ def test_the_generated_script_parses_when_a_js_engine_is_available(tmp_path):
         checked = subprocess.run([node, "--check", str(path)],
                                  capture_output=True, text=True, timeout=60)
         assert checked.returncode == 0, checked.stderr
+
+
+def _wait_note_page(wait_meta):
+    """The Threads page of a report whose meta carries *wait_meta*."""
+    samples = _cpu_samples()
+    prof = build_profile(samples)
+    html = build_html({"target": {"cmd": ["app"]}, "mode": "run", "wait": wait_meta},
+                      samples, MetricsReport(elapsed=2.0), prof, wp=None)
+    return _threads_page(html)
+
+
+def test_a_profile_that_asked_for_no_wait_does_not_blame_the_host():
+    """Nine empty columns read as a broken report, so the note says which absence
+    this is - and `--no-wait` is not a capability problem the reader can fix."""
+    page = _wait_note_page({"enabled": False, "reason": "disabled", "detail": None})
+
+    assert "Wait columns are n/a: this profile was collected with --no-wait" in page
+    assert "vperf doctor" not in page
+    assert "required capability" not in page
+
+
+def test_a_denied_wait_pass_carries_its_own_remedy():
+    """The detail is what `vperf doctor` would have said, so the profile needs no
+    second visit to the machine to find out what it is missing."""
+    detail = ("scheduler tracepoint files are root-only; perf needs "
+              "CAP_DAC_READ_SEARCH to read them: sudo setcap cap_perfmon=ep /usr/bin/perf")
+    page = _wait_note_page({"enabled": False, "reason": "unavailable", "detail": detail})
+
+    assert "could not be collected" in page
+    assert "CAP_DAC_READ_SEARCH" in page
+    assert "/usr/bin/perf" in page
+
+
+def test_the_wait_note_escapes_the_detail_it_is_given():
+    """The note is interpolated into the page as HTML, and the detail comes from
+    the environment - a perf path, a capability line - so it is not ours to trust."""
+    page = _wait_note_page({"enabled": False, "reason": "unavailable",
+                            "detail": "needs <b>cap</b> & \"quoting\" <script>x</script>"})
+
+    assert "<b>cap</b>" not in page
+    assert "<script>x</script>" not in page
+    assert "&lt;b&gt;cap&lt;/b&gt;" in page
+    assert "&quot;quoting&quot;" in page
+
+
+def test_an_empty_wait_dump_is_worded_apart_from_a_denied_one():
+    """The host allowed the pass and it still produced nothing. Filing that under
+    "not collected" sends the reader to fix a capability that was never the
+    problem, so it gets its own sentence."""
+    empty = _wait_note_page({"enabled": False, "reason": "empty", "detail": None})
+    denied = _wait_note_page({"enabled": False, "reason": "unavailable", "detail": None})
+
+    assert "the dump held no wait samples" in empty
+    assert "the dump held no wait samples" not in denied
+    assert empty != denied
+
+
+def test_a_platform_without_tracepoints_is_not_told_to_run_setcap():
+    """macOS records no scheduler tracepoints and no capability would provide
+    one, so the note must not send the reader looking for a setcap line."""
+    page = _wait_note_page({"enabled": False, "reason": "unsupported",
+                            "detail": "the macOS backend samples with `sample`"})
+
+    assert "samples with `sample`" in page
+    assert "setcap" not in page
+    assert "vperf doctor" not in page
+
+
+def test_a_profile_directory_predating_the_reason_keeps_the_old_wording():
+    """`vperf report` re-renders directories this version never wrote, and their
+    meta carries `wait: {enabled: false}` with no reason at all - the note has to
+    stay the one that is true of every cause."""
+    page = _wait_note_page({"enabled": False})
+
+    assert "Wait columns are n/a: scheduler tracepoints were not collected" in page
+    assert "vperf doctor" in page
