@@ -1712,3 +1712,219 @@ def test_attach_forwards_keep_perf_data_to_the_collector(monkeypatch):
         cli._collect_attach(args, str(Path.cwd() / "unused"))
 
     assert seen["keep_perf_data"] is True
+
+
+# --- compacting the dumps ---------------------------------------------------
+#
+# Both helpers rewrite a dump into itself, and both are only allowed to change
+# bytes the parser was going to throw away.  So every test here asserts the
+# strong property - the parse of the compacted file equals the parse of the
+# original - rather than a size delta, and every fixture is read back off disk
+# through the same parser `load_profile` uses.  Asserting on the transformed
+# string instead is what let a lost newline through once: the string-level
+# rewrite kept every separator, the file-level one dropped one.
+
+_SCRIPT_FIXTURE = "\n".join([
+    "membound   44150  8383.783465:        144        cycles/freq=499/P: ",
+    "\tffffffff97356fef [unknown] ([unknown])",
+    "\tffffffff96f56a67 [unknown] ([unknown])",
+    "\t7ee0b32a039b __syscall_cancel+0x5b (/usr/lib/x86_64-linux-gnu/libc.so.6)",
+    "\t7ee0b332816d read+0x1d (/usr/lib/x86_64-linux-gnu/libc.so.6)",
+    "membound   44150  8383.783999:        144        cycles/freq=499/P: ",
+    # a non-kernel unresolved frame: same shape, classified the other way
+    "\t5f2a245cbff0 [unknown] ([unknown])",
+    "\t        3663e570 [unknown] ([heap])",
+    "\t    5f2a245cbff0 [unknown] (//anon)",
+    # a null frame prints a bare 0, which is not an address this may rewrite
+    "\t               0 [unknown] ([unknown])",
+])
+
+def _padded_row(cells: list[str], widths: list[int], indent: str = "") -> str:
+    """One `perf report --field-separator=\\t` row: right-aligned, tab-separated.
+
+    Built rather than pasted because the padding *is* the subject - a fixture
+    with the spaces typed out would read as incidental, and would need the E501
+    exemption the byte-exact perf fixtures in the other test files carry.  perf
+    sizes every column to its widest cell, so one long C++ symbol is what turns
+    the file into padding.
+    """
+    return indent + "\t".join(cell.rjust(width) for cell, width in zip(cells, widths)) + "\n"
+
+
+_MEM_CELLS = ["Overhead", "Samples", "Period", "Pid:Command", "Command", "Local Weight",
+              "Memory access", "Symbol", "Shared Object", "TLB access"]
+_MEM_ROWS = [
+    ["1%", "1", "1175", "44214:membound", "membound", "1175", "RAM hit",
+     "[.] DB::OwnAsyncSplitChannel::runChannel(unsigned long)", "clickhouse", "L2 miss"],
+    ["1%", "1", "1176", "44214:membound", "membound", "1176", "L1 hit",
+     "[.] main", "clickhouse", "L1 hit"],
+]
+_MEM_WIDTHS = [max([len(_MEM_CELLS[i])] + [len(row[i]) for row in _MEM_ROWS])
+               for i in range(len(_MEM_CELLS))]
+_PADDED_MEM_REPORT = (
+    "# Samples: 2 of event 'ibs_op/period=100003/p'\n"
+    + _padded_row(_MEM_CELLS, _MEM_WIDTHS, indent="# ")
+    + "".join(_padded_row(row, _MEM_WIDTHS, indent=" ") for row in _MEM_ROWS)
+)
+
+
+def _write(path: Path, text: str) -> Path:
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_the_script_dump_is_compacted_without_its_parse_changing(tmp_path):
+    """perf's unresolvable frames become the tag _frame would have produced.
+
+    On a host with kernel.kptr_restrict=1 - which is where the size is, see the
+    note on `_UNRESOLVED_FRAME_RE` - every kernel frame reads
+    "<addr> [unknown] ([unknown])" and _frame throws all of it away but the `ff`.
+    Writing the tag it derives makes the rewrite provably parse-identical
+    instead of merely equivalent-looking.
+    """
+    from vperf.parsers import parse_perf_script
+
+    path = _write(tmp_path / "script.txt", _SCRIPT_FIXTURE)
+    before = parse_perf_script(path.read_text(encoding="utf-8"))
+    collector._compact_script_file(str(path))
+    after_text = path.read_text(encoding="utf-8")
+
+    assert parse_perf_script(after_text) == before
+    assert "[unknown] ([unknown])" in after_text  # the heap, //anon and null shapes stay
+    assert after_text.count("[kernel] ([kernel])") == 2   # the two ffffffff frames
+    assert after_text.count("[unresolved] ([unresolved])") == 1  # 5f2a..., not ffffffff
+    assert len(after_text) < len(_SCRIPT_FIXTURE)
+
+
+def test_a_dump_that_ends_without_a_newline_keeps_ending_without_one(tmp_path):
+    """The rewrite must not invent a line break.
+
+    perf always terminates its last line, so this is the shape a hand-written or
+    truncated fixture has - and a helper that appends unconditionally would
+    split it into two, which a reader of the artifact sees as a phantom frame.
+    """
+    from vperf.parsers import parse_perf_script
+
+    path = _write(tmp_path / "script.txt", _SCRIPT_FIXTURE)
+    text = path.read_text(encoding="utf-8")
+    path.write_text(text.rstrip("\n"), encoding="utf-8")
+    before = parse_perf_script(path.read_text(encoding="utf-8"))
+
+    collector._compact_script_file(str(path))
+    after_text = path.read_text(encoding="utf-8")
+
+    assert not after_text.endswith("\n")
+    assert parse_perf_script(after_text) == before
+
+
+def test_compacting_a_dump_twice_changes_nothing(tmp_path):
+    """vperf report re-reads a directory it did not write, and a re-run of
+    collect() can reuse one, so compaction has to be a fixed point."""
+    from vperf.parsers import parse_perf_script
+
+    path = _write(tmp_path / "script.txt", _SCRIPT_FIXTURE)
+    collector._compact_script_file(str(path))
+    once = path.read_text(encoding="utf-8")
+    collector._compact_script_file(str(path))
+
+    assert path.read_text(encoding="utf-8") == once
+    assert parse_perf_script(once)
+
+
+def test_the_memory_report_loses_its_padding_and_nothing_else(tmp_path):
+    """`perf report` right-pads every cell to the column width, and that width is
+    set by the longest symbol in the report - a ClickHouse template
+    instantiation runs to hundreds of characters, which measured 87% of
+    mem_report.txt as spaces.  _split_cells strips each cell, so the padding was
+    already discarded on read; the rewrite only avoids writing it.
+
+    Asserting the parse is the whole point: an earlier version stripped the
+    newline off the end of every line with it, which merged the column header
+    into the first row and took the whole report to zero samples.
+    """
+    from vperf.memory import parse_mem_report
+
+    path = _write(tmp_path / "mem_report.txt", _PADDED_MEM_REPORT)
+    events = {"ibs_op/period=100003/p"}
+    before = parse_mem_report(path.read_text(encoding="utf-8"), events, "\t", None)
+
+    collector._compact_mem_report(str(path))
+    after_text = path.read_text(encoding="utf-8")
+
+    assert parse_mem_report(after_text, events, "\t", None) == before
+    assert before.total_samples == 2
+    assert after_text.count("\n") == _PADDED_MEM_REPORT.count("\n")
+    # still tab-separated, so the artifact stays greppable, just not padded:
+    # same ten cells, none of them carrying the column's worth of spaces
+    raw_cells = _PADDED_MEM_REPORT.splitlines()[2].split("\t")
+    after_cells = after_text.splitlines()[2].split("\t")
+    assert len(raw_cells) == len(after_cells) == len(_MEM_CELLS)
+    assert after_cells == [cell.strip() for cell in raw_cells]
+    assert len(after_text) < len(_PADDED_MEM_REPORT)
+
+
+def test_the_lines_with_no_tab_are_left_alone(tmp_path):
+    """The `#` preamble and perf's "Kernel address can't be resolved" prose are
+    matched by prefix and never split, so rewriting them could only cost."""
+    path = _write(tmp_path / "mem_report.txt", "# Samples: 2 of event 'x'\n#\nKernel address can't be resolved.\n")
+    collector._compact_mem_report(str(path))
+    assert path.read_text(encoding="utf-8") == "# Samples: 2 of event 'x'\n#\nKernel address can't be resolved.\n"
+
+
+def test_the_wait_carve_out_and_the_compaction_share_one_pass(monkeypatch, tmp_path):
+    """A wait pass already rewrites script.txt in full, so the compaction rides
+    along in that pass instead of costing a second one - and the split itself is
+    unchanged: marker lines to wait.txt, everything else to script.txt.
+
+    wait.py reads only header lines (_LINE_RE), so the frame lines a sched
+    sample carries have always stayed behind in script.txt and been dropped at
+    parse time by cli.py's `event.startswith("sched:")` filter.  The split is
+    line-by-line on the marker, not sample-by-sample, and this pins that the
+    sharing did not change which side of it a line lands on.
+    """
+    lines = [
+        "worker   42/42  1.0: 100 cycles:P:",
+        "\tffffffff97356fef [unknown] ([unknown])",
+        "worker   42/42  1.5: sched:sched_switch: prev_comm=worker prev_pid=42 prev_state=S ==> sh",
+        "\tffffffff96c0012b [unknown] ([unknown])",
+        "worker   42/42  2.0: 100 cycles:P:",
+        "\t7ee0b332816d read+0x1d (/usr/lib/libc.so.6)",
+    ]
+    script = _write(tmp_path / "script.txt", "\n".join(lines) + "\n")
+
+    wait = collector._wait_artifact(str(script), str(tmp_path), ["sched:sched_switch"])
+
+    assert wait is not None
+    wait_text = Path(wait).read_text(encoding="utf-8")
+    # only the marker-bearing header crosses over, exactly as before
+    assert wait_text == lines[2] + "\n"
+    script_text = script.read_text(encoding="utf-8")
+    assert "sched:sched_switch:" not in script_text
+    assert script_text.count("\n") == len(lines) - 1
+    # ...and both halves' frame lines are now compacted rather than merely moved
+    assert "[unknown] ([unknown])" not in script_text
+    assert script_text.count("[kernel] ([kernel])") == 2
+
+
+def test_a_dump_collected_without_the_wait_pass_is_still_compacted(monkeypatch, tmp_path):
+    """The gap this closes: --no-wait skips _wait_artifact, which is where the
+    compaction otherwise rides, and the dump must not keep its unresolvable
+    frames just because nothing had to be carved out of it.
+
+    Driven through collect() rather than at the helper, because the helper was
+    never the thing that could be forgotten - the branch around it was.
+    """
+    script_lines = "\n".join([
+        "worker   42/42  1.0: 100 cycles:P:",
+        "\tffffffff97356fef [unknown] ([unknown])",
+        "\t7ee0b332816d read+0x1d (/usr/lib/libc.so.6)",
+    ]) + "\n"
+
+    _wait_collect(monkeypatch, tmp_path, "nowait", probe=lambda: True,
+                  use_wait=False, script_lines=script_lines)
+    script = tmp_path / "nowait" / "script.txt"
+
+    assert "[unknown] ([unknown])" not in script.read_text(encoding="utf-8")
+    assert script.read_text(encoding="utf-8").count("[kernel] ([kernel])") == 1
+    # and no wait half was invented for a profile that asked for none
+    assert not (tmp_path / "nowait" / "wait.txt").exists()

@@ -44,7 +44,7 @@ When a change alters observable behaviour, **both files may need updating**:
    Preserve them when editing around a line; add the same kind of comment when
    you add a limit.
 6. **The target is always `SIGCONT`'d.** Any change to the collection path must
-   keep the `try/finally` that resumes it (`collector.py:884`) and the
+   keep the `try/finally` that resumes it (`collector.py:1177`) and the
    `PerfProcess.stop()` escalation (SIGINT → SIGTERM → SIGKILL) that flushes a
    partial `perf.data`. That escalation's grace is
    `_COLLECTOR_STOP_GRACE = 60 s`, not something short: perf's flush is
@@ -65,7 +65,7 @@ When a change alters observable behaviour, **both files may need updating**:
    draw and cost nothing.
 7. **`SIGINT` ends an attached profile, and it produces a report.** In `attach`
    mode a `KeyboardInterrupt` while the collectors run is caught and the
-   finalize path continues (`collector.py:880`), so an interrupted profile still
+   finalize path continues (`collector.py:1190`), so an interrupted profile still
    writes `meta.json` and `report.html`; `run` mode keeps unwinding. Two things
    make that work and both are load-bearing: `cmd_attach` requests `SIGINT`
    itself, because a driver launches it as a background job and bash hands a
@@ -122,7 +122,7 @@ PYTHONPATH=$PWD python3 -m pytest tests/ -q
 | File | Lines | Responsibility |
 |---|---|---|
 | `vperf/cli.py` | 460 | argparse surface, subcommand dispatch, the shared analyze→report path |
-| `vperf/collector.py` | 1461 | the orchestrator: capability probes, the perf passes, artifact writing |
+| `vperf/collector.py` | 1848 | the orchestrator: capability probes, the perf passes, artifact writing |
 | `vperf/perf.py` | 215 | thin, well-behaved wrapper around the `perf` binary |
 | `vperf/doctor.py` | 429 | capability probes + environment report (the source of truth for what this host supports) |
 | `vperf/parsers.py` | 504 | `perf stat -x,` CSV and `perf script` → dataclasses |
@@ -154,10 +154,10 @@ Notable APIs:
 
 ## CLI surface
 
-`build_parser()` is at `cli.py:364`; `main(argv=None)` at `cli.py:452`.
+`build_parser()` is at `cli.py:407`; `main(argv=None)` at `cli.py:503`.
 Subcommands: **run, attach, report, cycle, diff, doctor**.
 
-### Shared by `run` and `attach` (`cli.py:372`)
+### Shared by `run` and `attach` (`cli.py:415`)
 
 | Flag | Type / default | Effect |
 |---|---|---|
@@ -177,9 +177,9 @@ Subcommands: **run, attach, report, cycle, diff, doctor**.
 ### Per subcommand
 
 - **run** — `cmd` positional, `nargs=REMAINDER`, `metavar="-- CMD"`
-  (`cli.py:413`). Requires `-- CMD` (returns 2 otherwise, `cli.py:154`).
+  (`cli.py:464`). Requires `-- CMD` (returns 2 otherwise, `cli.py:157`).
   **Propagates the target's exit code**: `128 + abs(code)` for signals
-  (`cli.py:179`).
+  (`cli.py:183`).
 - **attach** — `-p/--pid` (required), `--duration` (default 10.0). `SIGSTOP`s the
   pid, profiles, `SIGCONT`s — but the stop is **best effort**: a pid we may not
   signal (another user's process, e.g. a systemd `clickhouse-server`) is profiled
@@ -192,7 +192,7 @@ Subcommands: **run, attach, report, cycle, diff, doctor**.
   trailing workload** alongside `-p` — perf attaches *or* launches, never both,
   and asked to do both it prints its usage and exits non-zero, which reads
   exactly like "attach is unavailable" on a host where attaching works.
-  `cmd_attach` also asks for `SIGINT` explicitly (`cli.py:196`), because that is
+  `cmd_attach` also asks for `SIGINT` explicitly (`cli.py:204`), because that is
   how an attached profile is meant to end — see the SIGINT invariant below.
 - **report** — positional `dir`. Loads artifacts with
   `load_profile(..., include_threads=True)` and re-renders terminal +
@@ -220,14 +220,14 @@ Subcommands: **run, attach, report, cycle, diff, doctor**.
 | `stat.csv` | `perf stat -x,` — legacy non-combined path only | during measurement |
 | `perf_ibs.data` / `perf_mem.data` | standalone memory record, only when the co-joined record failed | fallback only — **retired** like `perf.data` |
 | `perf_wait.data` | legacy non-combined path's scheduler-tracepoint recording — read only by the `perf script` that becomes `wait.txt` | fallback only — **retired** like `perf.data` |
-| `script.txt` | `perf script -i perf.data [--no-inline]` | post-target |
-| `wait.txt` | `_wait_artifact` splits the `sched:*` lines **out of** `script.txt` and rewrites it without them; deleted if empty | after `script.txt` |
-| `mem_report.txt` | `perf mem report -i perf.data --stdio --field-separator=\t --show-total-period [--sort …] [--time-quantum Nms]` | post-target, concurrent with `perf script` |
+| `script.txt` | `perf script -i perf.data [--no-inline]`, then compacted in place (`_compact_script_file` / inside `_wait_artifact`) | post-target |
+| `wait.txt` | `_wait_artifact` splits the `sched:*` lines **out of** `script.txt` and rewrites it without them, compacting as it goes; deleted if empty | after `script.txt` |
+| `mem_report.txt` | `perf mem report -i perf.data --stdio --field-separator=\t --show-total-period [--sort …] [--time-quantum Nms]`, then compacted in place (`_compact_mem_report`) | post-target, concurrent with `perf script` |
 | `freq.json`, `rss.json` | `_FreqSampler` / `_RssSampler` threads | after samplers stop |
 | `meta.json` | `_write_meta` — **last** of the collection phase | end |
 | `report.html` | `build_html` via `cli._finish` / `cmd_report` | report |
 
-### Collection order (`_collect_combined`, `collector.py:735`)
+### Collection order (`_collect_combined`, `collector.py:970`)
 
 1. Record `started`; `probe_wait()` decides whether `sched:` events go into the
    record.
@@ -238,7 +238,7 @@ Subcommands: **run, attach, report, cycle, diff, doctor**.
 3. `perf stat --per-thread -p <pid>` and `perf record -p <pid>` are launched
    **independently** (no `--`, so neither waits for the target to exit), each
    given `_COLLECTOR_SETTLE_GRACE = 0.1 s` to fail fast. Retry ladder on failure
-   (`collector.py:822`): drop `-I` intervals → drop co-joined memory → downgrade
+   (`collector.py:1095`): drop `-I` intervals → drop co-joined memory → downgrade
    DWARF to fp.
 4. `_FreqSampler(interval=0.01)` and `_RssSampler(pid, interval=0.01)` start.
    Their `t0` is `_sample_clock()` and goes into `meta.json` as `freq_t0` /
@@ -263,10 +263,12 @@ Subcommands: **run, attach, report, cycle, diff, doctor**.
 7. `stat_threads.csv` parsed; the aggregate `StatData` is
    `_aggregate_thread_stats(thread_stats)`, falling back to `stat.csv`.
 8. **`perf script` and `perf mem report` are both *started* with `defer=True`
-   before either is joined** (`collector.py:952`) so the phase costs `max()` of
+   before either is joined** (`collector.py:1282`) so the phase costs `max()` of
    the two rather than their sum. Pinned by `test_post_target_dumps_overlap`.
-   Do not "tidy" this into a sequential block.
-9. **The raw recordings are retired here** — `_retire_raw` (`collector.py:802`),
+   Do not "tidy" this into a sequential block. Each dump is compacted in place
+   once its own child has been joined (see *Collection*), so both rewrites fall
+   inside this phase rather than after it.
+9. **The raw recordings are retired here** — `_retire_raw` (`collector.py:926`),
    the earliest point past the last read of each: both deferred children are
    joined and `_memory_report`'s sort-key ladder is exhausted. Nothing after this
    line opens `perf.data`, so the space is freed before the parse and the render
@@ -316,13 +318,13 @@ wording that is true of every cause.
 
 ## The report build and its scoping model
 
-`report_html.py` is one module in three layers: `_CSS` (`report_html.py:42`, a
-minified custom-property theme), `_JS` (`report_html.py:131`, a **raw**
+`report_html.py` is one module in three layers: `_CSS` (`report_html.py:153`, a
+minified custom-property theme), `_JS` (`report_html.py:242`, a **raw**
 `r"""..."""` string), and the Python renderers, assembled by `build_html`
-(`report_html.py:2402`) into a single f-string.
+(`report_html.py:2576`) into a single f-string.
 
 Data reaches the browser as **bare global assignments in a separate `<script>`
-block emitted before `_JS`** (`report_html.py:2608`): `S=`, `FREQ=`, `FREQ_T0=`,
+block emitted before `_JS`** (`report_html.py:2821`): `S=`, `FREQ=`, `FREQ_T0=`,
 `RSS=`, `RSS_T0=`, `RSS_PEAK=`, `MEM_BACKEND=`, `MEM_ROWS=`, `MEM_SYM=`,
 `MEM_CHART_TITLES=`, `MEM_TLB=`, `MEM_SLICES=`, `MEM_Q=`, `MEM_TRUNC=`,
 `MEMORY_HTML=`, `OVERVIEW_HTML=`, `THREAD_GROUPS=`, `THREAD_OPTS=`,
@@ -569,6 +571,49 @@ behaviour change to both docs.
 
 ### Collection
 
+- **The two text dumps are compacted in place, and may only lose what the
+  parser already discarded.** Both are perf's raw stdout, and on a wide target
+  they are the two largest things in the directory, so each is rewritten once
+  the dump that produced it is done:
+  - **`script.txt`** — `_compact_script_file`, or sharing `_wait_artifact`'s
+    existing pass when a wait pass ran (there is no reason to walk a 75 MB file
+    twice). perf prints a frame it could not symbolize as
+    `<addr> [unknown] ([unknown])`, and `parsers._frame` already reduces that
+    pair to the single tag `[kernel]` (an address in the kernel's space) or
+    `[unresolved]`, deciding on the `ff` prefix alone and **throwing the address
+    away** — so the rewrite writes the tag the parser would have produced, which
+    makes it provably parse-identical rather than merely equivalent-looking.
+    With `kernel.kptr_restrict=1` (here: uid 1000, so `/proc/kallsyms` reads
+    back all zeros and *no* kernel address resolves) that is **20% of
+    `script.txt`** across five ClickBench/duckdb profiles, 249 MB → 199 MB; a
+    workload that stays in userspace barely moves (1.7% on a 1.9 s `membound`).
+    It costs ~400 ms per 75 MB, against the tens of seconds `perf script` took
+    to write the file.
+  - **`mem_report.txt`** — `_compact_mem_report`. We already pass
+    `--field-separator=\t`, but perf still right-pads every cell to the column
+    width, and that width is set by the *longest symbol in the report*: a
+    ClickHouse template instantiation runs to several hundred characters, so
+    **87% of the file was spaces** (104 MB of padding around an 11 MB report —
+    the largest artifact in the directory, ahead of `script.txt`). `_split_cells`
+    splits on the tab and strips each cell, so the padding was being thrown away
+    on read and the rewrite only avoids writing it. 235 MB → 29 MB across the
+    same five profiles, ~145 ms per 104 MB; the win scales with how long the
+    target's symbol names are (51% on `membound`, whose symbols are short).
+  - Both are **plain text and still tab-separated**, so a profile directory
+    stays greppable. Gzip wins far harder (98%, both files) and is lossless, but
+    it turns two documented, hand-inspectable artifacts into binary blobs and
+    would reach `load_profile`'s paths and the wait carve-out — deliberately not
+    taken.
+  - Every helper is a **fixed point** (`vperf report` re-reads a directory this
+    version did not write, and `-o` reuses an outdir) and preserves each line's
+    own terminator. Assert the *parse* of the written file, never the size: a
+    version that stripped the trailing `\n` off with the last cell merged the
+    column header into the first row and took the whole memory report to zero
+    samples, while a string-level check of the same transform passed.
+  - **`_UNRESOLVED_FRAME_RE` requires 4+ hex digits on purpose.** A null frame
+    prints a bare `0`, which `_FRAME_RE`'s `addr` group also refuses — so `sym`
+    swallows the run and the report shows a frame named `0 [unknown]`.
+    Rewriting it would change what the reader sees, so it is left alone.
 - **`load_profile`'s return value is a fixed-shape 8-tuple**:
   `(meta, stat, script_path, mem_report_path, wait_path, freq_timeline,
   thread_stats, rss_timeline)`. Index 6 is the thread map slot *even when it is
@@ -577,7 +622,7 @@ behaviour change to both docs.
 - **`perf` exits 0 with an empty report when it rejects a `--sort` key.**
   `_memory_report` therefore has a 5-attempt ladder over `_MEMORY_SORT` variants
   and treats "rc 0 + empty output" as a **failure**, not as "no samples"
-  (`_perf_error_summary`, `collector.py:300`). `perf report` has no `tgid` key —
+  (`_perf_error_summary`, `collector.py:322`). `perf report` has no `tgid` key —
   `pid` already means "command and tid"; do not add one to the sort lists.
 - **`--startup-grace` is a correctness knob, not a speed knob.**
   `perf stat --per-thread` only reports threads alive at the instant it attaches.
@@ -600,10 +645,10 @@ behaviour change to both docs.
   `flameColor`, `flameLabelText`). `MAX_FLAME_DEPTH` is injected into JS from
   Python. Change one and you must change the other; `tests/test_report_html.py`
   asserts on the JS as a string contract.
-- **Known latent bug:** `_FreqSampler` is defined **twice** — `collector.py:29`
-  (dead code, `interval_ms=` kwarg) and `collector.py:514` (the live one,
+- **Known latent bug:** `_FreqSampler` is defined **twice** — `collector.py:30`
+  (dead code, `interval_ms=` kwarg) and `collector.py:535` (the live one,
   `interval=` seconds). The legacy `collect()` path still calls it with the old
-  kwarg (`collector.py:1149`), so that path would raise. Tests monkeypatch
+  kwarg (`collector.py:1497`), so that path would raise. Tests monkeypatch
   `collector._FreqSampler` with `_FakeSampler`, so it is not exercised. Collapse
   the two definitions if you touch either.
 
@@ -625,10 +670,10 @@ report says so in place of the chart rather than drawing an empty box.
 
 Three independent mechanisms, all keyed off `doctor.cpu_vendor()`:
 
-1. **Event gating** — `_probe_capabilities` (`collector.py:407`) probes
+1. **Event gating** — `_probe_capabilities` (`collector.py:429`) probes
    `GENERIC_EVENTS + AMD_ONLY_EVENTS` only on `AuthenticAMD`, so Intel never
    emits `<not counted>` noise. Memoized in `_PROBE_CACHE` (cleared by tests).
-2. **Memory backend gating** — `_memory_plan` (`collector.py:195`) skips the IBS
+2. **Memory backend gating** — `_memory_plan` (`collector.py:217`) skips the IBS
    probe entirely on a known-Intel host; Intel falls through to
    `probe_intel_mem()` + `_intel_memory_events()`, which scrapes
    `perf mem record -e list` / `perf list --details` for `mem-loads`/`mem-stores`
@@ -651,8 +696,8 @@ vendor gets `DEFAULT_BRANCH_PENALTY` 15.0 (AMD 13.0, Intel 15.0).
 ### Platforms
 
 `sys.platform == "darwin"` is checked in exactly four places: `cli._ensure_access`
-(`cli.py:30`), `cli.cmd_attach` (`cli.py:191`), `cli.cmd_cycle` (`cli.py:255`),
-`cli.cmd_doctor` (`cli.py:350`), plus `collector.collect` (`collector.py:1094`)
+(`cli.py:30`), `cli.cmd_attach` (`cli.py:197`), `cli.cmd_cycle` (`cli.py:298`),
+`cli.cmd_doctor` (`cli.py:393`), plus `collector.collect` (`collector.py:1419`)
 which delegates to `collect_macos`. Heavy imports are deferred *inside* the
 branch so Linux never pays for them — keep it that way.
 
