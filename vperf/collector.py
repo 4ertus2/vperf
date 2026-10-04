@@ -882,6 +882,8 @@ def _collect_combined(
     # the samplers' own start, and a driver's SIGINT can land in it.
     session_start = time.monotonic()
     observation_end = session_start
+    record_launch_t0 = None
+    record_exit_t0 = None
     try:
         if target_ready:
             stat_args = _attached_stat_args(
@@ -940,6 +942,18 @@ def _collect_combined(
                 rss_sampler.start()
             except Exception:
                 rss_sampler = None
+        if record_process is not None:
+            # The clock perf prints its sample timestamps on, read at the moment
+            # the recording starts; its exit is stamped the same way below. What
+            # userspace can read is not necessarily that clock: a time namespace
+            # shifts CLOCK_MONOTONIC by its offset, and beyond that perf's own
+            # clock runs ahead of CLOCK_BOOTTIME by a drift proportional to
+            # uptime (measured here: 0.38 s at 2.3 h of uptime, 3.9 s at 11.8 h -
+            # about 0.9 ms per minute, so it grows by roughly 1.6 s a day).
+            # Neither is knowable in advance and both grow, so the two ends go
+            # into meta.json and the report derives the offset from the samples it
+            # already has. See report_html._sample_clock_bias.
+            record_launch_t0 = _sample_clock()
         if target_paused:
             if _signal_target(target_pid, signal.SIGCONT, warnings, process_group=target is not None):
                 target_paused = False
@@ -1001,6 +1015,10 @@ def _collect_combined(
         warnings.append(f"Target exited with status {target_exit_code}.")
 
     record_result = _finish_collector(record_process)
+    # stamped here, not before: the recording ends when perf is done writing, and
+    # the samples run to that moment. Stamping it a few ms early would make the
+    # samples' span look longer than the recording they came from.
+    record_exit_t0 = _sample_clock() if record_process is not None else None
     stat_result = _finish_collector(stat_process)
 
     # The samplers stop here, after the collectors, not when the monitor returned:
@@ -1155,6 +1173,8 @@ def _collect_combined(
         ),
         "wait": {"enabled": wait_path is not None},
         "freq_t0": getattr(freq_sampler, "t0", None),
+        "record_launch_t0": record_launch_t0,
+        "record_exit_t0": record_exit_t0,
         "rss_t0": getattr(rss_sampler, "t0", None),
         "rss_peak": max((rss for _, rss in rss_timeline), default=None) if rss_timeline else None,
         "startup_grace": startup_grace if pid is None else None,
@@ -1326,6 +1346,8 @@ def collect(
     # it on the stat pass above, and an attach knows the window it asked for
     quantum_ms = mem_time_quantum if mem_time_quantum else mem_time_quantum_ms(
         elapsed or (duration or None))
+    record_launch_t0 = None
+    record_exit_t0 = None
     if use_record:
         data_path = os.path.join(outdir, "perf.data")
         if memory_plan:
@@ -1347,6 +1369,7 @@ def collect(
         freq_sampler.start()
         if rss_sampler is not None:
             rss_sampler.start()
+        record_launch_t0 = _sample_clock()
         r = run_perf(args + ["--", *placeholder], timeout=(duration or 0) + 3600)
         freq_timeline = freq_sampler.stop()
         rss_timeline = rss_sampler.stop() if rss_sampler is not None else None
@@ -1368,6 +1391,7 @@ def collect(
             r = run_perf(args + ["--", *placeholder], timeout=(duration or 0) + 3600)
         if not r.ok:
             raise PerfError("perf record failed:\n" + (r.stderr or "").strip()[:2000])
+        record_exit_t0 = _sample_clock()
 
         # default format: explicit -F field lists suppress callchain frames
         sr = run_perf(["script", "-i", data_path],
@@ -1496,6 +1520,8 @@ def collect(
         ),
         "wait": {"enabled": wait_enabled},
         "freq_t0": getattr(freq_sampler, "t0", None),
+        "record_launch_t0": record_launch_t0,
+        "record_exit_t0": record_exit_t0,
         "rss_t0": getattr(rss_sampler, "t0", None),
         "rss_peak": max((rss for _, rss in rss_timeline), default=None) if rss_timeline else None,
         "perf_version": perf_version(),

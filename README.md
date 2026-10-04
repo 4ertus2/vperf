@@ -49,13 +49,20 @@ script. See [Development](#development).
   Runnable seconds, with a "where the time went" bar.
 - **Timelines** — CPU utilization, resident memory (with the run's peak) and
   frequency, across the whole run. The memory and frequency curves are placed on
-  the sample timeline by a clock origin each sampler records, which has to be the
-  clock perf prints its sample timestamps on — inside a Linux time namespace
-  those are not the clock userspace reads, so vperf reads `CLOCK_BOOTTIME` and,
-  for profiles collected before that or on a host where the clocks still differ,
-  re-aligns the origins when rendering and says so under the charts. Without that
-  both curves draw *empty* while their data sits in the file, which is invisible
-  rather than wrong-looking.
+  the sample timeline by a clock origin each sampler records, and that clock is
+  not one userspace is guaranteed to be reading: inside a Linux time namespace
+  `CLOCK_MONOTONIC` is shifted by the namespace's offset, and perf's own clock can
+  run ahead of `CLOCK_BOOTTIME` by a drift that grows with uptime — measured here
+  as 0.38 s at 2.3 h of uptime and 3.9 s at 11.8 h, about +1.6 s a day. So vperf
+  measures that offset per profile, from where the recording started and ended
+  against where its samples fall, and uses it to place the curves — unless the
+  measurement demonstrably puts the readings outside the measured window, in which
+  case the curve is anchored to the first sample instead, because on such a host
+  much of the gap is the delay before perf's *first* sample rather than a clock
+  difference. Either way the curve is drawn only where it was measured: a stretch
+  with no reading is left blank and labelled, never continued, since a held value
+  is a measurement nobody took. Left uncorrected both curves draw *empty* while
+  their data sits in the file, which is invisible rather than wrong-looking.
 - **Scoping** — a thread selector (with an optional group-by-name mode) and a
   time selection on the chart narrow every view that has the data for it.
 

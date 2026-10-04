@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 
 from .perf import PerfError, perf_available, perf_version, run_perf, start_perf
@@ -338,8 +339,10 @@ def probe_sampling_spread(event: str, seconds: float = 6.0) -> tuple[bool, str]:
     """
     data = "/tmp/vperf-spread-probe.data"
     placeholder = ["sleep", f"{seconds:.0f}"]
+    launched = time.clock_gettime(_sample_clock_id())
     r = run_perf(["record", "-o", data, "-F", "199", "-e", event, "--", *placeholder],
                  timeout=seconds + 30)
+    exited = time.clock_gettime(_sample_clock_id())
     stamps: list[float] = []
     try:
         if r.ok:
@@ -363,13 +366,36 @@ def probe_sampling_spread(event: str, seconds: float = 6.0) -> tuple[bool, str]:
             pass
     if len(stamps) < 2:
         return False, f"only {len(stamps)} sample(s) in {seconds:g}s"
+
+    # What the report will have to correct: perf's timestamps come from the
+    # kernel's clock, and the recording just measured how far that is from the one
+    # the samplers read. It is worth saying out loud, because it grows - measured
+    # here as 0.38 s at 2.3 h of uptime and 3.9 s at 11.8 h, about 1.6 s a day -
+    # and until it is removed the Memory RSS and Frequency curves sit outside the
+    # sample window and draw empty.
+    bias = ((min(stamps) - launched) + (max(stamps) - exited)) / 2
+    drift = ""
+    if abs(bias) >= 0.25:
+        drift = (f"; perf's timestamps run {abs(bias):.1f}s "
+                 f"{'ahead of' if bias > 0 else 'behind'} the samplers' clock "
+                 f"({clock_name()}), which vperf measures per profile and subtracts")
+
     spread = max(stamps) - min(stamps)
     if spread < 0.25:
         return False, (f"{len(stamps)} samples inside {spread * 1000:.0f} ms "
                        f"of a {seconds:g}s window: the PMU is not delivering "
                        f"samples over time, so profiles from this host are a "
-                       f"single instant")
-    return True, f"{len(stamps)} samples spanning {spread:.1f}s"
+                       f"single instant" + drift)
+    return True, f"{len(stamps)} samples spanning {spread:.1f}s" + drift
+
+
+def _sample_clock_id() -> int:
+    """The clock the samplers read, and the one perf's stamps are compared to."""
+    return getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC)
+
+
+def clock_name() -> str:
+    return "CLOCK_BOOTTIME" if hasattr(time, "CLOCK_BOOTTIME") else "CLOCK_MONOTONIC"
 
 
 def probe_wait() -> bool:

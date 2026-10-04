@@ -225,9 +225,20 @@ Subcommands: **run, attach, report, cycle, diff, doctor**.
    (`collector.py:822`): drop `-I` intervals → drop co-joined memory → downgrade
    DWARF to fp.
 4. `_FreqSampler(interval=0.01)` and `_RssSampler(pid, interval=0.01)` start.
-   Their `t0` is `time.monotonic()` and is the clock that lines `freq.json`,
-   `rss.json` and the perf sample timestamps up — it must be written to
-   `meta.json` as `freq_t0` / `rss_t0`.
+   Their `t0` is `_sample_clock()` and goes into `meta.json` as `freq_t0` /
+   `rss_t0` — the origins the report places those two curves by.
+   **Not `time.monotonic()`, and not enough on its own.** perf's timestamps come
+   from the kernel's clock, which userspace may not be reading: a *time
+   namespace* shifts `CLOCK_MONOTONIC` by its offset (26,161 s on the host this
+   was found on), and beyond that perf's clock runs ahead of `CLOCK_BOOTTIME` by a
+   drift proportional to uptime — 0.38 s at 2.3 h of uptime, 3.9 s at 11.8 h,
+   about 0.9 ms per minute, so **+1.6 s a day and no fixed allowance keeps up**.
+   So the collector also stamps the recording's two ends on the samplers' clock
+   (`record_launch_t0` when `perf record` is up, `record_exit_t0` once it has
+   finished writing — stamped before the stop, the samples' span would look
+   longer than the recording they came from), and
+   `report_html._sample_clock_bias` turns those plus the samples into the offset
+   to place the curves by.
 5. Target `SIGCONT`s; `_monitor_collectors` runs until the deadline, the
    collectors finish, or 2.0 s after the target exits.
 6. Samplers stopped (the last RSS reading is real because the target is still
@@ -255,7 +266,8 @@ stdout → `build_html` → `report.html`.
 host, cpu_vendor, kernel, ncpus, freq, interval_ms, events[], metrics[],
 precise_event, callgraph, inline, thread_stats{enabled,cojoined,file},
 memory{enabled,backend,period,ldlat,events,data_file,cojoined,time_quantum_ms},
-wait{enabled}, freq_t0, rss_t0, rss_peak, startup_grace, perf_version,
+wait{enabled}, freq_t0, rss_t0, rss_peak, record_launch_t0, record_exit_t0,
+startup_grace, perf_version,
 elapsed_wall`. The macOS backend adds `backend: "macos"`, `callgraph: "sample"`,
 `cpu_vendor: "Apple"`, `interval_ms: 50`.
 
@@ -300,11 +312,32 @@ folded in the browser.**
   process is one address space — procfs has no per-thread footprint). The HTML
   reveals a `.whole-run-note` via `body.sel-active` rather than silently
   reporting the run as if it were the window. Those two curves are placed on the
-  sample timeline by the origins the samplers recorded (`freq_t0` / `rss_t0`), so
-  the two charts draw *empty* — silently, with the data sitting in the file —
-  whenever those origins are on a different clock from perf's sample times.
-  `_reanchor_origin` in `build_html` is the guard: it only fires on a gap larger
-  than the run itself, and it leaves a note under the charts when it does.
+  sample timeline by the origins the samplers recorded (`freq_t0` / `rss_t0`),
+  which is what puts them at the same x as the samples they share a moment with —
+  and that placement is *measured*, not assumed: `_sample_clock_bias` reads the
+  last sample against the recording's exit (the one comparison with no setup
+  latency in it), refuses the correction when the samples claim a longer span
+  than the recording had, and adds the offset to the origin, since perf's stamps
+  run ahead. Left uncorrected the two charts draw *empty*, silently, with the
+  data sitting in the file. When the curves still do not reach the window the
+  chart says so in place, and the two reasons are worded apart: a placed profile
+  whose readings genuinely fall short, and one collected before the offset was
+  measured, which only a re-collection settles.
+- **A sampler curve is placed by whichever way lands more of its readings on the
+  window** (`_place_curve`), and drawn only where it was measured. Two rules, both
+  from what a wrong placement looks like. The measured offset is preferred,
+  because it is arithmetic — but on a host where perf delivers its samples long
+  after the recording was launched, the gap it measures is mostly *timing*:
+  measured here, a 2.87 s recording whose samples are stamped 3.94 s after its
+  launch, so subtracting the 2.80 s estimate slid the window past the end of the
+  series and a 311 → 1830 MiB rise drew as one flat line, the settled tail being
+  all that was left inside. So the measurement is judged by its effect, and when
+  it loses, the physical relation stands: the samplers start with the collectors,
+  so the first reading belongs at the first sample. And `rssBuckets` fills
+  *interior* gaps only — ahead of the first reading and behind the last there is
+  nothing to hold, and holding a value there is how one real reading becomes a
+  flat line across the whole timeline. Those buckets stay blank, labelled
+  "sampler not running".
 - HTML escaping: `esc()` in Python, `escHtml()` in JS. Numeric sort keys go in
   `data-v=` attributes so `sortTable` can compare numerically.
 
@@ -535,8 +568,10 @@ really there — a virtualised one — opens the event, delivers a single burst
 seconds after launch, and goes quiet; measured here, a 28 s recording produced 15
 samples inside 5 ms. Every hotspot, flame graph and timeline from such a host is
 one instant, so this is a WARN and not a FAIL, but it changes how any number from
-that host should be read. When the sampler curves come out empty for the same
-reason, the report says so in place of the chart rather than drawing an empty box.
+that host should be read. The row also reports the clock offset it measured on
+the way through, since that is what decides whether the two header curves can be
+placed at all. When the sampler curves come out empty for the same reason, the
+report says so in place of the chart rather than drawing an empty box.
 
 ### Vendors
 
@@ -660,7 +695,14 @@ summaries.
   `backends.macos` — not in `cli`, `collector`, `stacks`, `metrics`,
   `flamegraph`, `perf`, `timeline`, `report_*`.
 - HTML/CSS/JS: lowerCamelCase classes and JS globals, `--kebab-case` CSS custom
-  properties.
+  properties. **A JS string literal containing an apostrophe must escape it or use
+  double quotes** (`"the sampler's"` or `'the sampler\'s'`): one unescaped `'` ends
+  the literal early and makes the whole `<script>` block unparseable, which takes
+  the report with it — no charts, no tabs, no selection, with every byte of its
+  data still in the file. The string contracts in `tests/test_report_html.py`
+  cannot see it (a substring is present in a file that does not parse), so
+  `_js_lex_errors` walks `_JS` and every generated script block for unterminated
+  literals, and a `node --check` test covers it properly wherever node exists.
 - Backwards-compat aliases and duplicated helpers are deliberate; when you
   remove one, remove its aliases in the same commit.
 

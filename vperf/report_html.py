@@ -24,35 +24,115 @@ def esc(s) -> str:
     return html.escape(str(s), quote=True)
 
 
-# How far a sampler origin may sit from the first sample and still be believed:
-# generous enough for a sampler's lead-in and a collector's tail, far smaller than
-# any clock disagreement.
-_ORIGIN_SLACK_S = 10.0
+# A measured clock offset below this is not worth a note: it is what a setup
+# latency of a few tens of milliseconds looks like on a host where sampling works.
+_NOTE_CLOCK_BIAS_S = 0.25
 
 
-def _reanchor_origin(origin: float | None, t0: float, tspan: float) -> tuple[float | None, bool]:
-    """Put a sampler curve's origin on the sample timeline, if it is not.
+# A clock offset larger than this is not a clock, it is a mistake: a bias this big
+# would mean the two readings belong to different runs entirely.
+_MAX_CLOCK_BIAS_S = 86400.0
 
-    Normally a no-op: the samplers take their origin on perf's clock precisely so
-    the RSS and Frequency curves can be placed against the sample times. It was
-    not always so, and a mismatch is invisible rather than wrong-looking - every
-    reading simply falls outside the window, both charts draw empty, and the data
-    sits in the file looking complete. Two ways to end up here: a profile
-    collected before the origins moved to perf's clock (and `vperf report`
-    re-renders those), and a host where the kernel's clock is not the one
-    userspace reads, as inside a time namespace.
+# How far before the launch the first sample may sit once the offset is removed:
+# one sample interval, which is all the slack the first sample can have.
+_FIRST_SAMPLE_SLACK_S = 0.01
 
-    The shift assumes the samplers start just before the collectors do, which is
-    what they do - they are started first and stopped last - so the first reading
-    belongs at the first sample. Only a gap larger than the window itself triggers
-    it: a curve that starts early or late by less than that is a lead-in or a
-    tail, not a different clock.
+
+def _sample_clock_bias(meta: dict, t0: float, tspan: float) -> float | None:
+    """How far perf's own clock runs ahead of the clock the samplers read.
+
+    perf prints sample timestamps from the kernel's clock, and no clock userspace
+    can read is guaranteed to be it. A time namespace shifts CLOCK_MONOTONIC by
+    its offset (26,161 s on the host this was found on), and beyond that perf's
+    clock runs ahead of CLOCK_BOOTTIME by a drift proportional to uptime - 0.38 s
+    at 2.3 h of uptime, 3.9 s at 11.8 h, about 0.9 ms per minute, so it grows by
+    roughly 1.6 s a day and no fixed allowance can keep up with it. Both are
+    invisible until the sampler curves stop overlapping the samples at all and
+    the Memory RSS and Frequency charts draw empty over data that is in the file.
+
+    So the collector stamps the recording's launch and exit on the samplers' clock
+    (`record_launch_t0`, `record_exit_t0`), and the offset is derived here from the
+    samples already in hand. The *last* sample against the exit is the estimate to
+    use: the last sample is taken as the recording ends, so the difference is the
+    offset with no setup latency left in it, where the first sample against the
+    launch would carry the whole of it. The first sample is then the check - it
+    has to land at or after the launch once the offset is removed, or the two
+    readings are not describing the same recording and no offset is applied.
+
+    The offset is *added* to a curve's origin, not subtracted: perf's stamps run
+    ahead of the samplers' clock, so a reading has to be placed further along the
+    sample axis to line up with the sample it shares a moment with.
+
+    None means no usable calibration, and the caller leaves the curves where they
+    were recorded.
     """
-    if origin is None:
-        return None, False
-    if abs(origin - t0) <= tspan + _ORIGIN_SLACK_S:
-        return origin, False
-    return t0, True
+    launch = meta.get("record_launch_t0")
+    exit_ = meta.get("record_exit_t0")
+    if not isinstance(launch, (int, float)) or not isinstance(exit_, (int, float)):
+        return None
+    if exit_ <= launch:
+        return None
+    bias = (t0 + tspan) - exit_
+    if abs(bias) > _MAX_CLOCK_BIAS_S:
+        return None
+    # the first sample, with the offset removed, must not precede the launch; the
+    # slack is one sample interval at 200 Hz, which is all the slack it may have
+    if (t0 - launch) - bias < -_FIRST_SAMPLE_SLACK_S:
+        return None
+    return bias
+
+
+def _series_overlap(origin: float | None, t0: float, tspan: float,
+                    series: list | None) -> int:
+    """How many readings of a sampler curve fall inside the sample window."""
+    if origin is None or not series:
+        return 0
+    lo, hi = t0 - origin, t0 + tspan - origin
+    return sum(1 for point in series if lo <= point[0] <= hi)
+
+
+# Ordered by how much is known about where the curve belongs: arithmetic, then a
+# physical relation, then nothing. The weaker of the two curves names both, since
+# it is the one a reader could be misled by.
+_PLACEMENT_RANK = {"measured": 0, "anchored": 1, "recorded": 2}
+
+
+def _place_curve(raw: float | None, t0: float, tspan: float,
+                 series: list | None, bias: float | None) -> tuple[str, float | None]:
+    """Where to put one sampler curve, and which of the ways that won.
+
+    The measured offset is arithmetic, so it is preferred — but its entire
+    purpose is to land the readings on the sample window, and on a host where
+    perf delivers its samples long after the recording was launched the gap it
+    measures is mostly *timing*, not a clock offset. Measured on such a host: a
+    2.87 s recording whose samples are stamped 3.94 s after its launch, so the
+    estimate subtracts 2.80 s of window that never held a reading and the curve
+    lands past the end of the series — flat, because all that is left inside is
+    the settled tail.
+
+    So the measurement is judged by what it achieves: whichever placement lands
+    more of the sampler's readings on the measured window wins. When that is the
+    measurement it stands, because there is nothing to prefer over arithmetic.
+    When it is not, the physical relation is used instead — the samplers are
+    started with the collectors and stopped with them, so the first reading
+    belongs at the first sample. With nothing measured at all (a profile older
+    than the measurement) the curve stays where it was recorded and the chart
+    says why, rather than being slid across to look plausible.
+    """
+    if raw is None:
+        return "recorded", None
+    if bias is None:
+        return "recorded", raw
+    candidates = [("measured", raw + bias), ("anchored", t0)]
+    # Whichever lands more of the readings on the window wins, and a tie goes to
+    # the measurement: it is arithmetic, where anchoring is a relation. Scoring on
+    # the *count* rather than on overlap at all is the part that matters — a
+    # settled tail that happens to fall inside the window is an overlap, and
+    # accepting it is how a 311 -> 1830 MiB rise ends up drawn as one flat line.
+    scored = [(_series_overlap(origin, t0, tspan, series), -i, kind, origin)
+              for i, (kind, origin) in enumerate(candidates)]
+    best = max(scored)
+    return best[2], best[3]
 
 
 def _fmt(v, suffix="", prec=2):
@@ -490,16 +570,20 @@ function rssBuckets(){
   var idx=Math.floor((t-T0)/TSPAN*NBUCKETS);
   if(idx<0||idx>NBUCKETS-1) continue;
   sums[idx]+=r[1];counts[idx]++;}
- /* the sampler runs at a fixed cadence, so a bucket with no sample is the edge
-    of the window rather than a reading: hold the value across it, ahead of the
-    first sample and behind the last, and never let a gap read as zero bytes */
- var first=NaN,last=NaN;
- for(i=0;i<NBUCKETS;i++) if(counts[i]){first=sums[i]/counts[i];break;}
- last=first;
+ /* The sampler runs at a fixed cadence, so a bucket with no reading *between* two
+    that have one is a gap in the curve, not a zero: hold the value across it,
+    because that is what a 10 ms cadence that missed a bucket looks like. Ahead
+    of the first reading and behind the last there is nothing to hold - the
+    sampler was not running there - and extending the value across that stretch
+    is how one real reading becomes a flat line over the whole timeline. Those
+    buckets stay NaN and the chart leaves them blank. */
+ var first=-1,last=-1;
+ for(i=0;i<NBUCKETS;i++) if(counts[i]){if(first<0) first=i;last=i;}
  var out=new Float64Array(NBUCKETS);
- for(i=0;i<NBUCKETS;i++){
-  if(counts[i]) last=sums[i]/counts[i];
-  out[i]=isNaN(last)?(isNaN(first)?0:first):last;}
+ var held=NaN;
+ for(i=first;i>=0&&i<=last;i++){
+  out[i]=counts[i]?sums[i]/counts[i]:held;
+  if(counts[i]) held=out[i];}
  chartCacheKey=key;chartCache=out;
  return out;}
 
@@ -514,14 +598,24 @@ function rssEmpty(g,H,msg){
   +'<text x="'+(g.W/2).toFixed(0)+'" y="'+(g.pad_t+g.ph/2).toFixed(0)
   +'" text-anchor="middle" fill="#777">'+escHtml(msg)+'</text></svg>';}
 
+/* One sentence for both curves, and the two reasons are different enough to be
+   worth telling apart: a calibrated profile has had perf's clock offset removed,
+   so its readings genuinely do not reach the measured window; an uncalibrated one
+   (collected before vperf measured the offset) may simply be sitting on a
+   different clock, which only a re-collection can settle. */
+function windowGapMsg(placement){
+ return placement==='recorded'
+  ? 'This profile predates vperf measuring perf\'s clock offset, so the sampler\'s '
+    +'readings cannot be placed on this window; collect it again.'
+  : 'The sampler\'s readings do not reach the measured window \u2014 check the '
+    +'"sample spread" line of vperf doctor.';}
+
 function rssSvg(g,H,pad_t,ph){
  if(!RSS.length) return rssEmpty(g,H,
   'Memory over time was not collected in this profile (--no-rss skips it).');
  var buckets=rssBuckets(),i,peak=RSS_PEAK||0;
  for(i=0;i<NBUCKETS;i++) if(buckets[i]>peak) peak=buckets[i];
- if(peak<=0) return rssEmpty(g,H,
-   'The memory sampler recorded nothing inside the measured window \u2014 check the '
-   +'"sample spread" line of vperf doctor.');
+ if(peak<=0) return rssEmpty(g,H, windowGapMsg(RSS_CALIBRATED));
  var unit=rssUnit(peak),div=unit[0];
  /* the run's peak is the top of the plot, the way the utilization chart puts
     its ceiling there, so the marker line is the last thing the eye lands on */
@@ -540,12 +634,28 @@ function rssSvg(g,H,pad_t,ph){
  svg+='<text x="'+(g.pad_l-6)+'" y="'+(pad_t+4).toFixed(1)+'" text-anchor="end" fill="#bbb">'
    +ticks(ymax)+'</text>';
  svg+=shadeSvg(g,H,pad_t,ph);
+ /* Only where the sampler was running at all. A stretch with no reading is
+    drawn as an empty stretch and labelled, not continued: a held value there
+    reads as a measurement nobody took. */
+ var lo=-1,hi=-1;
+ for(i=0;i<NBUCKETS;i++) if(!isNaN(buckets[i])){if(lo<0) lo=i;hi=i;}
+ if(lo<0) return rssEmpty(g,H, windowGapMsg(CURVE_PLACEMENT));
+ var xlo=g.pad_l+lo/Math.max(NBUCKETS-1,1)*g.pw;
+ var xhi=g.pad_l+hi/Math.max(NBUCKETS-1,1)*g.pw;
+ if(lo>0) svg+='<rect x="'+g.pad_l.toFixed(1)+'" y="'+pad_t.toFixed(1)+'" width="'
+   +(xlo-g.pad_l).toFixed(1)+'" height="'+ph.toFixed(1)+'" fill="rgba(255,255,255,0.05)"/>';
+ if(hi<NBUCKETS-1) svg+='<rect x="'+xhi.toFixed(1)+'" y="'+pad_t.toFixed(1)+'" width="'
+   +(g.W-10-xhi).toFixed(1)+'" height="'+ph.toFixed(1)+'" fill="rgba(255,255,255,0.05)"/>';
+ if(lo>0||hi<NBUCKETS-1){
+  svg+='<text x="'+(lo>0&&hi<NBUCKETS-1?(xlo+xhi)/2:(lo>0?(g.pad_l+xlo)/2:(xhi+g.W-10)/2)).toFixed(1)
+   +'" y="'+(pad_t+ph-6).toFixed(1)+'" text-anchor="middle" fill="#8b93a7" font-size="10">'
+   +'sampler not running</text>';}
  var pts='';
- for(i=0;i<NBUCKETS;i++){
+ for(i=lo;i<=hi;i++){
   var x=g.pad_l+i/Math.max(NBUCKETS-1,1)*g.pw;
   pts+=x.toFixed(1)+','+Y(buckets[i]/div).toFixed(1)+' ';}
- svg+='<polygon points="'+g.pad_l+','+(pad_t+ph)+' '+pts
-   +timeToX(T0+TSPAN,g).toFixed(1)+','+(pad_t+ph)+'" fill="rgba(64,156,255,0.35)" '
+ svg+='<polygon points="'+xlo.toFixed(1)+','+(pad_t+ph)+' '+pts
+   +xhi.toFixed(1)+','+(pad_t+ph)+'" fill="rgba(64,156,255,0.35)" '
    +'stroke="#409cff" stroke-width="1.5"/>';
  var py=Y(ymax).toFixed(1);
  svg+='<line x1="'+g.pad_l+'" y1="'+py+'" x2="'+(g.W-10)+'" y2="'+py
@@ -585,9 +695,7 @@ function freqSvg(g,H,pad_t,ph){
     the file says perfectly well which. So say it here, and point at the check
     that tells the two causes apart (a sampler that ran, and a PMU that never
     delivered samples inside the window). */
- if(!env.length) return rssEmpty(g,H,
-   'The frequency sampler recorded nothing inside the measured window \u2014 check '
-   +'the "sample spread" line of vperf doctor.');
+ if(!env.length) return rssEmpty(g,H, windowGapMsg(FREQ_CALIBRATED));
  var span=TSPAN,lo=env[0][0],hi=env[env.length-1][0];
  if(FREQ_T0===null) span=Math.max(hi-lo,1e-9);
  var ymax=0,i,e;
@@ -2495,31 +2603,47 @@ def build_html(meta: dict, samples: list, m: MetricsReport, prof: StackProfile,
     # ---- sampler curve origins, memory slice table, band/level names --------
     # The frequency and memory samplers record offsets from an origin on perf's
     # own clock, so those origins are what line the three curves up.
-    # _reanchor_origin puts them on the sample timeline when they are not already
-    # - see its docstring for when that happens and what it costs.
+    # _place_curve decides where each origin belongs and says which way it
+    # decided - see its docstring.
     # rss_peak is the raw high-water mark the sampler saw: a spike shorter than a
     # bucket is gone from the area, so the chart draws the peak as its own line
     # and the terminal prints the same number.
-    freq_t0, freq_shifted = _reanchor_origin(meta.get("freq_t0"), t0, tspan)
+    bias = _sample_clock_bias(meta, t0, tspan)
+    freq_kind, freq_t0 = _place_curve(meta.get("freq_t0"), t0, tspan,
+                                      freq_timeline, bias)
+    rss_kind, rss_t0 = _place_curve(meta.get("rss_t0"), t0, tspan,
+                                    rss_timeline, bias)
+    placement = max((freq_kind, rss_kind), key=lambda k: _PLACEMENT_RANK[k])
+    placement_json = repr(placement)
     freq_t0_json = "null" if freq_t0 is None else repr(float(freq_t0))
-    rss_t0, rss_shifted = _reanchor_origin(meta.get("rss_t0"), t0, tspan)
     rss_t0_json = "null" if rss_t0 is None else repr(float(rss_t0))
     rss_peak = meta.get("rss_peak")
     rss_peak_json = "0" if rss_peak is None else repr(int(rss_peak))
-    shifted = [name for name, was in (("Frequency", freq_shifted),
-                                      ("Memory RSS", rss_shifted)) if was]
+    note_bits = []
+    if bias is not None and abs(bias) >= _NOTE_CLOCK_BIAS_S:
+        if placement == "recorded":
+            note_bits.append(
+                f"perf's timestamps run {abs(bias):.1f} s "
+                f"{'ahead of' if bias > 0 else 'behind'} the clock the samplers read, "
+                "so both curves were placed with that offset removed - without it they "
+                "would fall outside the measured window and draw empty (vperf "
+                "doctor's \"sample spread\" line explains why the two clocks differ)")
+        else:
+            note_bits.append(
+                f"the {abs(bias):.1f} s offset between perf's timestamps and the "
+                "clock the samplers read was measured but not applied: it places the "
+                "readings outside the measured window, which means it is mostly the "
+                "delay before perf's first sample rather than a clock difference "
+                "(see \"sample spread\" in vperf doctor). Both curves are placed by "
+                "anchoring the first reading to the first sample instead")
+    elif placement == "recorded" and bias is None:
+        note_bits.append(
+            "the curves are placed where their readings were recorded: this profile "
+            "predates vperf measuring perf's clock offset")
     clock_note_html = ""
-    if shifted:
-        clock_note_html = (
-            '<div class="note" style="margin-top:6px">'
-            + esc(f"{' and '.join(shifted)} "
-                  "curve origin re-aligned to the sample timeline: the sampler read a "
-                  "clock that is not the one perf's sample timestamps use, and the two "
-                  "differed by more than this run is long - left alone, every reading "
-                  "would fall outside the window and the chart would draw empty. A "
-                  "profile collected on a host inside a time namespace, or before vperf "
-                  "read perf's clock, needs this; re-collecting it fixes the cause.")
-            + "</div>")
+    if note_bits:
+        clock_note_html = ('<div class="note" style="margin-top:6px">'
+                           + esc(". ".join(note_bits) + ".") + "</div>")
     mem_rows = _memory_rows_payload(mem, t0)
     mem_rows_json = json.dumps(mem_rows["rows"]).replace("</", "<\\/")
     mem_sym_json = json.dumps(mem_rows["sym"]).replace("</", "<\\/")
@@ -2666,6 +2790,7 @@ rows too thin to read, and anything past {MAX_FLAME_DEPTH} rows, fold into the l
 <script>
 S={samples_json};FREQ={freq_json};FREQ_T0={freq_t0_json};
 RSS={rss_json};RSS_T0={rss_t0_json};RSS_PEAK={rss_peak_json};
+CURVE_PLACEMENT={placement_json};
 MEM_BACKEND={mem_backend_json};MEM_ROWS={mem_rows_json};MEM_SYM={mem_sym_json};
 MEM_CHART_TITLES={mem_chart_titles};
 MEM_TLB={mem_tlb_json};
