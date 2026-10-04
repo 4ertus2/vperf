@@ -1,5 +1,7 @@
 import json
 import re
+import shutil
+import subprocess
 
 import pytest
 from dataclasses import asdict
@@ -11,6 +13,9 @@ from vperf.parsers import ScriptSample, StatData
 from vperf.report_html import (
     _CSS,
     _JS,
+    _place_curve,
+    _series_overlap,
+    _sample_clock_bias,
     _memory_rows_payload,
     _sample_payload,
     _group_options,
@@ -625,8 +630,13 @@ def test_build_html_embeds_the_memory_timeline_and_its_origin():
     prints too, so the two never disagree."""
     meta = {"target": {"cmd": ["app"]}, "ncpus": 4,
             "rss_t0": 100.0, "rss_peak": 1073741824}
+    # the origin is on perf's clock, so the profile's own time range has to start
+    # there too - a sample at 100.0s, the way a real profile's first one does
+    prof = build_profile([
+        ScriptSample("worker", 42, 42, 100.0, 1, "cycles:P", [("worker", "app")]),
+    ])
 
-    html = build_html(meta, [], MetricsReport(), build_profile([]),
+    html = build_html(meta, [], MetricsReport(), prof,
                       rss_timeline=[[0.01, 536870912], [0.02, 1073741824]])
 
     assert "RSS=[[0.01, 536870912], [0.02, 1073741824]];" in html
@@ -1338,3 +1348,345 @@ def test_a_thread_or_group_timeline_is_capped_at_its_own_ceiling():
     assert "function ceilingNote(g)" in _JS
     assert "one thread can use one core" in _JS
     assert "of '+fmtCount(scopeCeiling())+' logical CPUs" in _JS
+
+
+class TestSamplerCurveOrigins:
+    """The Memory RSS and Frequency curves are placed against perf's sample times.
+
+    Their samplers record offsets from an origin on perf's clock, and when that
+    origin is on a *different* clock every reading falls outside the window and
+    both charts draw empty - the data sits in the file looking complete. Inside a
+    time namespace that is exactly what happens: measured on a host whose shell
+    sits in one, time.monotonic() read 13711 s where perf and /proc/uptime read
+    39873 s.
+    """
+
+    def test_an_empty_curve_says_which_failure_it_is(self):
+        """A blank plot is the one failure a reader cannot act on.
+
+        Both header curves are drawn from readings on a sampler's own clock, so
+        they can be empty while the file is complete - and the two reasons are
+        different enough to be worth telling apart. A placed profile has had
+        perf's clock offset resolved, so its readings genuinely do not reach the
+        measured window; an unplaced one (collected before vperf measured that
+        offset) may simply be on a different clock, which only a re-collection
+        settles.
+        """
+        assert "windowGapMsg(" in _JS
+        assert "do not reach the measured window" in _JS
+        assert "predates vperf measuring" in _JS
+        assert "sample spread" in _JS
+        # and the frequency curve has an in-place empty state at all, rather than
+        # returning a bare <svg>
+        body = _JS.split("function freqSvg(")[1].split("\nfunction ")[0]
+        assert "rssEmpty(" in body
+
+    def test_a_steady_process_is_flat_but_fully_covered(self):
+        """The opposite case, and the one server mode produces.
+
+        A clickhouse-server's RSS does not move inside a two-second query, so its
+        curve is genuinely flat. What must not happen is a flat curve *made* flat
+        by holding one reading across a window the sampler never covered: here the
+        readings span the window, so every bucket has one and none is blank.
+        """
+        rss = [[t / 100.0, 2_500_000_000] for t in range(200)]
+        prof = build_profile([
+            ScriptSample("worker", 42, 42, 100.0, 1, "cycles:P", [("worker", "app")]),
+            ScriptSample("worker", 42, 42, 101.9, 1, "cycles:P", [("worker", "app")]),
+        ])
+        html = build_html({"target": {"cmd": ["app"]}, "mode": "attach",
+                           "rss_t0": 100.0}, [], MetricsReport(), prof, _profile(),
+                          rss_timeline=rss)
+
+        assert "RSS_T0=100.0;" in html          # nothing to correct: readings cover it
+        assert "CURVE_PLACEMENT='recorded';" in html
+
+    def test_a_stretch_with_no_reading_is_blank_and_labelled(self):
+        """A held value is a measurement nobody took.
+
+        The curve is drawn across the measured span only; ahead of the first
+        reading and behind the last the buckets stay empty and say so, which is
+        what stops one real reading reading as a flat line over the whole timeline.
+        """
+        body = _JS.split("function rssBuckets(")[1].split("\nfunction ")[0]
+        assert "out[i]=counts[i]?sums[i]/counts[i]" in body
+        svg = _JS.split("function rssSvg(")[1].split("\nfunction ")[0]
+        assert "sampler not running" in svg
+        assert "isNaN(buckets[i])" in svg
+
+
+class TestMeasuredClockOffset:
+    """perf's timestamps come from the kernel's clock, and no clock userspace can
+    read is guaranteed to be it.
+
+    Measured on the host this was found on: a time namespace put
+    CLOCK_MONOTONIC 26,161 s behind, and perf's own clock runs ahead of
+    CLOCK_BOOTTIME by a drift proportional to uptime - 0.38 s at 2.3 h, 3.9 s at
+    11.8 h. The second one is the dangerous kind: it grows about 1.6 s a day, so no
+    fixed allowance keeps up, and until it is removed the Memory RSS and Frequency
+    curves sit outside the sample window and draw empty over data the file has.
+    """
+
+    def _meta(self, launch, exit_):
+        return {"record_launch_t0": launch, "record_exit_t0": exit_}
+
+    def test_a_perfectly_calibrated_recording_needs_no_shift(self):
+        # samples end exactly where the recording ended: nothing to correct
+        meta = self._meta(launch=100.0, exit_=103.0)
+        assert _sample_clock_bias(meta, t0=101.0, tspan=2.0) == 0.0
+
+    def test_the_offset_is_read_off_the_end_of_the_samples(self):
+        # a recording that lived 100..103, whose samples are stamped 4 s ahead and
+        # begin 0.5 s after the launch (perf's setup latency, not a clock error)
+        meta = self._meta(launch=100.0, exit_=103.0)
+        bias = _sample_clock_bias(meta, t0=104.5, tspan=2.5)
+        assert bias == 4.0
+        # and the origin moves by exactly that - forwards, because perf's stamps
+        # run ahead - so a reading taken at the launch lands on the first sample
+        series = [[1.0 + t / 100.0, 1024] for t in range(200)]
+        assert _place_curve(100.0, t0=104.5, tspan=2.5, series=series, bias=bias) == (
+            "measured", 104.0)
+
+    def test_samples_longer_than_the_recording_refuse_the_correction(self):
+        """Samples claiming a longer span than the recording had are not a clock.
+
+        A constant offset cannot stretch a span, so this is the signature of two
+        readings that do not describe the same recording. Correcting with a number
+        derived from the wrong end would put the curve somewhere plausible and
+        wrong, so nothing is applied and the chart reports the gap instead.
+        """
+        meta = self._meta(launch=100.0, exit_=101.0)
+        assert _sample_clock_bias(meta, t0=100.0, tspan=2.0) is None
+
+    def test_a_measured_offset_is_never_slid_across_to_look_plausible(self):
+        """A measurement is used as measured, or not at all.
+
+        With a bias in hand the origin moves by that bias and nothing else. Where
+        that lands the curve short of the window, the chart reports the shortfall
+        rather than the curve being dragged over to fill it - which is why the
+        placement is chosen by how many readings land inside, and not by which
+        candidate produces the fuller-looking plot.
+        """
+        # every reading sits just outside the window under either placement, so
+        # the measurement stands and the shortfall is the chart's to report
+        series = [[5.0 + t / 100.0, 1024] for t in range(100)]
+        assert _place_curve(100.0, t0=100.0, tspan=1.0, series=series,
+                            bias=4.0) == ("measured", 104.0)
+
+    def test_no_calibration_leaves_the_origin_where_it_was_recorded(self):
+        assert _sample_clock_bias({}, t0=100.0, tspan=2.0) is None
+        assert _sample_clock_bias({"record_launch_t0": 100.0}, t0=100.0, tspan=2.0) is None
+        # nothing measured, nothing assumed: the reading stays where it was taken
+        # and the chart says why, rather than being slid across to look plausible
+        series = [[t / 100.0, 1024] for t in range(200)]
+        assert _place_curve(139.0, t0=140.0, tspan=2.0, series=series,
+                            bias=None) == ("recorded", 139.0)
+
+    def test_nonsense_stamps_are_refused(self):
+        assert _sample_clock_bias(self._meta(103.0, 100.0), t0=104.0, tspan=1.0) is None
+        assert _sample_clock_bias({"record_launch_t0": 0.0, "record_exit_t0": 1.0},
+                                  t0=9e9, tspan=1.0) is None
+
+    def test_the_measured_offset_wins_when_it_lands_the_readings_on_the_window(self):
+        series = [[t / 100.0, 1024] for t in range(0, 300)]
+        # the window is 0..3 s of the readings' own timeline
+        kind, origin = _place_curve(100.0, t0=100.5, tspan=2.0, series=series, bias=0.0)
+        assert (kind, origin) == ("measured", 100.0)
+
+    def test_an_offset_that_pushes_the_curve_past_the_readings_is_not_used(self):
+        """The measurement is judged by what it achieves.
+
+        This is the host that made it necessary: a recording whose samples are
+        stamped seconds after it started, so the estimate is mostly the delay
+        before perf's first sample. Subtracting it leaves the readings behind
+        the window and the curve flat, so the physical relation is used instead -
+        the samplers start with the collectors, so the first reading belongs at
+        the first sample.
+        """
+        series = [[t / 100.0, 1024] for t in range(0, 173)]   # readings 0..1.73 s
+        # measured would slide the window past most of the readings, leaving the
+        # settled tail inside it; anchoring puts the whole series in
+        measured = _series_overlap(100.0 + 1.14, 100.0, 1.73, series)
+        anchored = _series_overlap(100.0, 100.0, 1.73, series)
+        assert anchored > measured
+        kind, origin = _place_curve(100.0 + 1.14, t0=100.0, tspan=1.73,
+                                    series=series, bias=1.14)
+        assert kind == "anchored"
+        assert origin == 100.0
+
+    def test_the_report_carries_the_placement_to_the_chart(self):
+        """Which placement won reaches the chart, and the chart is told.
+
+        The fixture is the healthy-host shape: the sampler's readings cover the
+        part of the recording the measured offset puts them on, so the measurement
+        wins and the origins carry it.
+        """
+        prof = build_profile([
+            ScriptSample("worker", 42, 42, 104.5, 1, "cycles:P", [("worker", "app")]),
+            ScriptSample("worker", 42, 42, 106.5, 1, "cycles:P", [("worker", "app")]),
+        ])
+        base = {"target": {"cmd": ["app"]}, "mode": "attach"}
+        # readings 1.0..4.0 s of a recording that ran 100..103, whose samples are
+        # stamped 3.5 s ahead: the offset is real and it lands them on the window
+        series = [[1.0 + t / 100.0, 1024] for t in range(300)]
+        measured = build_html({**base, "record_launch_t0": 100.0,
+                               "record_exit_t0": 103.0, "rss_t0": 100.0,
+                               "freq_t0": 100.0},
+                              [], MetricsReport(), prof, _profile(),
+                              freq_timeline=series, rss_timeline=series)
+        uncalibrated = build_html({**base, "rss_t0": 100.0, "freq_t0": 100.0},
+                                  [], MetricsReport(), prof, _profile(),
+                                  freq_timeline=series, rss_timeline=series)
+
+        assert "RSS_T0=103.5;" in measured
+        assert "FREQ_T0=103.5;" in measured
+        assert "CURVE_PLACEMENT='measured';" in measured
+        # with nothing measured nothing is assumed: the readings stay where they
+        # were recorded and the report says why
+        assert "RSS_T0=100.0;" in uncalibrated
+        assert "FREQ_T0=100.0;" in uncalibrated
+        assert "CURVE_PLACEMENT='recorded';" in uncalibrated
+
+
+def _js_lex_errors(js: str) -> list[str]:
+    """Unterminated string literals in JavaScript, with the context to fix them.
+
+    This suite's other contract against `_JS` is substring assertions, and a
+    substring is just as present in a file that does not parse - so a single
+    unescaped apostrophe inside a `'...'` literal shipped a syntax error that
+    killed the whole report: no charts, no tabs, no selection. There is no JS
+    engine in this environment to parse with, so this walks the text instead.
+
+    The part that needs care is regex literals. `escHtml` holds `.replace(/"/g,
+    '&quot;')`, and a scanner that treats that `"` as opening a string swallows
+    the rest of the file and reports a page of nonsense. So a `/` opens a regex
+    only where a value cannot end - after `(,=:[!&|?{};` or a newline - and the
+    regex then runs to its closing slash, honouring backslash escapes and
+    character classes.
+    """
+    errors: list[str] = []
+    i, n = 0, len(js)
+    prev = ""          # last significant character, for the regex heuristic
+    start = 0
+    while i < n:
+        c = js[i]
+        if c == "/" and i + 1 < n and js[i + 1] == "/":
+            j = js.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if c == "/" and i + 1 < n and js[i + 1] == "*":
+            j = js.find("*/", i + 2)
+            if j < 0:
+                errors.append(f"unterminated /* comment at offset {i}")
+                break
+            i = j + 2
+            continue
+        if c in "'\"`":
+            quote, start = c, i
+            i += 1
+            while i < n:
+                if js[i] == "\\":
+                    i += 2
+                    continue
+                if js[i] == quote:
+                    break
+                if js[i] == "\n":
+                    break
+                i += 1
+            if i >= n or js[i] != quote:
+                errors.append(
+                    f"unterminated {quote} string at offset {start}: "
+                    f"{js[max(0, start - 60):start + 40]!r}"
+                )
+            prev = quote
+            i += 1
+            continue
+        if c == "/":
+            # a regex where a value cannot end, division everywhere else
+            if prev in "(,=:[!&|?{};+-*%~^" or prev == "":
+                i += 1
+                in_class = False
+                while i < n and js[i] != "\n":
+                    if js[i] == "\\":
+                        i += 2
+                        continue
+                    if js[i] == "[":
+                        in_class = True
+                    elif js[i] == "]":
+                        in_class = False
+                    elif js[i] == "/" and not in_class:
+                        break
+                    i += 1
+                prev = "/"
+                i += 1
+                continue
+        if not c.isspace():
+            prev = c
+        i += 1
+    return errors
+
+
+def test_the_embedded_javascript_lexes():
+    """A syntax error in `_JS` takes the whole report with it, silently.
+
+    Nothing else in this file can see one: the contracts above are substring
+    assertions, and a substring survives a parse failure. An unescaped apostrophe
+    in a `'...'` literal is exactly that - a report that loads, draws three empty
+    header charts, and has no working tab strip, with every byte of its data
+    sitting in the file.
+    """
+    assert _js_lex_errors(_JS) == [], _js_lex_errors(_JS)
+
+
+def test_a_generated_reports_script_blocks_lexe(tmp_path):
+    """Same check on what actually ships, payload included.
+
+    The globals are concatenated into the same block as `_JS`, so this covers the
+    assembly too, not only the constant.
+    """
+    prof = build_profile([
+        ScriptSample("worker", 42, 42, 10.0, 1, "cycles:P", [("worker", "app")]),
+    ])
+    html = build_html({"target": {"cmd": ["app"]}, "mode": "run"}, [],
+                      MetricsReport(), prof, _profile())
+
+    for block in re.findall(r"<script>(.*?)</script>", html, re.S):
+        assert _js_lex_errors(block) == [], _js_lex_errors(block)
+
+
+def test_the_scanner_still_catches_the_escaping_mistake():
+    """Guard the guard: a scanner that cannot fail is not a check."""
+    broken = "function f(){ return 'The sampler's readings do not reach'; }"
+    errors = _js_lex_errors(broken)
+    assert errors and "unterminated" in errors[0]
+    # and it is not fooled by a regex literal holding a quote, which is what
+    # escHtml's .replace(/"/g, '&quot;') looks like
+    assert _js_lex_errors('var a=s.replace(/"/g,"&quot;");') == []
+    assert _js_lex_errors("// don't worry\nvar a=1;") == []
+    assert _js_lex_errors("/* don't worry */ var a=1;") == []
+    assert _js_lex_errors("var t=`top`;") == []
+
+
+def test_the_generated_script_parses_when_a_js_engine_is_available(tmp_path):
+    """The lexical check above is a floor, not a parser.
+
+    Where node exists, hand it the real thing: it will catch what a scanner
+    cannot, and it costs nothing where node is absent (this host has none, which
+    is why the scanner exists at all).
+    """
+    node = shutil.which("node") or shutil.which("nodejs")
+    if not node:
+        pytest.skip("no JS engine available; the lexical check above is the gate")
+    prof = build_profile([
+        ScriptSample("worker", 42, 42, 10.0, 1, "cycles:P", [("worker", "app")]),
+    ])
+    html = build_html({"target": {"cmd": ["app"]}, "mode": "run"}, [],
+                      MetricsReport(), prof, _profile())
+    blocks = re.findall(r"<script>(.*?)</script>", html, re.S)
+    assert blocks
+    for n, block in enumerate(blocks):
+        path = tmp_path / f"block{n}.js"
+        path.write_text(block, encoding="utf-8")
+        checked = subprocess.run([node, "--check", str(path)],
+                                 capture_output=True, text=True, timeout=60)
+        assert checked.returncode == 0, checked.stderr

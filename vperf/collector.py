@@ -116,6 +116,9 @@ def _memory_meta(*, enabled: bool, backend: str | None, period: int,
 
 DEFAULT_CALLGRAPH = "fp"
 DEFAULT_STACK_DEPTH = 127      # perf's own default; kept explicit, see _callgraph_args
+# Written the instant before the collectors are monitored, so a driver knows when
+# it may start the workload it wants profiled - see _write_recording_marker.
+RECORDING_MARKER = "recording.started"
 
 # `perf report -s` accepts: pid, comm, dso, symbol, parent, cpu, socket, srcline,
 # weight, local_weight, cgroup_id, addr.  There is no `tgid` key, and a rejected
@@ -486,9 +489,8 @@ class _RssSampler:
         self.samples: list[tuple[float, int]] = []
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        # same clock and the same reason as the frequency sampler's: perf prints
-        # sample timestamps on CLOCK_MONOTONIC, so this is what puts the memory
-        # curve on the sample timeline in the HTML report.
+        # same clock and the same reason as the frequency sampler's - see
+        # _sample_clock
         self.t0: float | None = None
 
     def start(self) -> None:
@@ -503,11 +505,11 @@ class _RssSampler:
         return self.samples
 
     def _run(self) -> None:
-        t0 = self.t0 = time.monotonic()
+        t0 = self.t0 = _sample_clock()
         while not self._stop.is_set():
             rss = _read_rss(self.pid)
             if rss is not None:
-                self.samples.append((time.monotonic() - t0, rss))
+                self.samples.append((_sample_clock() - t0, rss))
             self._stop.wait(self.interval)
 
 
@@ -519,9 +521,9 @@ class _FreqSampler:
         self.samples: list[tuple[float, dict[int, int]]] = []
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        # absolute CLOCK_MONOTONIC reading the sample times are relative to.
-        # perf prints sample timestamps on the same clock, so this is what puts
-        # the frequency curve on the sample timeline in the HTML report.
+        # reading on perf's clock that the sample offsets are relative to, which
+        # is what puts the frequency curve on the sample timeline - see
+        # _sample_clock for why that is not simply time.monotonic()
         self.t0: float | None = None
 
     def start(self) -> None:
@@ -536,11 +538,11 @@ class _FreqSampler:
         return self.samples
 
     def _run(self) -> None:
-        t0 = self.t0 = time.monotonic()
+        t0 = self.t0 = _sample_clock()
         while not self._stop.is_set():
             freqs = _read_freqs()
             if freqs:
-                self.samples.append((time.monotonic() - t0, freqs))
+                self.samples.append((_sample_clock() - t0, freqs))
             self._stop.wait(self.interval)
 
 
@@ -664,11 +666,58 @@ def _monitor_collectors(
         time.sleep(0.02)
 
 
+# How long a collector gets to exit after being asked to, before it is escalated
+# to SIGTERM.  perf's flush is proportional to perf.data, and that file is not
+# small for a wide target: sampling a 359-thread clickhouse-server at 499 Hz with
+# 16 KiB DWARF stacks writes ~140 MB for a one-second window, and perf needs tens
+# of seconds to write it out.  With the old 2 s it was still flushing when the
+# SIGTERM arrived, which killed the record, and a record judged failed takes its
+# samples with it - a full perf.data discarded because of a stop that was too
+# impatient.  Perf that truly hangs still gets escalated; it just gets to finish.
+_COLLECTOR_STOP_GRACE = 60.0
+
+
+def _write_recording_marker(outdir: str) -> None:
+    """Tell a driver waiting on this profile that measurement has started.
+
+    The wall-clock line is for a reader; the contract is the file's existence, at
+    the instant before the collectors are monitored. Best effort by design: a
+    driver that waits for it and does not find it falls back to its own timeout,
+    and a profile is still a profile without it.
+    """
+    try:
+        with open(os.path.join(outdir, RECORDING_MARKER), "w", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    except OSError:
+        pass
+
+
+def _sample_clock() -> float:
+    """The clock perf prints its sample timestamps on.
+
+    The samplers record offsets from their own origin and the report places them
+    against perf's sample times, so the origin has to be on perf's axis. It is
+    not always CLOCK_MONOTONIC: perf's timestamps come from the kernel's own
+    clock, which a *time namespace* does not shift for the kernel while it does
+    shift what userspace reads. Measured on a host whose shell sits in one:
+    time.monotonic() read 13711 s where perf and /proc/uptime read 39873 s, and
+    every RSS and Frequency reading landed 7 hours outside the sample window -
+    so both header charts drew empty while the data sat in the file, whole.
+    CLOCK_BOOTTIME is the axis perf's numbers are on there, and where no time
+    namespace is in play it differs from CLOCK_MONOTONIC only by the time the
+    machine spent suspended, which is what a curve of a running profile should
+    cover anyway.
+    """
+    if hasattr(time, "CLOCK_BOOTTIME"):
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    return time.monotonic()
+
+
 def _finish_collector(process: PerfProcess | None) -> PerfResult | None:
     if process is None:
         return None
     try:
-        return process.stop()
+        return process.stop(grace=_COLLECTOR_STOP_GRACE)
     except (OSError, PerfError, subprocess.TimeoutExpired) as exc:
         return PerfResult(1, "", str(exc))
 
@@ -799,108 +848,164 @@ def _collect_combined(
             target_ready = False
             warnings.append(f"PID {target_pid} exited before collectors could attach.")
         elif state not in ("T", "t"):
-            target_ready = _signal_target(target_pid, signal.SIGSTOP, warnings)
-            target_paused = target_ready
+            # Freezing an attached target keeps the window while the collectors
+            # open on it out of the profile.  A process that is already running
+            # has no startup for that to protect, so a SIGSTOP we are not
+            # allowed to send - another user's server, say a systemd
+            # clickhouse-server - is a warning and not a reason to profile
+            # nothing: the collectors open on it either way, just without the
+            # pause.  Only a freeze we did take is ever continued below.
+            if _signal_target(target_pid, signal.SIGSTOP, warnings):
+                target_paused = True
+            else:
+                warnings.append(
+                    f"Could not freeze PID {target_pid} (not ours to signal); "
+                    f"profiling it from the moment the collectors are up."
+                )
 
     stat_process: PerfProcess | None = None
     record_process: PerfProcess | None = None
+    # declared out here because the code after the try stops them: an interrupt
+    # inside the try must leave them defined, not unbound
+    freq_sampler: _FreqSampler | None = None
+    rss_sampler: _RssSampler | None = None
     active_memory_plan = memory_plan
     active_callgraph = callgraph_mode
     active_interval_ms = interval_ms
     if target_ready and target_cmd is not None:
         target_pid = target.pid
-    if target_ready:
-        stat_args = _attached_stat_args(
-            stat_path, ev_list, metric_list, interval_ms, target_pid,
-        )
-        stat_process = _launch_collector(stat_args, "stat", warnings)
-        record_args = _attached_record_args(
-            data_path, precise_ev, freq, active_callgraph,
-            active_memory_plan, wait_events, target_pid,
-        )
-        record_process = _launch_collector(record_args, "record", warnings)
-        stat_startup = _settle_collector(stat_process, _COLLECTOR_SETTLE_GRACE)
-        record_startup = _settle_collector(record_process, _COLLECTOR_SETTLE_GRACE)
-        if stat_startup is not None and not stat_startup.ok and active_interval_ms:
-            stat_args = _attached_stat_args(
-                stat_path, ev_list, metric_list, None, target_pid,
-            )
-            stat_process = _launch_collector(stat_args, "stat without intervals", warnings)
-            stat_startup = _settle_collector(stat_process, _COLLECTOR_SETTLE_GRACE)
-            if stat_startup is not None and stat_startup.ok:
-                warnings.append(
-                    "Per-thread interval collection unavailable; timeline falls back to samples."
-                )
-                active_interval_ms = None
-        if record_startup is not None and not record_startup.ok:
-            if active_memory_plan is not None:
-                warnings.append(
-                    f"Co-joined {active_memory_plan.backend.upper()} memory sampling failed; "
-                    "retrying CPU-only."
-                )
-                active_memory_plan = None
-                record_args = _attached_record_args(
-                    data_path, precise_ev, freq, active_callgraph,
-                    active_memory_plan, wait_events, target_pid,
-                )
-                record_process = _launch_collector(record_args, "record", warnings)
-                record_startup = _settle_collector(record_process, _COLLECTOR_SETTLE_GRACE)
-            if record_startup is not None and not record_startup.ok and active_callgraph == "dwarf":
-                warnings.append("DWARF call graphs failed; retrying with frame pointers.")
-                active_callgraph = "fp"
-                record_args = _frame_pointer_args(record_args)
-                record_process = _launch_collector(record_args, "record", warnings)
-                record_startup = _settle_collector(record_process, _COLLECTOR_SETTLE_GRACE)
-        if stat_startup is not None and not stat_startup.ok:
-            warnings.append(f"perf stat failed: {_collector_error(stat_startup)}")
-
-    freq_sampler: _FreqSampler | None = None
-    if use_freq:
-        try:
-            freq_sampler = _FreqSampler(interval=0.01)
-            freq_sampler.start()
-        except Exception:
-            freq_sampler = None
-    rss_sampler: _RssSampler | None = None
-    if use_rss and target_pid > 0:
-        try:
-            rss_sampler = _RssSampler(target_pid, interval=0.01)
-            rss_sampler.start()
-        except Exception:
-            rss_sampler = None
-    if target_paused:
-        if _signal_target(target_pid, signal.SIGCONT, warnings, process_group=target is not None):
-            target_paused = False
+    # Everything from here to the monitor is inside one try: a collector that
+    # is launched and then orphaned by an interrupt holds the PMU for the rest
+    # of the machine's life, and every later profile then fails to open its
+    # events ("current value: 4294967295,0"). The gap between perf record
+    # starting and the monitor loop beginning is a collector-settle window plus
+    # the samplers' own start, and a driver's SIGINT can land in it.
     session_start = time.monotonic()
     observation_end = session_start
-    if target_ready:
-        effective_duration = None
-        if target is None:
-            effective_duration = 5.0 if duration is None else duration
-        try:
+    record_launch_t0 = None
+    record_exit_t0 = None
+    try:
+        if target_ready:
+            stat_args = _attached_stat_args(
+                stat_path, ev_list, metric_list, interval_ms, target_pid,
+            )
+            stat_process = _launch_collector(stat_args, "stat", warnings)
+            record_args = _attached_record_args(
+                data_path, precise_ev, freq, active_callgraph,
+                active_memory_plan, wait_events, target_pid,
+            )
+            record_process = _launch_collector(record_args, "record", warnings)
+            stat_startup = _settle_collector(stat_process, _COLLECTOR_SETTLE_GRACE)
+            record_startup = _settle_collector(record_process, _COLLECTOR_SETTLE_GRACE)
+            if stat_startup is not None and not stat_startup.ok and active_interval_ms:
+                stat_args = _attached_stat_args(
+                    stat_path, ev_list, metric_list, None, target_pid,
+                )
+                stat_process = _launch_collector(stat_args, "stat without intervals", warnings)
+                stat_startup = _settle_collector(stat_process, _COLLECTOR_SETTLE_GRACE)
+                if stat_startup is not None and stat_startup.ok:
+                    warnings.append(
+                        "Per-thread interval collection unavailable; timeline falls back to samples."
+                    )
+                    active_interval_ms = None
+            if record_startup is not None and not record_startup.ok:
+                if active_memory_plan is not None:
+                    warnings.append(
+                        f"Co-joined {active_memory_plan.backend.upper()} memory sampling failed; "
+                        "retrying CPU-only."
+                    )
+                    active_memory_plan = None
+                    record_args = _attached_record_args(
+                        data_path, precise_ev, freq, active_callgraph,
+                        active_memory_plan, wait_events, target_pid,
+                    )
+                    record_process = _launch_collector(record_args, "record", warnings)
+                    record_startup = _settle_collector(record_process, _COLLECTOR_SETTLE_GRACE)
+                if record_startup is not None and not record_startup.ok and active_callgraph == "dwarf":
+                    warnings.append("DWARF call graphs failed; retrying with frame pointers.")
+                    active_callgraph = "fp"
+                    record_args = _frame_pointer_args(record_args)
+                    record_process = _launch_collector(record_args, "record", warnings)
+                    record_startup = _settle_collector(record_process, _COLLECTOR_SETTLE_GRACE)
+            if stat_startup is not None and not stat_startup.ok:
+                warnings.append(f"perf stat failed: {_collector_error(stat_startup)}")
+
+        if use_freq:
+            try:
+                freq_sampler = _FreqSampler(interval=0.01)
+                freq_sampler.start()
+            except Exception:
+                freq_sampler = None
+        if use_rss and target_pid > 0:
+            try:
+                rss_sampler = _RssSampler(target_pid, interval=0.01)
+                rss_sampler.start()
+            except Exception:
+                rss_sampler = None
+        if record_process is not None:
+            # The clock perf prints its sample timestamps on, read at the moment
+            # the recording starts; its exit is stamped the same way below. What
+            # userspace can read is not necessarily that clock: a time namespace
+            # shifts CLOCK_MONOTONIC by its offset, and beyond that perf's own
+            # clock runs ahead of CLOCK_BOOTTIME by a drift proportional to
+            # uptime (measured here: 0.38 s at 2.3 h of uptime, 3.9 s at 11.8 h -
+            # about 0.9 ms per minute, so it grows by roughly 1.6 s a day).
+            # Neither is knowable in advance and both grow, so the two ends go
+            # into meta.json and the report derives the offset from the samples it
+            # already has. See report_html._sample_clock_bias.
+            record_launch_t0 = _sample_clock()
+        if target_paused:
+            if _signal_target(target_pid, signal.SIGCONT, warnings, process_group=target is not None):
+                target_paused = False
+
+        if target_ready:
+            effective_duration = None
+            if target is None:
+                effective_duration = 5.0 if duration is None else duration
+            # Announce that the collectors are live, which is what a driver
+            # ending this profile with SIGINT needs to know before it starts the
+            # workload it is profiling. perf.data appearing is too early a signal
+            # to race on: it exists from the moment perf record opens, and a
+            # collector-settle window plus the samplers' start still have to pass
+            # before the monitor loop begins - long enough for a query that
+            # finishes in 50 ms to send its SIGINT into a window where nothing has
+            # been sampled and there is no profile to report.
+            _write_recording_marker(outdir)
+            # The measured window starts here, not above: the capability probes
+            # and the collector launch are setup, not part of what the profile
+            # claims to have measured.
+            session_start = time.monotonic()
             observation_end = _monitor_collectors(
                 stat_process, record_process, target, target_pid, effective_duration,
             )
-        except BaseException:
+    except BaseException as exc:
             if target_paused:
                 _signal_target(
                     target_pid, signal.SIGCONT, warnings,
                     process_group=target is not None,
                 )
-            _finish_collector(record_process)
-            _finish_collector(stat_process)
-            _cleanup_run_target(target, warnings)
-            raise
+            # SIGINT is how `attach` is meant to end: it is how a driver stops
+            # a profile the moment the work it was watching is over (the
+            # ClickBench driver sends it when the query returns), and a person
+            # pressing Ctrl-C on a long attach wants the partial profile too.
+            # Falling through here is what turns that into a report - the
+            # collectors are finished and the artifacts written below, exactly
+            # as if the duration had elapsed. Run mode keeps unwinding: there
+            # the target is ours to kill rather than to watch.
+            if target is None and target_pid > 0 and isinstance(exc, KeyboardInterrupt):
+                warnings.append(
+                    f"Profiling ended on SIGINT after "
+                    f"{time.monotonic() - session_start:.1f}s; "
+                    f"the rest of the --duration window was not collected."
+                )
+                observation_end = time.monotonic()
+            else:
+                _finish_collector(record_process)
+                _finish_collector(stat_process)
+                _cleanup_run_target(target, warnings)
+                raise
     elapsed = max(0.0, observation_end - session_start)
     quantum_ms = mem_time_quantum if mem_time_quantum else mem_time_quantum_ms(elapsed)
-    freq_timeline: list | None = None
-    if freq_sampler is not None:
-        freq_timeline = freq_sampler.stop()
-    rss_timeline: list | None = None
-    if rss_sampler is not None:
-        # the target is still alive here, so the last reading is a real one
-        rss_timeline = rss_sampler.stop()
-
     if target is not None:
         if target_paused and _signal_target(
                 target_pid, signal.SIGCONT, warnings, process_group=True):
@@ -910,7 +1015,27 @@ def _collect_combined(
         warnings.append(f"Target exited with status {target_exit_code}.")
 
     record_result = _finish_collector(record_process)
+    # stamped here, not before: the recording ends when perf is done writing, and
+    # the samples run to that moment. Stamping it a few ms early would make the
+    # samples' span look longer than the recording they came from.
+    record_exit_t0 = _sample_clock() if record_process is not None else None
     stat_result = _finish_collector(stat_process)
+
+    # The samplers stop here, after the collectors, not when the monitor returned:
+    # their curves are placed against the sample times, and perf's first sample
+    # is not the moment it was launched. On a host where opening the events takes
+    # seconds - a virtualised PMU, or 359 threads to attach to - stopping them
+    # with the monitor leaves the curve covering a stretch of time no sample
+    # falls in, and the RSS and Frequency charts then draw empty over data that
+    # was collected all along. The readings they add past the last sample are
+    # outside the window the charts draw and cost nothing.
+    freq_timeline: list | None = None
+    if freq_sampler is not None:
+        freq_timeline = freq_sampler.stop()
+    rss_timeline: list | None = None
+    if rss_sampler is not None:
+        rss_timeline = rss_sampler.stop()
+
     if record_result is not None and not record_result.ok:
         warnings.append(f"perf record failed: {_collector_error(record_result)}")
     if stat_result is not None and not stat_result.ok:
@@ -1048,6 +1173,8 @@ def _collect_combined(
         ),
         "wait": {"enabled": wait_path is not None},
         "freq_t0": getattr(freq_sampler, "t0", None),
+        "record_launch_t0": record_launch_t0,
+        "record_exit_t0": record_exit_t0,
         "rss_t0": getattr(rss_sampler, "t0", None),
         "rss_peak": max((rss for _, rss in rss_timeline), default=None) if rss_timeline else None,
         "startup_grace": startup_grace if pid is None else None,
@@ -1219,6 +1346,8 @@ def collect(
     # it on the stat pass above, and an attach knows the window it asked for
     quantum_ms = mem_time_quantum if mem_time_quantum else mem_time_quantum_ms(
         elapsed or (duration or None))
+    record_launch_t0 = None
+    record_exit_t0 = None
     if use_record:
         data_path = os.path.join(outdir, "perf.data")
         if memory_plan:
@@ -1240,6 +1369,7 @@ def collect(
         freq_sampler.start()
         if rss_sampler is not None:
             rss_sampler.start()
+        record_launch_t0 = _sample_clock()
         r = run_perf(args + ["--", *placeholder], timeout=(duration or 0) + 3600)
         freq_timeline = freq_sampler.stop()
         rss_timeline = rss_sampler.stop() if rss_sampler is not None else None
@@ -1261,6 +1391,7 @@ def collect(
             r = run_perf(args + ["--", *placeholder], timeout=(duration or 0) + 3600)
         if not r.ok:
             raise PerfError("perf record failed:\n" + (r.stderr or "").strip()[:2000])
+        record_exit_t0 = _sample_clock()
 
         # default format: explicit -F field lists suppress callchain frames
         sr = run_perf(["script", "-i", data_path],
@@ -1389,6 +1520,8 @@ def collect(
         ),
         "wait": {"enabled": wait_enabled},
         "freq_t0": getattr(freq_sampler, "t0", None),
+        "record_launch_t0": record_launch_t0,
+        "record_exit_t0": record_exit_t0,
         "rss_t0": getattr(rss_sampler, "t0", None),
         "rss_peak": max((rss for _, rss in rss_timeline), default=None) if rss_timeline else None,
         "perf_version": perf_version(),

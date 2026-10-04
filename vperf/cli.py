@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import signal
 import sys
 import time
 from dataclasses import asdict
@@ -183,8 +184,31 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_attach(args: argparse.Namespace) -> int:
+    # An attached profile is meant to be ended from outside: a driver that runs
+    # the workload it is watching sends SIGINT the moment that work is over (the
+    # ClickBench driver does, per query).  Ask for the signal explicitly, because
+    # it does not arrive by default in that setup - bash hands a background job
+    # of a non-interactive script an *ignored* SIGINT (POSIX asks for it), a
+    # shell `trap` in the child cannot undo it, and CPython leaves an inherited
+    # SIG_IGN alone instead of installing its KeyboardInterrupt handler. Without
+    # this the signal is dropped on the floor and the profile runs to --duration.
+    try:
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+    except (OSError, ValueError):
+        pass
     try:
         os.kill(args.pid, 0)
+    except ProcessLookupError:
+        print(f"error: PID {args.pid}: no such process", file=sys.stderr)
+        return 2
+    except PermissionError:
+        # The process exists; it is just not ours to signal, because it belongs
+        # to another user - a systemd clickhouse-server being the case that
+        # matters here. Whether we may *profile* it is a perf question (attach
+        # needs CAP_PERFMON, which perf can hold through file capabilities), not
+        # a signal question, and refusing here made every such process
+        # unprofileable. The collector warns separately when it cannot freeze it.
+        pass
     except OSError as e:
         print(f"error: PID {args.pid}: {e}", file=sys.stderr)
         return 2
@@ -197,7 +221,28 @@ def cmd_attach(args: argparse.Namespace) -> int:
             return 2
     _ensure_access()
     outdir = args.outdir or _default_outdir("attach")
-    pd = collect(
+    try:
+        pd = _collect_attach(args, outdir)
+    except KeyboardInterrupt:
+        # An interrupt that lands before the collectors are up has nothing to
+        # report - the PMU capability probes alone take about a second, and a
+        # short query's SIGINT can arrive inside them. The caller that sent the
+        # signal gets a line it can read rather than a traceback; an interrupt
+        # once the collectors run is handled inside collect() and does produce a
+        # report.
+        print("vperf: interrupted before collection started; nothing to report",
+              file=sys.stderr)
+        return 130
+    _finish(outdir, pd.meta, pd.warnings, pd.stat, pd.elapsed or args.duration,
+            pd.script_path, pd.mem_report_path, pd.wait_path, pd.freq_timeline,
+            pd.thread_stats, pd.rss_timeline)
+    return 0
+
+
+def _collect_attach(args: argparse.Namespace, outdir: str):
+    """Attach-mode collection, kept apart so cmd_attach can catch the interrupt
+    that arrives before anything has been collected."""
+    return collect(
         target_cmd=None,
         pid=args.pid,
         outdir=outdir,
@@ -215,10 +260,6 @@ def cmd_attach(args: argparse.Namespace) -> int:
         inline=not args.no_inline,
         startup_grace=args.startup_grace,
     )
-    _finish(outdir, pd.meta, pd.warnings, pd.stat, pd.elapsed or args.duration,
-            pd.script_path, pd.mem_report_path, pd.wait_path, pd.freq_timeline,
-            pd.thread_stats, pd.rss_timeline)
-    return 0
 
 
 def cmd_report(args: argparse.Namespace) -> int:

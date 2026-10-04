@@ -46,7 +46,32 @@ When a change alters observable behaviour, **both files may need updating**:
 6. **The target is always `SIGCONT`'d.** Any change to the collection path must
    keep the `try/finally` that resumes it (`collector.py:884`) and the
    `PerfProcess.stop()` escalation (SIGINT → SIGTERM → SIGKILL) that flushes a
-   partial `perf.data`.
+   partial `perf.data`. That escalation's grace is
+   `_COLLECTOR_STOP_GRACE = 60 s`, not something short: perf's flush is
+   proportional to `perf.data`, and a record escalated to SIGTERM mid-flush is a
+   record judged *failed*, which takes its samples with it — a 100 MB recording
+   discarded because the stop was impatient. Perf that truly hangs still gets
+   escalated; it just gets to finish first.
+8. **The samplers stop after the collectors, not with the monitor** (step 6,
+   `_finish_collector` then `_FreqSampler.stop()`). Their curves are placed
+   against the *sample* times, and perf's first sample is not the moment it was
+   launched: opening the events takes seconds on a host with a virtualised PMU or
+   with hundreds of threads to attach to, and a sampler that stopped when the
+   monitor returned leaves a curve covering a stretch no sample falls in — the
+   RSS and Frequency charts then draw empty over data that was collected all
+   along. The readings past the last sample are outside the window the charts
+   draw and cost nothing.
+7. **`SIGINT` ends an attached profile, and it produces a report.** In `attach`
+   mode a `KeyboardInterrupt` while the collectors run is caught and the
+   finalize path continues (`collector.py:880`), so an interrupted profile still
+   writes `meta.json` and `report.html`; `run` mode keeps unwinding. Two things
+   make that work and both are load-bearing: `cmd_attach` requests `SIGINT`
+   itself, because a driver launches it as a background job and bash hands a
+   background job of a non-interactive script an *ignored* `SIGINT` (POSIX asks
+   for it, a shell `trap` cannot undo it, and CPython installs no handler over an
+   inherited `SIG_IGN`) — and `wait`ing for the client is the driver's job, not
+   vperf's. A driver that sends `SIGINT` gets `elapsed_wall` = the time observed,
+   plus a warning saying the rest of `--duration` was not collected.
 
 ---
 
@@ -140,9 +165,20 @@ Subcommands: **run, attach, report, cycle, diff, doctor**.
   (`cli.py:413`). Requires `-- CMD` (returns 2 otherwise, `cli.py:154`).
   **Propagates the target's exit code**: `128 + abs(code)` for signals
   (`cli.py:179`).
-- **attach** — `-p/--pid` (required), `--duration` (default 10.0).
-  `SIGSTOP`s the pid, profiles, `SIGCONT`s. Always returns 0. Skips
-  `probe_attach()` on darwin.
+- **attach** — `-p/--pid` (required), `--duration` (default 10.0). `SIGSTOP`s the
+  pid, profiles, `SIGCONT`s — but the stop is **best effort**: a pid we may not
+  signal (another user's process, e.g. a systemd `clickhouse-server`) is profiled
+  from the moment the collectors are up, with a warning, because a process that is
+  already running has no startup for the pause to protect. Always returns 0.
+  Skips `probe_attach()` on darwin. `cmd_attach` distinguishes `ESRCH` (no such
+  process → return 2) from `EPERM` (it exists, we simply may not signal it →
+  carry on): signal permission is not profile permission, and perf holds
+  `CAP_PERFMON` through file capabilities. `probe_attach` must pass **no
+  trailing workload** alongside `-p` — perf attaches *or* launches, never both,
+  and asked to do both it prints its usage and exits non-zero, which reads
+  exactly like "attach is unavailable" on a host where attaching works.
+  `cmd_attach` also asks for `SIGINT` explicitly (`cli.py:196`), because that is
+  how an attached profile is meant to end — see the SIGINT invariant below.
 - **report** — positional `dir`. Loads artifacts with
   `load_profile(..., include_threads=True)` and re-renders terminal +
   `report.html`. Returns 0 (it has no target to report).
@@ -164,6 +200,7 @@ Subcommands: **run, attach, report, cycle, diff, doctor**.
 | File | Written by | Phase |
 |---|---|---|
 | `perf.data` | `perf record -q -d -W -o` (+ co-joined memory and `sched:` events) | during measurement |
+| `recording.started` | `_write_recording_marker`, the instant before the collectors are monitored — a driver's cue to start the workload | during measurement |
 | `stat_threads.csv` | `perf stat -x, --per-thread` | during measurement |
 | `stat.csv` | `perf stat -x,` — legacy non-combined path only | during measurement |
 | `perf_ibs.data` / `perf_mem.data` | standalone memory record, only when the co-joined record failed | fallback only |
@@ -180,16 +217,28 @@ Subcommands: **run, attach, report, cycle, diff, doctor**.
    record.
 2. `run`: `Popen(target_cmd, start_new_session=True)` → `_settle_target(...,
    startup_grace)` → `SIGSTOP` the process group. `attach`: `SIGSTOP` the pid
-   (tolerating state `T`/`t`).
+   (tolerating state `T`/`t`); a refused stop leaves `target_paused` false and the
+   collectors open on the pid anyway, so only a freeze we took is ever continued.
 3. `perf stat --per-thread -p <pid>` and `perf record -p <pid>` are launched
    **independently** (no `--`, so neither waits for the target to exit), each
    given `_COLLECTOR_SETTLE_GRACE = 0.1 s` to fail fast. Retry ladder on failure
    (`collector.py:822`): drop `-I` intervals → drop co-joined memory → downgrade
    DWARF to fp.
 4. `_FreqSampler(interval=0.01)` and `_RssSampler(pid, interval=0.01)` start.
-   Their `t0` is `time.monotonic()` and is the clock that lines `freq.json`,
-   `rss.json` and the perf sample timestamps up — it must be written to
-   `meta.json` as `freq_t0` / `rss_t0`.
+   Their `t0` is `_sample_clock()` and goes into `meta.json` as `freq_t0` /
+   `rss_t0` — the origins the report places those two curves by.
+   **Not `time.monotonic()`, and not enough on its own.** perf's timestamps come
+   from the kernel's clock, which userspace may not be reading: a *time
+   namespace* shifts `CLOCK_MONOTONIC` by its offset (26,161 s on the host this
+   was found on), and beyond that perf's clock runs ahead of `CLOCK_BOOTTIME` by a
+   drift proportional to uptime — 0.38 s at 2.3 h of uptime, 3.9 s at 11.8 h,
+   about 0.9 ms per minute, so **+1.6 s a day and no fixed allowance keeps up**.
+   So the collector also stamps the recording's two ends on the samplers' clock
+   (`record_launch_t0` when `perf record` is up, `record_exit_t0` once it has
+   finished writing — stamped before the stop, the samples' span would look
+   longer than the recording they came from), and
+   `report_html._sample_clock_bias` turns those plus the samples into the offset
+   to place the curves by.
 5. Target `SIGCONT`s; `_monitor_collectors` runs until the deadline, the
    collectors finish, or 2.0 s after the target exits.
 6. Samplers stopped (the last RSS reading is real because the target is still
@@ -217,7 +266,8 @@ stdout → `build_html` → `report.html`.
 host, cpu_vendor, kernel, ncpus, freq, interval_ms, events[], metrics[],
 precise_event, callgraph, inline, thread_stats{enabled,cojoined,file},
 memory{enabled,backend,period,ldlat,events,data_file,cojoined,time_quantum_ms},
-wait{enabled}, freq_t0, rss_t0, rss_peak, startup_grace, perf_version,
+wait{enabled}, freq_t0, rss_t0, rss_peak, record_launch_t0, record_exit_t0,
+startup_grace, perf_version,
 elapsed_wall`. The macOS backend adds `backend: "macos"`, `callgraph: "sample"`,
 `cpu_vendor: "Apple"`, `interval_ms: 50`.
 
@@ -261,7 +311,33 @@ folded in the browser.**
   together with `--per-thread`), the frequency chart, and the RSS curve (a
   process is one address space — procfs has no per-thread footprint). The HTML
   reveals a `.whole-run-note` via `body.sel-active` rather than silently
-  reporting the run as if it were the window.
+  reporting the run as if it were the window. Those two curves are placed on the
+  sample timeline by the origins the samplers recorded (`freq_t0` / `rss_t0`),
+  which is what puts them at the same x as the samples they share a moment with —
+  and that placement is *measured*, not assumed: `_sample_clock_bias` reads the
+  last sample against the recording's exit (the one comparison with no setup
+  latency in it), refuses the correction when the samples claim a longer span
+  than the recording had, and adds the offset to the origin, since perf's stamps
+  run ahead. Left uncorrected the two charts draw *empty*, silently, with the
+  data sitting in the file. When the curves still do not reach the window the
+  chart says so in place, and the two reasons are worded apart: a placed profile
+  whose readings genuinely fall short, and one collected before the offset was
+  measured, which only a re-collection settles.
+- **A sampler curve is placed by whichever way lands more of its readings on the
+  window** (`_place_curve`), and drawn only where it was measured. Two rules, both
+  from what a wrong placement looks like. The measured offset is preferred,
+  because it is arithmetic — but on a host where perf delivers its samples long
+  after the recording was launched, the gap it measures is mostly *timing*:
+  measured here, a 2.87 s recording whose samples are stamped 3.94 s after its
+  launch, so subtracting the 2.80 s estimate slid the window past the end of the
+  series and a 311 → 1830 MiB rise drew as one flat line, the settled tail being
+  all that was left inside. So the measurement is judged by its effect, and when
+  it loses, the physical relation stands: the samplers start with the collectors,
+  so the first reading belongs at the first sample. And `rssBuckets` fills
+  *interior* gaps only — ahead of the first reading and behind the last there is
+  nothing to hold, and holding a value there is how one real reading becomes a
+  flat line across the whole timeline. Those buckets stay blank, labelled
+  "sampler not running".
 - HTML escaping: `esc()` in Python, `escHtml()` in JS. Numeric sort keys go in
   `data-v=` attributes so `sortTable` can compare numerically.
 
@@ -334,6 +410,14 @@ written down. Changing any of it changes what the reader sees.
   (default ~100 slices, clamped 25 ms–1 s), so a window cutting a slice in half
   counts half of it. A profile collected before that existed — or on a perf that
   rejected the `time` sort key — keeps a whole-run Memory tab and says so.
+- **An attached profile is a process, and the report says which process.** A
+  profile taken with `vperf attach` covers every thread of that pid: attaching to
+  a `clickhouse-server` means the Overview counters and the utilization curve
+  include the ~164 `ThreadPool` workers and the `MergeMutate`/`Fetch`/`Bg*`
+  background threads alongside the query's, and the query is read by grouping or
+  scoping to its threads. Nothing in the report normalizes that away — the
+  utilization ceiling is the pid's thread count, not the query's — so the scope
+  line and the thread grouping are the tools for it.
 
 ### Memory usage over time
 
@@ -475,6 +559,20 @@ behaviour change to both docs.
   `collector._FreqSampler` with `_FakeSampler`, so it is not exercised. Collapse
   the two definitions if you touch either.
 
+### The samplers and the PMU
+
+`doctor`'s **`sample spread`** row is the one that says whether a profile on this
+host is a time series at all: `probe_sampling_spread` records for a few seconds
+and looks at the span between the first and last sample. A host whose PMU is not
+really there — a virtualised one — opens the event, delivers a single burst
+seconds after launch, and goes quiet; measured here, a 28 s recording produced 15
+samples inside 5 ms. Every hotspot, flame graph and timeline from such a host is
+one instant, so this is a WARN and not a FAIL, but it changes how any number from
+that host should be read. The row also reports the clock offset it measured on
+the way through, since that is what decides whether the two header curves can be
+placed at all. When the sampler curves come out empty for the same reason, the
+report says so in place of the chart rather than drawing an empty box.
+
 ### Vendors
 
 Three independent mechanisms, all keyed off `doctor.cpu_vendor()`:
@@ -597,7 +695,14 @@ summaries.
   `backends.macos` — not in `cli`, `collector`, `stacks`, `metrics`,
   `flamegraph`, `perf`, `timeline`, `report_*`.
 - HTML/CSS/JS: lowerCamelCase classes and JS globals, `--kebab-case` CSS custom
-  properties.
+  properties. **A JS string literal containing an apostrophe must escape it or use
+  double quotes** (`"the sampler's"` or `'the sampler\'s'`): one unescaped `'` ends
+  the literal early and makes the whole `<script>` block unparseable, which takes
+  the report with it — no charts, no tabs, no selection, with every byte of its
+  data still in the file. The string contracts in `tests/test_report_html.py`
+  cannot see it (a substring is present in a file that does not parse), so
+  `_js_lex_errors` walks `_JS` and every generated script block for unterminated
+  literals, and a `node --check` test covers it properly wherever node exists.
 - Backwards-compat aliases and duplicated helpers are deliberate; when you
   remove one, remove its aliases in the same commit.
 
@@ -683,6 +788,58 @@ assumed to be.
 Startup grace is per engine in the sweep driver: `clickhouse-local` needs ~90 ms
 to build its pool while its cheapest query takes 140 ms; duckdb has its 16
 threads up within 8 ms while its cheapest query takes 80 ms.
+
+`bench/clickbench_profiles.sh --mode server` profiles the same queries against a
+MergeTree `hits` in a `clickhouse-server`, one `vperf attach` per query, and the
+parts of it worth knowing before changing it:
+
+- **The window is the query, and the driver ends it.** A query's runtime is not
+  knowable in advance (Q00 ~0.1 s, Q35 ~90 s), so the driver launches
+  `vperf attach --duration <ceiling>` in the background, runs the query with
+  `clickhouse-client --time`, and `SIGINT`s vperf the moment the client returns.
+  Do not replace this with a per-query duration.
+- **Readiness comes from the freeze, or failing that from `perf.data`.** vperf
+  freezes the pid it can signal while its collectors open, so the driver watches
+  `/proc/<pid>/stat` for `T` and then for its release. A pid it may *not* signal
+  — the systemd server — cannot be frozen and vperf does not try, so there is no
+  handshake to watch; the driver then waits for `recording.started`, the file vperf
+  writes the instant before it monitors the collectors (`wait_for_recording`).
+  That wait is not optional: vperf spends ~1 s probing PMU capabilities before it
+  opens anything, and `perf.data` exists ~100 ms before samples start arriving, so
+  a sub-second query's SIGINT lands in one of those gaps and ends the run with
+  nothing collected. `kill -0` is how the driver decides which path to take
+  — **not** as a liveness test, since a systemd server is another user's process
+  and `kill -0` on it returns EPERM (use `/proc`, as `pid_alive()` does).
+- **Sampling rates are per mode.** `FREQ`/`MEM_PERIOD` default to 499 Hz /
+  1000003 for a local engine and 99 Hz / 4000003 for a server: cost is per thread,
+  and 499 Hz × 359 threads × 16 KiB DWARF stacks is ~140 MB for a one-second
+  window. Env vars still win.
+- **The schema comes from the checkout, not from the parquet variant.**
+  `clickhouse/create.sql` (MergeTree, `PRIMARY KEY` only, no `PARTITION BY`/`ORDER
+  BY`, `fsync_after_insert=1`) and `clickhouse/queries.sql`, which is byte-equal
+  to the parquet variant's. No OPTIMIZE is done, which is why
+  `--optimize`/`--optimize-final` are opt-in.
+- **The load streams the parquet in; the server never reads it where it lies.**
+  ClickHouse confines `file()` to `user_files_path`
+  (`/var/lib/clickhouse/user_files/`, inside a `700 clickhouse:clickhouse`
+  `/var/lib`), so the in-place read ClickBench uses — `INSERT INTO hits SELECT *
+  FROM file('<parquet>') --max-insert-threads $(nproc)/4`, reached through a
+  root-owned symlink — fails here with `Code: 291 DATABASE_ACCESS_DENIED, "File
+  ... is not inside /var/lib/clickhouse/user_files"`. Streaming the bytes
+  (`INSERT INTO hits FORMAT Parquet`, server-side parsing with
+  `input_format_parallel_parsing`) needs no privileges at all. Do not "fix" this
+  by reintroducing the group/`user_files` setup: nothing needs it any more.
+- **`check_columns` guards the insert.** The Parquet reader matches columns *by
+  name* and `input_format_parquet_allow_missing_columns` is 1, so a dataset
+  missing a column would insert cleanly and then answer every query with that
+  column's default. The check therefore runs *client-side* —
+  `clickhouse-local --query "DESCRIBE SELECT * FROM file('<parquet>')"`, which
+  needs no server — comparing against `create.sql`'s column list (between the `(`
+  after `TABLE` and the `)`, skipping the trailing `PRIMARY KEY`), and it runs
+  before a byte is sent.
+- **Auth is the client's, not the driver's.** Host, port, user and password come
+  from `~/.clickhouse-client/config.xml`; the only credentials the driver ever
+  passes are the empty password and `--port` of `--private-server`.
 
 ---
 
