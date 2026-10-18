@@ -22,11 +22,16 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 LLAMA_CLI="${LLAMA_CLI:-$HOME/src/ik_llama.cpp/_build/bin/llama-cli}"
 MODEL="${MODEL:-$HOME/llm/Qwen3.6-35B-A3B-UD-IQ4_NL.gguf}"
+LABEL="${LABEL:-}"
 THREADS="${THREADS:-8}"
 OUT_ROOT="${OUT_ROOT:-$REPO_ROOT/.vperf}"
 VPERF="${VPERF:-}"
 TOKENS="${TOKENS:-100}"
 PROMPT="${PROMPT:-Who killed Laura Palmer?}"
+# the model-loading flag is the one that moved between the forks: ik_llama.cpp spells it
+# --no-mmap, upstream replaced it with --load-mode/-lm. pass LOAD_FLAGS when pointing
+# LLAMA_CLI at a build whose flag set differs
+LOAD_FLAGS="${LOAD_FLAGS:---no-mmap}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -44,9 +49,17 @@ Options:
 Environment:
   LLAMA_CLI       llama.cpp cli                    (default: ~/src/ik_llama.cpp/_build/bin/llama-cli)
   MODEL           path to .gguf model file         (default: ~/llm/Qwen3.6-35B-A3B-UD-IQ4_NL.gguf)
+  LABEL           tag for the output directory     (default: none) - set it when
+                  profiling more than one fork, since the same model under
+                  ik_llama.cpp and under upstream llama.cpp otherwise lands in
+                  two directories that are named identically but for the
+                  timestamp
   THREADS         llama-cli thread count           (default: 8)
   TOKENS          tokens to generate               (default: 100)
   PROMPT          prompt for llama-cli             (default: "Who killed Laura Palmer?")
+  LOAD_FLAGS      model loading flags              (default: --no-mmap)
+                  ik_llama.cpp and upstream llama.cpp disagree on this one -
+                  upstream spells it "-lm none"; check LLAMA_CLI --help
   OUT_ROOT        profile output root              (default: <repo>/.vperf)
   VPERF           vperf command to use             (default: repo venv, else python3 -m vperf)
 EOF
@@ -83,11 +96,12 @@ fi
 
 MODEL_NAME="$(basename "$MODEL" .gguf)"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-DIR="$OUT_ROOT/llama_${MODEL_NAME}_${TIMESTAMP}"
+DIR="$OUT_ROOT/llama${LABEL:+_${LABEL}}_${MODEL_NAME}_${TIMESTAMP}"
 
 mkdir -p "$DIR"
 
 echo "llama.cpp profile: $DIR"
+echo "  label:     ${LABEL:-<none>}"
 echo "  model:     $MODEL"
 echo "  threads:   $THREADS"
 echo "  tokens:    $TOKENS"
@@ -107,7 +121,7 @@ set +e
             -p "$PROMPT" \
             -n "$TOKENS" \
             -t "$THREADS" \
-            --no-mmap \
+            $LOAD_FLAGS \
             --no-display-prompt
 ) >"$DIR/vperf.log" 2>&1
 rc=$?
