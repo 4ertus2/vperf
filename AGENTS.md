@@ -870,7 +870,19 @@ vperf run -- examples/bin/membound 268435456 1.5    # IPC ~0.14, miss storm
 
 bench/clickbench_profiles.sh --engine both          # sequential; never parallel
 bench/clear-caches.py                               # fadvise DONTNEED + mincore verify
+LABEL=ik_llama bench/llama_cpp_profile.sh -t 8 -n 100
 ```
+
+`bench/llama_cpp_profile.sh` profiles a `llama-cli` generation run. It defaults to
+`~/src/ik_llama.cpp/_build/bin/llama-cli`, and two env vars exist because the two
+forks are one script's worth of difference apart: `LABEL` tags the output directory
+(same model under both forks would otherwise land in two directories identical but
+for the timestamp), and `LOAD_FLAGS` is the model-loading flag, which ik spells
+`--no-mmap` and upstream replaced with `-lm none`. Both forks' worker threads are
+named — `llm-compute`, `llm-load`, `llm-mask` — but only by local branches
+(`ggml/name-worker-threads` in both trees) that are not merged into either fork yet,
+so a report taken from a stock build still shows one `llama-cli ×N` group; see
+`_thread_groups`.
 
 `bench/clear-caches.py` needs no root: `posix_fadvise(POSIX_FADV_DONTNEED)` on a
 clean file discards its pages, where `/proc/sys/vm/drop_caches` is `0600`
