@@ -567,22 +567,95 @@ class _FreqSampler:
 
 # `perf stat --per-thread` counts only the threads alive when it attaches, so
 # the target has to build its thread pool before the counting pass freezes it.
-# clickhouse-local needs ~90 ms to get there; 0.15 s covers it with headroom.
-# `--startup-grace` tunes it, 0 to attach as early as possible.
+# Freezing early is not free either: a thread created after the freeze is not a
+# row of its own, its counters are inherited by the thread that spawned it.  On
+# clickhouse-local the parquet decoders arrive in batches up to ~300 ms into a
+# query, and a profile frozen at 79 ms folded 9.8 s of task-clock into one row of
+# a 0.83 s window (12 cores on one thread); frozen at the 0.10 s ceiling the same
+# query reports 62 threads and no row above 4.5%.  So the wait is *patience*, not
+# a fixed sleep: freeze once the count has held still for `_startup_quiet`
+# seconds - half the ceiling, 50-250 ms, long enough to sit out the 20-60 ms gaps
+# between spawn batches - and never later than `--startup-grace`, which `0` turns
+# into "attach at once".  Measured thread trace (clickhouse-local, COUNT(*)):
+# 1 at 0 ms, 5 at 24 ms, 8 at 38 ms, 25 at 39 ms, 37 at 58 ms, 38 at 86 ms, and
+# the process is tearing down by 90 ms.
 DEFAULT_STARTUP_GRACE = 0.15
+_STARTUP_POLL_GRACE = 0.002
+_STARTUP_QUIET_MIN = 0.05
+_STARTUP_QUIET_MAX = 0.25
+_STARTUP_QUIET_FRACTION = 0.5
 _COLLECTOR_SETTLE_GRACE = 0.1
 _COLLECTOR_FLUSH_GRACE = 2.0
 
+# A count that falls by half (from at least this many) is a target tearing down,
+# not a worker churn: clickhouse-local goes 38 -> 5 -> 2 as it exits.
+_STARTUP_TEARDOWN_MIN = 4
 
-def _settle_target(target: subprocess.Popen, grace: float) -> None:
-    """Let the target reach its steady thread count before freezing it.
 
-    Returns early once the target is gone, so a workload that finishes inside
-    the grace is not held for the rest of it.
+def _startup_quiet(grace: float) -> float:
+    """Return how long a thread count must hold still to count as settled.
+
+    A bigger ceiling buys more patience: half of it, clamped to 50-250 ms, so a
+    pool that pauses for tens of milliseconds between spawn batches is not
+    frozen between two of them.
     """
+    return min(max(_STARTUP_QUIET_MIN, grace * _STARTUP_QUIET_FRACTION),
+               _STARTUP_QUIET_MAX)
+
+
+def _thread_count(pid: int) -> int | None:
+    """Read the live thread count, or None when /proc cannot answer."""
+    try:
+        return len(os.listdir(f"/proc/{pid}/task"))
+    except OSError:
+        return None
+
+
+def _teardown_note(peak: int | None, left: int | None, grace: float) -> str | None:
+    """Explain a freeze that landed on a target in teardown, else None.
+
+    A pool loses a worker now and then, so only a count that halved is read as
+    the target leaving; the note names the knob that fixes it.
+    """
+    if peak is None or left is None or peak < _STARTUP_TEARDOWN_MIN or left * 2 > peak:
+        return None
+    return (f"Target was already shutting down when the startup grace expired "
+            f"(threads fell from {peak} to {left}): the freeze caught it mid-exit, "
+            f"so counters may be missing. Lower --startup-grace below the run's "
+            f"lifetime (it is {grace:g}s) to profile a workload this short.")
+
+
+def _settle_target(target: subprocess.Popen, grace: float) -> int | None:
+    """Freeze the target once its thread pool has stopped growing.
+
+    Returns as soon as the count in `/proc/<pid>/task` has held still for the
+    quiet window, and waits out *grace* when it keeps growing or /proc cannot be
+    read.  A target that exits returns immediately, so a workload that finishes
+    inside the window is reported rather than held for the rest of it.  The peak
+    count seen comes back so the caller can tell a settled pool from one that was
+    already tearing down.
+    """
+    if grace <= 0:
+        return None
+    quiet = _startup_quiet(grace)
     deadline = time.monotonic() + grace
-    while target.poll() is None and time.monotonic() < deadline:
-        time.sleep(0.002)
+    count = peak = _thread_count(target.pid)
+    stable_since = time.monotonic()
+    while target.poll() is None:
+        now = time.monotonic()
+        if now >= deadline:
+            break
+        time.sleep(min(_STARTUP_POLL_GRACE, deadline - now))
+        current = _thread_count(target.pid)
+        now = time.monotonic()
+        if current != count:
+            count = current
+            stable_since = now
+            if current is not None and (peak is None or current > peak):
+                peak = current
+        elif count is not None and now - stable_since >= quiet:
+            break
+    return peak
 
 
 def _process_state(pid: int) -> str | None:
@@ -1032,12 +1105,18 @@ def _collect_combined(
             )
         except OSError as exc:
             raise PerfError(f"target failed to start: {exc}") from exc
-        _settle_target(target, startup_grace)
+        peak = _settle_target(target, startup_grace)
         if target.poll() is not None:
             target_exit_code = target.wait()
             target_ready = False
             warnings.append("Target exited during collector startup grace; target was not rerun.")
         else:
+            # freezing a target that is already tearing down collects nothing
+            # useful: clickhouse-local has 38 threads 4 ms before it exits and 5
+            # while it does, so this is the failure the operator has to see
+            note = _teardown_note(peak, _thread_count(target.pid), startup_grace)
+            if note:
+                warnings.append(note)
             target_ready = _signal_target(
                 target.pid, signal.SIGSTOP, warnings, process_group=True,
             )

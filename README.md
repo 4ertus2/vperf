@@ -89,19 +89,27 @@ noise. Everything else is collected and reported identically on both.
 | `-o, --outdir NAME` | you want a named profile directory — `vperf diff` compares two |
 | `-f, --freq HZ` (199) | the default sample rate misses short phases |
 | `--callgraph dwarf` | the target has good DWARF; `fp` (the default) needs no debug info but requires the target to preserve frame pointers |
-| `--startup-grace SEC` (0.15) | the target spawns its thread pool during startup — per-thread counters only see the threads alive when counting attaches |
+| `--startup-grace SEC` (0.15) | the target spawns its thread pool during startup — per-thread counters only see the threads alive at the freeze, so the wait buys attribution. This is a ceiling, not a sleep: vperf freezes as soon as the thread count has held still for half of it (50–250 ms) |
 | `--mem-period N` (100003) | a long multi-threaded run produces millions of AMD IBS samples; raise the period to thin them |
 | `--no-inline` | a huge C++ binary spends most of the run expanding DWARF inlines (measured: a 4.9 GB ClickHouse debug build, ~80 s per `perf` call with inlines, ~2 s without) |
 | `--no-stat` / `--no-wait` / `--no-rss` | skip a pass you don't need — each one removes its panel from the report |
 | `--mem-time-quantum MS` | finer or coarser Memory-tab slices (default ~100 over the run, clamped 25 ms–1 s) |
 | `--keep-perf-data` | you want the raw `perf.data` left in the profile directory — it is removed by default once the dumps have been taken from it, and it is ~100 MB per second of a wide target |
 
-`--startup-grace` is worth calibrating against your target: measured on
-`clickhouse-local`, the thread pool goes 1 thread at 0 ms, 3 at 11 ms, 25 at
-42 ms and 43 at 93 ms. Counters only start once the target resumes, so a longer
-grace costs no measurement accuracy — but a target that exits inside the window
-is reported rather than profiled, so keep the value below the shortest run you
-care about.
+`--startup-grace` is a ceiling, not a fixed sleep: vperf watches
+`/proc/<pid>/task` and freezes once the count has held still for half the
+ceiling (50–250 ms), or at the ceiling if the target keeps spawning. Freezing
+early is not free — a thread created after the freeze is not a row of its own,
+its counters are inherited by the thread that spawned it — so the window is long
+enough to sit out the gaps between spawn batches. Measured on `clickhouse-local`,
+the base pool is 38 threads by 86 ms and the parquet decoders trickle in until
+~300 ms; a profile frozen at 79 ms folded 9.8 s of task-clock into one row of a
+0.83 s window, while the same query frozen at its 0.10 s ceiling reports 62
+threads and no row above 4.5%. A query that finishes inside the ceiling is
+reported rather than profiled, and the warning says so: `COUNT(*)` over the 14 GB
+parquet is ~90 ms end to end and starts tearing down at ~86 ms, so it needs a
+ceiling below that. `0` attaches immediately. The wait still happens before the
+measured window, so it costs wall time, not measurement accuracy.
 
 ## Other commands
 
