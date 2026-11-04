@@ -79,15 +79,20 @@ TO_SET=0
 DRY_RUN=0
 PARQUET="$DATA_DIR/hits.parquet"
 
-# Per-engine defaults.  The startup grace is the seconds a target may run
-# before vperf freezes it and attaches: `perf stat --per-thread` only counts
-# the threads alive at attach time, so the grace has to outlast the engine's
-# thread-pool build or the Threads tab collapses to a single thread - and it
-# has to stay *under* the cheapest query's runtime, or that query finishes
-# before anything is collected.  clickhouse-local needs ~90 ms for its pool:
-# measured here, vperf's own 0.15 s default leaves 9 of the 43 queries with no
-# samples at all, 0.10 s sees the same pool (48-54 threads with counters) and
-# collects the short ones, and 0 collects everything but leaves 1 thread.
+# Per-engine defaults for `--startup-grace`, which is a *ceiling* on the time a
+# target may run before vperf freezes it and attaches (`perf stat --per-thread`
+# only counts the threads alive at the freeze).  vperf ends the wait early once
+# the thread count has held still for max(50 ms, ceiling/2), but neither engine
+# gets there before its ceiling: clickhouse-local builds a 38-thread base pool by
+# ~86 ms and its parquet decoders trickle in until ~300 ms into a query, so the
+# ceiling *is* the freeze time, and it is what decides attribution - a freeze
+# before the decoders appear folds their task-clock into the thread that spawned
+# them (measured: 9.8 s on one row of a 0.83 s window).
+# The other edge is the cheapest query: clickhouse-local is ~60 ms to launch plus
+# the pool, ~90 ms end to end for COUNT(*), and it starts tearing down at ~86 ms,
+# so a 0.10 s ceiling can land on its exit and collect nothing - sweep() retries
+# such a query once at half the ceiling.  duckdb has all 16 threads 5 ms after
+# launch and its cheapest query is ~80 ms, so 0.02 s is already its whole budget.
 # STARTUP_GRACE overrides both.
 grace_for() {
     case "$1" in
@@ -241,9 +246,9 @@ Environment:
                                                        99 server)
   MEM_PERIOD      vperf --mem-period, IBS cycles       (default: 1000003 local,
                                                        4000003 server)
-  STARTUP_GRACE   seconds to let the target settle before the collectors
-                  attach, for every engine             (default: per engine,
-                                                       0.10 s)
+  STARTUP_GRACE   ceiling on the target's pre-freeze run, for every engine
+                  (default: per engine, 0.10 s); vperf freezes at the ceiling,
+                  or earlier once the thread count stops growing
   PRIVATE_PORT    TCP port for --private-server          (default: 19000)
   LOAD_TICK       seconds between load progress lines (default: 30)
   VPERF           vperf command to use                (default: repo venv,
@@ -491,18 +496,46 @@ sweep() {  # <engine>
         mkdir -p "$dir"
         say "$label start -> ${dir##*/}"
         build_argv "$engine" "$ddl" "$q"
-        # keep the exact statement next to the profile, so a report can be
-        # traced back to the engine and query that produced it
-        printf '%s\n%s\n' "$ddl" "$q" >"$dir/queries.sql"
         t0=$(date +%s)
-        set +e
-        (
-            cd "$DATA_DIR"
-            $VPERF run -f "$FREQ" --mem-period "$MEM_PERIOD" $INLINE_FLAG \
-                --startup-grace "$grace" -o "$dir" -- "$binary" "${ARGV[@]}"
-        ) </dev/null >"$dir/vperf.log" 2>&1
-        rc=$?
-        set -e
+        attempt_grace="$grace"
+        attempt=0
+        while :; do
+            attempt=$((attempt + 1))
+            # a retry profiles the query again from scratch: -o reuses a
+            # directory, and the first attempt's report must not pass for this
+            # one's
+            if [ "$attempt" -gt 1 ]; then
+                rm -rf "$dir"
+                mkdir -p "$dir"
+            fi
+            # keep the exact statement next to the profile, so a report can be
+            # traced back to the engine and query that produced it
+            printf '%s\n%s\n' "$ddl" "$q" >"$dir/queries.sql"
+            set +e
+            (
+                cd "$DATA_DIR"
+                $VPERF run -f "$FREQ" --mem-period "$MEM_PERIOD" $INLINE_FLAG \
+                    --startup-grace "$attempt_grace" -o "$dir" -- "$binary" "${ARGV[@]}"
+            ) </dev/null >"$dir/vperf.log" 2>&1
+            rc=$?
+            set -e
+            read -r cpu ipc samples ibs < <(headline "$dir/vperf.log") || true
+            # no counters means the query finished inside the ceiling and was
+            # reported rather than profiled: the cheapest ClickBench queries are
+            # ~90 ms end to end and clickhouse-local starts tearing down at
+            # ~86 ms, so a 0.10 s freeze can land on the exit.  Halve the ceiling
+            # once instead of losing the query - the second attempt freezes
+            # mid-run and profiles the part that is left.
+            if [ "$rc" -ne 0 ] || [ "$samples" != "-" ]; then
+                break
+            fi
+            if [ "$attempt" -ge 2 ] || [ "$attempt_grace" = "0" ]; then
+                break
+            fi
+            retry_grace=$(awk -v g="$attempt_grace" 'BEGIN { printf "%.3f", g / 2 }')
+            say "$label no counters at grace ${attempt_grace}s -> retry at ${retry_grace}s"
+            attempt_grace="$retry_grace"
+        done
         dur=$(( $(date +%s) - t0 ))
         if [ "$rc" -ne 0 ]; then
             printf 'vperf exit=%s\n' "$rc" >>"$dir/vperf.log"
@@ -519,7 +552,6 @@ d = json.load(open(sys.argv[1]))
 e = d.get("elapsed_wall")
 print(f"{e:.2f}" if isinstance(e, (int, float)) else "")' "$dir/meta.json" 2>/dev/null || true)
         fi
-        read -r cpu ipc samples ibs < <(headline "$dir/vperf.log") || true
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$label" "${elapsed:--}" "${cpu:--}" "${ipc:--}" "${samples:--}" \
             "${ibs:--}" "$rc" "${dir##*/}" >>"$tsv"

@@ -172,29 +172,124 @@ def test_startup_grace_is_a_user_option_on_both_modes():
         assert parser.parse_args(mode + ["--startup-grace", "0"]).startup_grace == 0.0
 
 
-def test_settle_target_waits_out_the_grace():
-    # a live target holds the window open, so the pool is up when perf attaches
-    class _Live:
-        pid = 1
+class _SettleClock:
+    """A monotonic clock that only moves when _settle_target sleeps."""
 
-        def poll(self):
-            return None
+    def __init__(self):
+        self.now = 0.0
 
-    started = time.monotonic()
-    collector._settle_target(_Live(), 0.05)
-    assert time.monotonic() - started >= 0.05
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += max(0.0, seconds)
+
+
+class _LiveTarget:
+    pid = 12345
+
+    def poll(self):
+        return None
+
+
+class _DeadTarget:
+    pid = 12345
+
+    def poll(self):
+        return 0
+
+
+def _settle_with(monkeypatch, counts, grace):
+    clock = _SettleClock()
+    monkeypatch.setattr(
+        collector, "time",
+        SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep))
+    values = iter(counts)
+
+    def thread_count(pid):
+        return next(values, counts[-1])
+
+    monkeypatch.setattr(collector, "_thread_count", thread_count)
+    peak = collector._settle_target(_LiveTarget(), grace)
+    return clock.now, peak
+
+
+def test_startup_quiet_scales_with_the_ceiling():
+    # a longer ceiling buys more patience between spawn batches; half of it,
+    # clamped so a short window cannot freeze between two spawn batches
+    assert collector._startup_quiet(0.02) == pytest.approx(0.05)
+    assert collector._startup_quiet(0.15) == pytest.approx(0.075)
+    assert collector._startup_quiet(1.0) == pytest.approx(0.25)
+    assert collector._startup_quiet(10.0) == pytest.approx(0.25)
+
+
+def test_thread_count_reads_the_live_process():
+    assert collector._thread_count(os.getpid()) >= 1
+    assert collector._thread_count(-1) is None
+
+
+def test_settle_target_returns_well_before_the_ceiling(monkeypatch):
+    # a target whose pool is already complete is not held for the whole window
+    elapsed, peak = _settle_with(monkeypatch, [4], 0.15)
+    assert elapsed == pytest.approx(0.076, abs=0.003)
+    assert elapsed < 0.15
+    assert peak == 4
+
+
+def test_settle_target_reports_the_peak_it_saw(monkeypatch):
+    # the caller needs the peak to tell a settled pool from a teardown
+    elapsed, peak = _settle_with(monkeypatch, [1, 3, 25, 38, 5, 2], 0.15)
+    assert peak == 38
+    assert elapsed < 0.15
+
+
+def test_teardown_note_explains_a_freeze_that_caught_the_exit():
+    # clickhouse-local goes 38 -> 5 -> 2 while exiting, so the freeze collected
+    # nothing; the note has to say which knob fixes it
+    note = collector._teardown_note(38, 5, 0.1)
+    assert note is not None
+    assert "38 to 5" in note
+    assert "--startup-grace" in note
+
+
+def test_teardown_note_ignores_pool_churn_and_missing_reads():
+    assert collector._teardown_note(38, 37, 0.1) is None       # one worker left
+    assert collector._teardown_note(3, 1, 0.1) is None         # too small to read
+    assert collector._teardown_note(None, 5, 0.1) is None      # /proc never answered
+    assert collector._teardown_note(38, None, 0.1) is None
+
+
+def test_settle_target_waits_out_the_ceiling_while_threads_keep_growing(monkeypatch):
+    # a pool built in a steady trickle never gets a quiet window
+    elapsed, _peak = _settle_with(monkeypatch, list(range(1, 200)), 0.05)
+    assert elapsed == pytest.approx(0.05, abs=0.002)
+
+
+def test_settle_target_attaches_at_once_at_zero_grace(monkeypatch):
+    clock = _SettleClock()
+    monkeypatch.setattr(
+        collector, "time",
+        SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep))
+
+    def unexpected(pid):
+        raise AssertionError("grace 0 must not poll /proc")
+
+    monkeypatch.setattr(collector, "_thread_count", unexpected)
+    collector._settle_target(_LiveTarget(), 0.0)
+    assert clock.now == 0.0
+
+
+def test_settle_target_falls_back_to_the_ceiling_without_proc(monkeypatch):
+    # no readable /proc: hold the window open rather than freeze too early
+    elapsed, peak = _settle_with(monkeypatch, [None], 0.05)
+    assert elapsed == pytest.approx(0.05, abs=0.002)
+    assert peak is None
 
 
 def test_settle_target_does_not_hold_a_dead_target():
-    # a target that exits inside the grace is reported, not held for the rest
-    class _Dead:
-        pid = 1
-
-        def poll(self):
-            return 0
-
+    # a target that exits inside the window is reported, not held for the rest
     started = time.monotonic()
-    collector._settle_target(_Dead(), 5.0)
+    collector._settle_target(_DeadTarget(), 5.0)
     assert time.monotonic() - started < 1.0
 
 

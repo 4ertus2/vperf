@@ -449,15 +449,17 @@ def build_parser() -> argparse.ArgumentParser:
                              "to feed another tool")
         sp.add_argument("--startup-grace", type=float, default=DEFAULT_STARTUP_GRACE,
                         metavar="SECONDS",
-                        help=f"seconds to let the target settle before the counting "
-                             f"pass freezes it (default: {DEFAULT_STARTUP_GRACE:g}s). "
+                        help=f"ceiling on the time the target may run before the "
+                             f"counting pass freezes it (default: {DEFAULT_STARTUP_GRACE:g}s). "
                              f"`perf stat --per-thread` reports only the threads "
                              f"alive when it attaches, so a runtime that builds a "
-                             f"thread pool during startup needs this window to cover "
-                             f"it; raise it for slow startups, lower it (0 attaches "
-                             f"at once) to save wall time, at the cost of per-thread "
-                             f"counters for late threads. Ignored by `attach`, whose "
-                             f"threads are already running")
+                             f"thread pool during startup has to be given time to do "
+                             f"it; vperf freezes as soon as the thread count stops "
+                             f"growing, so this is a patience cap, not a sleep. Raise "
+                             f"it for slow startups, lower it (0 attaches at once) to "
+                             f"save wall time, at the cost of per-thread counters for "
+                             f"late threads. Ignored by `attach`, whose threads are "
+                             f"already running")
 
     prun = sub.add_parser("run", help="profile a new process")
     common(prun)

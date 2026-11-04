@@ -99,7 +99,7 @@ report, cycle, diff, doctor**. Shared by `run` and `attach`:
 | `--mem-period` | 100003 | AMD IBS period (cycles) |
 | `--mem-time-quantum` | ~100 slices, 25 ms–1 s | Memory-tab slice width |
 | `--keep-perf-data` | off | keep raw recordings after the dumps |
-| `--startup-grace` | 0.15 s | settle before freezing (ignored by `attach`) |
+| `--startup-grace` | 0.15 s | ceiling on the pre-freeze wait; freeze once `/proc/<pid>/task` has held still for 20–50 ms (10% of the ceiling, floor 20 ms); 0 attaches at once (ignored by `attach`) |
 
 - **run** — `cmd` REMAINDER, requires `-- CMD` (else 2, `cli.py:157`). Propagates the exit
   code: `128 + abs(code)` for signals (`cli.py:183`).
@@ -137,8 +137,9 @@ report, cycle, diff, doctor**. Shared by `run` and `attach`:
 ### Collection order (`_collect_combined`, `collector.py:975`)
 
 1. Record `started`; `probe_wait()` decides whether `sched:` events go in.
-2. `run`: `Popen(..., start_new_session=True)` → `_settle_target(..., startup_grace)` →
-   `SIGSTOP` the group. `attach`: `SIGSTOP` the pid (tolerating `T`/`t`); a refused stop
+2. `run`: `Popen(..., start_new_session=True)` → `_settle_target(..., startup_grace)` waits
+   until the thread count holds still (20–50 ms) or the ceiling, then `SIGSTOP` the group.
+   `attach`: `SIGSTOP` the pid (tolerating `T`/`t`); a refused stop
    leaves `target_paused` false, so only a freeze we took is continued.
 3. `perf stat --per-thread -p` and `perf record -p` launch **independently** (no `--`), each
    with `_COLLECTOR_SETTLE_GRACE = 0.1 s`. Retry ladder (`collector.py:1098`): drop `-I` →
@@ -307,9 +308,12 @@ change to both docs.
   (`_perf_error_summary`, `collector.py:322`). `perf report` has no `tgid` key — `pid`
   already means "command and tid".
 - **`--startup-grace` is a correctness knob.** `perf stat --per-thread` reports only threads
-  alive at attach (measured on `clickhouse-local`: 1 at 0 ms, 3 at 11 ms, 25 at 42 ms, 43 at
-  93 ms). Threads created after the freeze are never counted — do not estimate them. A
-  target finishing inside the window is *reported rather than profiled*, so keep it below the
+  alive at attach (measured on `clickhouse-local`: 1 at 0 ms, 5 at 23 ms, 25 at 37 ms, 37 at
+  61 ms, 38 at 106 ms). Threads created after the freeze are never counted as rows — do not
+  estimate counters for them. The wait is adaptive: `_settle_target` polls
+  `/proc/<pid>/task` and freezes once the count has held still for 20–50 ms (10% of the
+  ceiling, floor 20 ms), so a short run is not lost to a fixed sleep. A target finishing
+  inside the window is *reported rather than profiled*, so keep the ceiling below the
   shortest run of interest.
 - **Deep stacks are iterative, never recursive**: `flamegraph.render_flame_svg`,
   `report_html._tree_html`, `stacks._build_call_tree`, `macos._collect_leaves`; `_Chain`
